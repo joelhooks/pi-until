@@ -1,0 +1,8 @@
+node_modules/
+coverage/
+dist/
+*.tgz
+.DS_Store
+BRAIN.md
+.pi/notes-bridge/
+.pi/notes-inbox/
