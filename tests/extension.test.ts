@@ -58,6 +58,7 @@ describe("pi-until extension", () => {
       message: { customType: string; content: string };
       options?: { deliverAs?: string; triggerTurn?: boolean };
     }[] = [];
+    const setWidget = vi.fn();
 
     const pi = {
       appendEntry: vi.fn(),
@@ -85,7 +86,7 @@ describe("pi-until extension", () => {
       mode: "tui",
       ui: {
         notify: vi.fn(),
-        setStatus: vi.fn(),
+        setWidget,
       },
     } as unknown as ExtensionContext;
 
@@ -104,6 +105,10 @@ describe("pi-until extension", () => {
     );
 
     expect(result.details).toMatchObject({ status: "running" });
+    expect(setWidget).toHaveBeenCalledWith(
+      "pi-until-watches",
+      expect.any(Function)
+    );
     const id = (result.details as { id: string }).id;
     expect(messages).toHaveLength(0);
     writeFileSync(readyFile, "ready\n", "utf-8");
@@ -111,6 +116,9 @@ describe("pi-until extension", () => {
     await vi.waitFor(() => {
       expect(messages).toHaveLength(1);
     });
+    const lastWidgetCall = setWidget.mock.calls.at(-1);
+    expect(lastWidgetCall?.[0]).toBe("pi-until-watches");
+    expect(lastWidgetCall?.[1]).toBeUndefined();
 
     expect(messages[0]?.message.customType).toBe("pi-until");
     expect(messages[0]?.message.content).toContain("condition is true");
@@ -171,7 +179,7 @@ describe("pi-until extension", () => {
     const context = {
       cwd: process.cwd(),
       mode: "tui",
-      ui: { notify, setStatus: vi.fn() },
+      ui: { notify, setWidget: vi.fn() },
     } as unknown as ExtensionContext;
 
     await tool.execute(
@@ -221,7 +229,7 @@ describe("pi-until extension", () => {
       const context = {
         cwd: process.cwd(),
         mode: "tui",
-        ui: { notify: vi.fn(), setStatus: vi.fn() },
+        ui: { notify: vi.fn(), setWidget: vi.fn() },
       } as unknown as ExtensionContext;
 
       await tool.execute(

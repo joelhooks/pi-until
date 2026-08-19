@@ -37,6 +37,7 @@
     "pack:dry": "npm pack --dry-run"
   },
   "dependencies": {
+    "@earendil-works/pi-tui": "0.84.2",
     "xstate": "5.32.5"
   },
   "devDependencies": {

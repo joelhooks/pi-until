@@ -15,6 +15,8 @@ import type { AnyActorRef } from "xstate";
 
 import { createShellConditionRunner } from "../src/check.ts";
 import { planCompletion } from "../src/completion.ts";
+import { renderWatchIndicator, renderWatchPanel } from "../src/indicator.ts";
+import type { WatchDisplay, WatchPhase } from "../src/indicator.ts";
 import { createUntilMachine } from "../src/machine.ts";
 import type {
   UntilContext,
@@ -25,7 +27,9 @@ import type {
 const DEFAULT_INTERVAL_SECONDS = 30;
 const DEFAULT_CHECK_TIMEOUT_SECONDS = 30;
 const MAX_ACTIVE_WATCHES = 32;
-const STATUS_KEY = "pi-until";
+const WIDGET_KEY = "pi-until-watches";
+const PANEL_PAGE_SIZE = 6;
+const INDICATOR_REFRESH_MS = 250;
 
 const parameters = Type.Object(
   {
@@ -146,6 +150,16 @@ function toReceipt(record: WatchRecord): WatchReceipt {
   };
 }
 
+function watchPhase(record: WatchRecord): WatchPhase | undefined {
+  if (record.status !== "running") return undefined;
+  const value: unknown = record.actor.getSnapshot().value;
+  if (typeof value !== "object" || value === null || !("running" in value)) {
+    return "checking";
+  }
+  const nested = (value as { readonly running?: unknown }).running;
+  return nested === "sleeping" ? "sleeping" : "checking";
+}
+
 function receiptText(receipt: WatchReceipt): string {
   const lines = [
     `pi-until watch ${receipt.id}: ${receipt.status}`,
@@ -167,6 +181,8 @@ function receiptText(receipt: WatchReceipt): string {
 export default function piUntil(pi: ExtensionAPI) {
   const watches = new Map<string, WatchRecord>();
   let currentContext: ExtensionContext | undefined;
+  let indicatorMounted = false;
+  let requestIndicatorRender: (() => void) | undefined;
   let shuttingDown = false;
 
   const shellRunner = createShellConditionRunner();
@@ -175,12 +191,70 @@ export default function piUntil(pi: ExtensionAPI) {
   const activeWatches = () =>
     [...watches.values()].filter((watch) => watch.status === "running");
 
-  const updateStatus = () => {
-    const count = activeWatches().length;
-    currentContext?.ui.setStatus(
-      STATUS_KEY,
-      count > 0 ? `until: ${count}` : undefined
-    );
+  const toWatchDisplay = (record: WatchRecord): WatchDisplay => {
+    const context = record.actor.getSnapshot().context as UntilContext;
+    return {
+      attempts: context.attempts,
+      id: context.id,
+      intervalMs: context.intervalMs,
+      label: context.label,
+      lastCheckedAt: context.lastCheckedAt,
+      phase: watchPhase(record),
+      startedAt: context.startedAt,
+      status: record.status,
+      wake: context.wake,
+    };
+  };
+
+  const orderedWatches = () =>
+    [...watches.values()].sort((left, right) => {
+      const runningDifference =
+        Number(right.status === "running") - Number(left.status === "running");
+      return runningDifference || right.input.startedAt - left.input.startedAt;
+    });
+
+  const refreshIndicator = () => {
+    const ctx = currentContext;
+    if (ctx?.mode !== "tui") return;
+
+    if (activeWatches().length === 0) {
+      if (indicatorMounted) ctx.ui.setWidget(WIDGET_KEY, undefined);
+      indicatorMounted = false;
+      requestIndicatorRender = undefined;
+      return;
+    }
+
+    if (!indicatorMounted) {
+      indicatorMounted = true;
+      ctx.ui.setWidget(WIDGET_KEY, (tui, theme) => {
+        const requestRender = () => tui.requestRender();
+        requestIndicatorRender = requestRender;
+        const refreshTimer = setInterval(requestRender, INDICATOR_REFRESH_MS);
+        refreshTimer.unref();
+        return {
+          dispose() {
+            clearInterval(refreshTimer);
+            if (requestIndicatorRender === requestRender) {
+              requestIndicatorRender = undefined;
+            }
+          },
+          invalidate() {
+            // Render reads live watch state and theme values.
+          },
+          render(width: number) {
+            return renderWatchIndicator(
+              activeWatches().map(toWatchDisplay),
+              Date.now(),
+              width,
+              theme
+            );
+          },
+        };
+      });
+      return;
+    }
+
+    requestIndicatorRender?.();
   };
 
   const finishWatch = (record: WatchRecord, status: FinalWatchStatus) => {
@@ -192,7 +266,7 @@ export default function piUntil(pi: ExtensionAPI) {
     if (record.timeout) {
       clearTimeout(record.timeout);
     }
-    updateStatus();
+    refreshIndicator();
     if (shuttingDown || status === "cancelled") {
       return;
     }
@@ -275,7 +349,9 @@ export default function piUntil(pi: ExtensionAPI) {
         const status = terminalState(snapshot.value);
         if (snapshot.status === "done" && status) {
           finishWatch(record, status);
+          return;
         }
+        refreshIndicator();
       },
     });
 
@@ -293,7 +369,7 @@ export default function piUntil(pi: ExtensionAPI) {
       timeoutMs: input.timeoutMs,
       wake: input.wake,
     });
-    updateStatus();
+    refreshIndicator();
     return record;
   };
 
@@ -307,6 +383,75 @@ export default function piUntil(pi: ExtensionAPI) {
         return `${receipt.id}\t${receipt.status}\t${receipt.label}\tattempts=${receipt.attempts}`;
       })
       .join("\n");
+  };
+
+  const showWatchPanel = async (ctx: ExtensionContext) => {
+    if (ctx.mode !== "tui") {
+      ctx.ui.notify(listText(orderedWatches()), "info");
+      return;
+    }
+
+    let offset = 0;
+    await ctx.ui.custom<null>(
+      (tui, theme, keybindings, done) => {
+        const upKeys = keybindings.getKeys("tui.select.up").join("/");
+        const downKeys = keybindings.getKeys("tui.select.down").join("/");
+        const closeKeys = keybindings.getKeys("tui.select.cancel").join("/");
+        const navigationHint = `${upKeys}/${downKeys} scroll · ${closeKeys} close`;
+        const requestRender = () => tui.requestRender();
+        const refreshTimer = setInterval(requestRender, 1_000);
+        refreshTimer.unref();
+        return {
+          dispose() {
+            clearInterval(refreshTimer);
+          },
+          handleInput(data: string) {
+            const count = orderedWatches().length;
+            const maximumOffset = Math.max(0, count - 1);
+            if (keybindings.matches(data, "tui.select.up")) {
+              offset = Math.max(0, offset - 1);
+            } else if (keybindings.matches(data, "tui.select.down")) {
+              offset = Math.min(maximumOffset, offset + 1);
+            } else if (keybindings.matches(data, "tui.select.pageUp")) {
+              offset = Math.max(0, offset - PANEL_PAGE_SIZE);
+            } else if (keybindings.matches(data, "tui.select.pageDown")) {
+              offset = Math.min(maximumOffset, offset + PANEL_PAGE_SIZE);
+            } else if (
+              keybindings.matches(data, "tui.select.cancel") ||
+              keybindings.matches(data, "tui.select.confirm")
+            ) {
+              done(null);
+              return;
+            }
+            requestRender();
+          },
+          invalidate() {
+            // Render reads live watch state and theme values.
+          },
+          render(width: number) {
+            return renderWatchPanel(
+              orderedWatches().map(toWatchDisplay),
+              Date.now(),
+              width,
+              offset,
+              PANEL_PAGE_SIZE,
+              navigationHint,
+              theme
+            );
+          },
+        };
+      },
+      {
+        overlay: true,
+        overlayOptions: {
+          anchor: "center",
+          margin: 1,
+          maxHeight: "85%",
+          minWidth: 56,
+          width: "72%",
+        },
+      }
+    );
   };
 
   pi.registerTool({
@@ -396,10 +541,10 @@ export default function piUntil(pi: ExtensionAPI) {
   });
 
   pi.registerCommand("until-list", {
-    description: "List watches owned by this Pi session",
+    description: "Open watches owned by this Pi session",
     handler: async (_args, ctx) => {
       currentContext = ctx;
-      ctx.ui.notify(listText([...watches.values()]), "info");
+      await showWatchPanel(ctx);
     },
   });
 
@@ -425,7 +570,7 @@ export default function piUntil(pi: ExtensionAPI) {
 
   pi.on("session_start", (_event, ctx) => {
     currentContext = ctx;
-    updateStatus();
+    refreshIndicator();
   });
 
   pi.on("session_shutdown", async () => {
@@ -442,7 +587,9 @@ export default function piUntil(pi: ExtensionAPI) {
       record.actor.stop();
     }
     watches.clear();
-    currentContext?.ui.setStatus(STATUS_KEY, undefined);
+    currentContext?.ui.setWidget(WIDGET_KEY, undefined);
+    indicatorMounted = false;
+    requestIndicatorRender = undefined;
     currentContext = undefined;
   });
 }

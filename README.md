@@ -61,6 +61,18 @@ Equivalent condition:
 ssh host 'test -f ~/migration/verify.done'
 ```
 
+## Session display
+
+Active watches appear in a compact card above the editor. The card shows the label, current check phase, elapsed time, attempt count, and next check time. It disappears when the session has no active watches.
+
+```text
+╭─ UNTIL · deploy verification ─────────────────────────╮
+│ ◷ next 12s · 2m14s elapsed · 5 checks                 │
+╰─ 8f2c1a7d · wakes agent · /until-list ────────────────╯
+```
+
+The footer is not used. `/until-list` opens a scrollable session panel with active and finished watches.
+
 ## Commands
 
 ```text
