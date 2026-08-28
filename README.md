@@ -79,9 +79,10 @@ The footer is not used. `/until-list` opens a scrollable session panel with acti
 /until <side-effect-free shell condition>
 /until-list
 /until-cancel <id>
+/until-stats
 ```
 
-`/until` uses the defaults and wakes the agent when the condition succeeds.
+`/until` uses the defaults and wakes the agent when the condition succeeds. `/until-stats` summarizes the local telemetry file.
 
 ## Lifecycle
 
@@ -89,11 +90,20 @@ A watch belongs to one live Pi session/process.
 
 - It survives normal agent turns.
 - It does not block Pi.
-- It stops on `/reload`, session switch, fork, or Pi shutdown. Graceful shutdown waits for process-tree cleanup before Pi exits.
+- It survives `/reload`. Pi keeps the process and session alive across a reload and only replaces the extension instance. On `session_shutdown { reason: "reload" }` the extension terminates the in-flight check, writes the watch definitions to a `pi-until-suspended` session entry, and the new instance restarts them on `session_start { reason: "reload" }`. Attempt counts carry over, the overall timeout stays anchored to the original start, and the receipt reports `Survived reloads: N`.
+- It stops on session switch, fork, `/new`, or Pi shutdown. Graceful shutdown waits for process-tree cleanup before Pi exits. A suspension entry from an earlier process is never resurrected on `resume`.
 - It does not survive a machine reboot.
 - Print and JSON modes reject new watches because those processes are not durable owners.
 
 This boundary is intentional. `pi-until` is a session primitive, not another scheduler or daemon.
+
+## Telemetry
+
+The extension appends one JSON line per event to `~/.pi/agent/pi-until/events.jsonl`. Nothing leaves the machine. Events: `started`, `finished`, `suspended`, `resumed`, and `action` (tool or command use). A condition is recorded as a 12-character hash plus its first word (for example `test`, `gh`, `curl`); the command text is never written. Labels are written, so keep them safe.
+
+- `PI_UNTIL_TELEMETRY=0` disables it.
+- `PI_UNTIL_TELEMETRY_FILE=/path/events.jsonl` moves it.
+- `/until-stats` prints counts by status and wake mode, median attempts and duration, reload suspend/resume counts, and the top condition heads.
 
 ## Safety
 

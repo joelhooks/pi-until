@@ -11,18 +11,32 @@ import type {
 import { Type } from "typebox";
 import type { Static } from "typebox";
 import { createActor } from "xstate";
-import type { AnyActorRef } from "xstate";
+import type { ActorRefFrom, SnapshotFrom } from "xstate";
 
 import { createShellConditionRunner } from "../src/check.ts";
 import { planCompletion } from "../src/completion.ts";
 import { renderWatchIndicator, renderWatchPanel } from "../src/indicator.ts";
 import type { WatchDisplay, WatchPhase } from "../src/indicator.ts";
 import { createUntilMachine } from "../src/machine.ts";
-import type {
-  UntilContext,
-  UntilInput,
-  UntilTerminalState,
-} from "../src/machine.ts";
+import type { UntilInput, UntilTerminalState } from "../src/machine.ts";
+import {
+  SUSPENDED_ENTRY_TYPE,
+  remainingTimeoutMs,
+  resumeInput,
+  suspendWatch,
+  suspendedWatchesFrom,
+  suspensionData,
+} from "../src/suspension.ts";
+import type { SuspendedWatch, WatchHistory } from "../src/suspension.ts";
+import {
+  createTelemetrySink,
+  describeCondition,
+  readTelemetry,
+  summarizeTelemetry,
+  summaryText,
+  telemetryOptionsFromEnv,
+} from "../src/telemetry.ts";
+import type { TelemetrySink } from "../src/telemetry.ts";
 
 const DEFAULT_INTERVAL_SECONDS = 30;
 const DEFAULT_CHECK_TIMEOUT_SECONDS = 30;
@@ -85,9 +99,16 @@ const parameters = Type.Object(
 type UntilParameters = Static<typeof parameters>;
 type FinalWatchStatus = UntilTerminalState | "failed";
 type WatchStatus = "running" | FinalWatchStatus;
+type UntilMachine = ReturnType<typeof createUntilMachine>;
+type UntilActor = ActorRefFrom<UntilMachine>;
+type UntilSnapshot = SnapshotFrom<UntilMachine>;
+
+const NO_HISTORY: WatchHistory = { attempts: 0, reloads: 0 };
 
 interface WatchRecord {
-  readonly actor: AnyActorRef;
+  readonly actor: UntilActor;
+  /** Attempts and reloads from runs before the last `/reload`. */
+  readonly history: WatchHistory;
   readonly input: UntilInput;
   failure?: string;
   finishedAt?: number;
@@ -95,7 +116,11 @@ interface WatchRecord {
   timeout?: ReturnType<typeof setTimeout>;
 }
 
-interface WatchReceipt {
+export interface PiUntilOptions {
+  readonly telemetry?: TelemetrySink;
+}
+
+export interface WatchReceipt {
   readonly attempts: number;
   readonly failure?: string;
   readonly finishedAt?: string;
@@ -104,10 +129,14 @@ interface WatchReceipt {
   readonly lastCheckKilled?: boolean;
   readonly lastCheckedAt?: string;
   readonly lastExitCode?: number;
+  readonly reloads: number;
   readonly startedAt: string;
   readonly status: WatchStatus;
   readonly wake: "agent" | "notify";
 }
+
+const sessionId = (ctx: ExtensionContext | undefined) =>
+  ctx?.sessionManager.getSessionId() ?? "unknown";
 
 function expandPath(value: string): string {
   if (value === "~") {
@@ -119,18 +148,27 @@ function expandPath(value: string): string {
   return value;
 }
 
-function terminalState(value: unknown): UntilTerminalState | undefined {
-  if (value === "succeeded" || value === "timedOut" || value === "cancelled") {
-    return value;
+function terminalState(
+  snapshot: UntilSnapshot
+): UntilTerminalState | undefined {
+  if (snapshot.status !== "done") {
+    return undefined;
   }
+  if (snapshot.matches("succeeded")) return "succeeded";
+  if (snapshot.matches("timedOut")) return "timedOut";
+  if (snapshot.matches("cancelled")) return "cancelled";
   return undefined;
 }
 
+/** Attempts across every run of this watch, including runs before a reload. */
+function totalAttempts(record: WatchRecord): number {
+  return record.history.attempts + record.actor.getSnapshot().context.attempts;
+}
+
 function toReceipt(record: WatchRecord): WatchReceipt {
-  const snapshot = record.actor.getSnapshot();
-  const context = snapshot.context as UntilContext;
+  const { context } = record.actor.getSnapshot();
   return {
-    attempts: context.attempts,
+    attempts: totalAttempts(record),
     failure: record.failure,
     finishedAt:
       record.finishedAt === undefined
@@ -144,6 +182,7 @@ function toReceipt(record: WatchRecord): WatchReceipt {
         : new Date(context.lastCheckedAt).toISOString(),
     lastCheckKilled: context.lastResult?.killed,
     lastExitCode: context.lastResult?.code,
+    reloads: record.history.reloads,
     startedAt: new Date(context.startedAt).toISOString(),
     status: record.status,
     wake: context.wake,
@@ -152,12 +191,9 @@ function toReceipt(record: WatchRecord): WatchReceipt {
 
 function watchPhase(record: WatchRecord): WatchPhase | undefined {
   if (record.status !== "running") return undefined;
-  const value: unknown = record.actor.getSnapshot().value;
-  if (typeof value !== "object" || value === null || !("running" in value)) {
-    return "checking";
-  }
-  const nested = (value as { readonly running?: unknown }).running;
-  return nested === "sleeping" ? "sleeping" : "checking";
+  return record.actor.getSnapshot().matches({ running: "sleeping" })
+    ? "sleeping"
+    : "checking";
 }
 
 function receiptText(receipt: WatchReceipt): string {
@@ -166,6 +202,9 @@ function receiptText(receipt: WatchReceipt): string {
     `Label: ${receipt.label}`,
     `Attempts: ${receipt.attempts}`,
   ];
+  if (receipt.reloads > 0) {
+    lines.push(`Survived reloads: ${receipt.reloads}`);
+  }
   if (receipt.lastExitCode !== undefined) {
     lines.push(`Last exit code: ${receipt.lastExitCode}`);
   }
@@ -178,7 +217,10 @@ function receiptText(receipt: WatchReceipt): string {
   return lines.join("\n");
 }
 
-export default function piUntil(pi: ExtensionAPI) {
+export default function piUntil(
+  pi: ExtensionAPI,
+  options: PiUntilOptions = {}
+) {
   const watches = new Map<string, WatchRecord>();
   let currentContext: ExtensionContext | undefined;
   let indicatorMounted = false;
@@ -187,14 +229,19 @@ export default function piUntil(pi: ExtensionAPI) {
 
   const shellRunner = createShellConditionRunner();
   const machine = createUntilMachine(shellRunner.run);
+  const telemetry =
+    options.telemetry ??
+    createTelemetrySink(telemetryOptionsFromEnv(process.env));
+
+  const track = telemetry.record;
 
   const activeWatches = () =>
     [...watches.values()].filter((watch) => watch.status === "running");
 
   const toWatchDisplay = (record: WatchRecord): WatchDisplay => {
-    const context = record.actor.getSnapshot().context as UntilContext;
+    const { context } = record.actor.getSnapshot();
     return {
-      attempts: context.attempts,
+      attempts: totalAttempts(record),
       id: context.id,
       intervalMs: context.intervalMs,
       label: context.label,
@@ -267,11 +314,26 @@ export default function piUntil(pi: ExtensionAPI) {
       clearTimeout(record.timeout);
     }
     refreshIndicator();
-    if (shuttingDown || status === "cancelled") {
+    if (shuttingDown) {
       return;
     }
 
     const receipt = toReceipt(record);
+    void track(sessionId(currentContext), {
+      attempts: receipt.attempts,
+      conditionHash: describeCondition(record.input.command).hash,
+      durationMs: record.finishedAt - record.input.startedAt,
+      event: "finished",
+      id: receipt.id,
+      lastCheckKilled: receipt.lastCheckKilled,
+      lastExitCode: receipt.lastExitCode,
+      reloads: receipt.reloads,
+      status,
+      wake: receipt.wake,
+    });
+    if (status === "cancelled") {
+      return;
+    }
     pi.appendEntry("pi-until-finished", receipt);
 
     const plan = planCompletion(status, receipt.wake);
@@ -333,9 +395,79 @@ export default function piUntil(pi: ExtensionAPI) {
       wake: params.wake ?? "agent",
     };
 
+    const record = runWatch(input, NO_HISTORY, input.timeoutMs);
+    pi.appendEntry("pi-until-started", {
+      id,
+      intervalMs: input.intervalMs,
+      label: input.label,
+      startedAt: new Date(input.startedAt).toISOString(),
+      timeoutMs: input.timeoutMs,
+      wake: input.wake,
+    });
+    const condition = describeCondition(input.command);
+    void track(sessionId(ctx), {
+      checkTimeoutMs: input.checkTimeoutMs,
+      conditionHash: condition.hash,
+      conditionHead: condition.head,
+      event: "started",
+      id,
+      intervalMs: input.intervalMs,
+      label: input.label,
+      resumed: false,
+      timeoutMs: input.timeoutMs,
+      wake: input.wake,
+    });
+    return record;
+  };
+
+  /** Resume watches suspended by the previous extension instance on `/reload`. */
+  const resumeWatches = (
+    suspended: readonly SuspendedWatch[],
+    ctx: ExtensionContext
+  ) => {
+    const now = Date.now();
+    for (const watch of suspended) {
+      if (watches.has(watch.id)) {
+        continue;
+      }
+      const input = resumeInput(watch);
+      runWatch(
+        input,
+        { attempts: watch.attempts, reloads: watch.reloads },
+        remainingTimeoutMs(watch, now)
+      );
+      const condition = describeCondition(input.command);
+      void track(sessionId(ctx), {
+        checkTimeoutMs: input.checkTimeoutMs,
+        conditionHash: condition.hash,
+        conditionHead: condition.head,
+        event: "started",
+        id: input.id,
+        intervalMs: input.intervalMs,
+        label: input.label,
+        resumed: true,
+        timeoutMs: input.timeoutMs,
+        wake: input.wake,
+      });
+    }
+    if (suspended.length > 0) {
+      void track(sessionId(ctx), { count: suspended.length, event: "resumed" });
+      ctx.ui.notify(
+        `pi-until resumed ${suspended.length} watch${suspended.length === 1 ? "" : "es"} after reload`,
+        "info"
+      );
+    }
+  };
+
+  /** Start the actor for a watch definition. Shared by fresh starts and resumes. */
+  const runWatch = (
+    input: UntilInput,
+    history: WatchHistory,
+    timeoutMs: number | undefined
+  ): WatchRecord => {
     const actor = createActor(machine, { input });
-    const record: WatchRecord = { actor, input, status: "running" };
-    watches.set(id, record);
+    const record: WatchRecord = { actor, history, input, status: "running" };
+    watches.set(input.id, record);
 
     actor.subscribe({
       error(error) {
@@ -346,8 +478,8 @@ export default function piUntil(pi: ExtensionAPI) {
         finishWatch(record, "failed");
       },
       next(snapshot) {
-        const status = terminalState(snapshot.value);
-        if (snapshot.status === "done" && status) {
+        const status = terminalState(snapshot);
+        if (status) {
           finishWatch(record, status);
           return;
         }
@@ -356,19 +488,11 @@ export default function piUntil(pi: ExtensionAPI) {
     });
 
     actor.start();
-    if (input.timeoutMs !== undefined) {
+    if (timeoutMs !== undefined) {
       record.timeout = setTimeout(() => {
         actor.send({ type: "TIMEOUT" });
-      }, input.timeoutMs);
+      }, timeoutMs);
     }
-    pi.appendEntry("pi-until-started", {
-      id,
-      intervalMs: input.intervalMs,
-      label: input.label,
-      startedAt: new Date(input.startedAt).toISOString(),
-      timeoutMs: input.timeoutMs,
-      wake: input.wake,
-    });
     refreshIndicator();
     return record;
   };
@@ -456,9 +580,14 @@ export default function piUntil(pi: ExtensionAPI) {
 
   pi.registerTool({
     description:
-      "Start, list, inspect, or cancel non-blocking shell-condition watches. A check is true only when its shell command exits 0. Active watches stop when this Pi session/process shuts down.",
+      "Start, list, inspect, or cancel non-blocking shell-condition watches. A check is true only when its shell command exits 0. Watches survive /reload but stop when this Pi session/process shuts down.",
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       currentContext = ctx;
+      void track(sessionId(ctx), {
+        action: params.action,
+        event: "action",
+        source: "tool",
+      });
       if (params.action === "start") {
         const record = startWatch(params, ctx);
         const receipt = toReceipt(record);
@@ -518,6 +647,11 @@ export default function piUntil(pi: ExtensionAPI) {
       "Start a default agent-waking watch: /until <side-effect-free shell condition>",
     handler: async (args, ctx) => {
       currentContext = ctx;
+      void track(sessionId(ctx), {
+        action: "start",
+        event: "action",
+        source: "command",
+      });
       if (!args.trim()) {
         ctx.ui.notify(
           "Usage: /until <side-effect-free shell condition>",
@@ -544,7 +678,36 @@ export default function piUntil(pi: ExtensionAPI) {
     description: "Open watches owned by this Pi session",
     handler: async (_args, ctx) => {
       currentContext = ctx;
+      void track(sessionId(ctx), {
+        action: "list",
+        event: "action",
+        source: "command",
+      });
       await showWatchPanel(ctx);
+    },
+  });
+
+  pi.registerCommand("until-stats", {
+    description: "Summarize local pi-until usage telemetry",
+    handler: async (_args, ctx) => {
+      currentContext = ctx;
+      void track(sessionId(ctx), {
+        action: "stats",
+        event: "action",
+        source: "command",
+      });
+      if (!telemetry.enabled) {
+        ctx.ui.notify(
+          "pi-until telemetry is disabled (PI_UNTIL_TELEMETRY=0)",
+          "warning"
+        );
+        return;
+      }
+      const events = await readTelemetry(telemetry.filePath);
+      ctx.ui.notify(
+        summaryText(summarizeTelemetry(events), telemetry.filePath),
+        "info"
+      );
     },
   });
 
@@ -552,6 +715,11 @@ export default function piUntil(pi: ExtensionAPI) {
     description: "Cancel a watch: /until-cancel <id>",
     handler: async (args, ctx) => {
       currentContext = ctx;
+      void track(sessionId(ctx), {
+        action: "cancel",
+        event: "action",
+        source: "command",
+      });
       const id = args.trim();
       const record = watches.get(id);
       if (!record) {
@@ -568,14 +736,40 @@ export default function piUntil(pi: ExtensionAPI) {
     },
   });
 
-  pi.on("session_start", (_event, ctx) => {
+  pi.on("session_start", (event, ctx) => {
     currentContext = ctx;
+    // Only a reload keeps the same process and session. new/resume/fork
+    // replace the session, and a suspension entry from an earlier process
+    // must never resurrect watches nobody is running.
+    if (event.reason === "reload") {
+      resumeWatches(suspendedWatchesFrom(ctx.sessionManager.getBranch()), ctx);
+    }
     refreshIndicator();
   });
 
-  pi.on("session_shutdown", async () => {
+  pi.on("session_shutdown", async (event) => {
     shuttingDown = true;
     const active = activeWatches();
+    if (event.reason === "reload") {
+      const suspended = active.map((record) =>
+        suspendWatch(
+          record.input,
+          record.history,
+          record.actor.getSnapshot().context.attempts
+        )
+      );
+      // Written even when empty so the newest entry always wins.
+      pi.appendEntry(
+        SUSPENDED_ENTRY_TYPE,
+        suspensionData(suspended, Date.now())
+      );
+      if (suspended.length > 0) {
+        void track(sessionId(currentContext), {
+          count: suspended.length,
+          event: "suspended",
+        });
+      }
+    }
     for (const record of active) {
       if (record.timeout) {
         clearTimeout(record.timeout);

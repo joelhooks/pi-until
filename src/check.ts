@@ -42,17 +42,12 @@ const executeShellCondition: RunUntilCheck = async (
 
     let killed = false;
     let settled = false;
-    const timers: {
-      check?: ReturnType<typeof setTimeout>;
-      forceKill?: ReturnType<typeof setTimeout>;
-    } = {};
+    let forceKillTimer: ReturnType<typeof setTimeout> | undefined;
 
     function cleanup() {
-      if (timers.check !== undefined) {
-        clearTimeout(timers.check);
-      }
-      if (timers.forceKill !== undefined) {
-        clearTimeout(timers.forceKill);
+      clearTimeout(checkTimer);
+      if (forceKillTimer !== undefined) {
+        clearTimeout(forceKillTimer);
       }
       signal.removeEventListener("abort", terminate);
     }
@@ -72,14 +67,14 @@ const executeShellCondition: RunUntilCheck = async (
       }
       killed = true;
       signalProcessTree(child.pid, "SIGTERM");
-      timers.forceKill = setTimeout(() => {
+      forceKillTimer = setTimeout(() => {
         signalProcessTree(child.pid, "SIGKILL");
-        timers.forceKill = undefined;
+        forceKillTimer = undefined;
         settle({ code: 1, killed: true });
       }, FORCE_KILL_DELAY_MS);
     }
 
-    timers.check = setTimeout(terminate, input.checkTimeoutMs);
+    const checkTimer = setTimeout(terminate, input.checkTimeoutMs);
     signal.addEventListener("abort", terminate, { once: true });
     if (signal.aborted) {
       terminate();

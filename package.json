@@ -1,6 +1,6 @@
 {
   "name": "@joelhooks/pi-until",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Non-blocking shell-condition watches that wake a live Pi session when work is ready to continue.",
   "keywords": [
     "async",

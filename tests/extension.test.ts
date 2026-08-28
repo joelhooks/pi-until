@@ -8,40 +8,17 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import type {
-  ExtensionAPI,
-  ExtensionContext,
-} from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import piUntil from "../extensions/pi-until.ts";
+import { FakeSession, loadExtension, receiptOf, sleep } from "./fake-pi.ts";
+import type { FakeExtension } from "./fake-pi.ts";
 
-interface CapturedTool {
-  execute: (
-    toolCallId: string,
-    params: {
-      action: "start" | "list" | "status" | "cancel";
-      condition?: string;
-      id?: string;
-      intervalSeconds?: number;
-      label?: string;
-      timeoutSeconds?: number;
-      wake?: "agent" | "notify";
-    },
-    signal: AbortSignal,
-    onUpdate: undefined,
-    context: ExtensionContext
-  ) => Promise<{ details?: unknown }>;
-}
-
-const shutdownHandlers: (() => Promise<void> | void)[] = [];
 const tempDirectories: string[] = [];
+const live: FakeExtension[] = [];
 
 afterEach(async () => {
   await Promise.all(
-    shutdownHandlers.splice(0).map(async (shutdown) => {
-      await shutdown();
-    })
+    live.splice(0).map((extension) => extension.shutdown("quit"))
   );
   for (const directory of tempDirectories.splice(0)) {
     rmSync(directory, { force: true, recursive: true });
@@ -50,47 +27,15 @@ afterEach(async () => {
 
 describe("pi-until extension", () => {
   it("returns immediately and wakes the agent after a later successful check", async () => {
-    let tool: CapturedTool | undefined;
     const directory = mkdtempSync(join(tmpdir(), "pi-until-extension-"));
     const readyFile = join(directory, "ready");
     tempDirectories.push(directory);
-    const messages: {
-      message: { customType: string; content: string };
-      options?: { deliverAs?: string; triggerTurn?: boolean };
-    }[] = [];
-    const setWidget = vi.fn();
+    const session = new FakeSession();
+    const extension = loadExtension(session);
+    live.push(extension);
+    const { ctx, setWidget } = session.context();
 
-    const pi = {
-      appendEntry: vi.fn(),
-      on: vi.fn((event: string, handler: () => Promise<void> | void) => {
-        if (event === "session_shutdown") {
-          shutdownHandlers.push(handler);
-        }
-      }),
-      registerCommand: vi.fn(),
-      registerTool: vi.fn((definition: CapturedTool) => {
-        tool = definition;
-      }),
-      sendMessage: vi.fn((message, options) => {
-        messages.push({ message, options });
-      }),
-    } as unknown as ExtensionAPI;
-
-    piUntil(pi);
-    if (!tool) {
-      throw new Error("until tool was not registered");
-    }
-
-    const context = {
-      cwd: process.cwd(),
-      mode: "tui",
-      ui: {
-        notify: vi.fn(),
-        setWidget,
-      },
-    } as unknown as ExtensionContext;
-
-    const result = await tool.execute(
+    const result = await extension.tool(
       "tool-call",
       {
         action: "start",
@@ -101,138 +46,153 @@ describe("pi-until extension", () => {
       },
       new AbortController().signal,
       undefined,
-      context
+      ctx
     );
 
-    expect(result.details).toMatchObject({ status: "running" });
+    expect(result.details).toMatchObject({ reloads: 0, status: "running" });
     expect(setWidget).toHaveBeenCalledWith(
       "pi-until-watches",
       expect.any(Function)
     );
-    const id = (result.details as { id: string }).id;
-    expect(messages).toHaveLength(0);
+    const { id } = receiptOf(result);
+    expect(extension.messages).toHaveLength(0);
     writeFileSync(readyFile, "ready\n", "utf-8");
 
     await vi.waitFor(() => {
-      expect(messages).toHaveLength(1);
+      expect(extension.messages).toHaveLength(1);
     });
     const lastWidgetCall = setWidget.mock.calls.at(-1);
     expect(lastWidgetCall?.[0]).toBe("pi-until-watches");
     expect(lastWidgetCall?.[1]).toBeUndefined();
 
-    expect(messages[0]?.message.customType).toBe("pi-until");
-    expect(messages[0]?.message.content).toContain("condition is true");
-    expect(messages[0]?.message.content).not.toContain(readyFile);
-    expect(messages[0]?.message.content).not.toContain("stdout");
-    expect(messages[0]?.options).toEqual({
-      deliverAs: "followUp",
-      triggerTurn: true,
-    });
+    const [sent] = extension.messages;
+    expect(sent?.message.customType).toBe("pi-until");
+    expect(sent?.message.content).toContain("condition is true");
+    expect(sent?.message.content).not.toContain(readyFile);
+    expect(sent?.message.content).not.toContain("stdout");
+    expect(sent?.message.content).not.toContain("Survived reloads");
+    expect(sent?.options).toEqual({ deliverAs: "followUp", triggerTurn: true });
 
-    const firstStatus = await tool.execute(
+    const firstStatus = await extension.tool(
       "status-1",
       { action: "status", id },
       new AbortController().signal,
       undefined,
-      context
+      ctx
     );
-    await new Promise<void>((resolve) => {
-      setTimeout(resolve, 5);
-    });
-    const secondStatus = await tool.execute(
+    await sleep(5);
+    const secondStatus = await extension.tool(
       "status-2",
       { action: "status", id },
       new AbortController().signal,
       undefined,
-      context
+      ctx
     );
-    expect(firstStatus.details).toMatchObject({ status: "succeeded" });
-    expect((firstStatus.details as { finishedAt: string }).finishedAt).toBe(
-      (secondStatus.details as { finishedAt: string }).finishedAt
+    expect(receiptOf(firstStatus)).toMatchObject({ status: "succeeded" });
+    expect(receiptOf(firstStatus).finishedAt).toBeDefined();
+    expect(receiptOf(firstStatus).finishedAt).toBe(
+      receiptOf(secondStatus).finishedAt
     );
+
+    const kinds = extension.telemetry.map((event) => event.event);
+    expect(kinds).toEqual([
+      "action",
+      "started",
+      "finished",
+      "action",
+      "action",
+    ]);
+    const started = extension.telemetry.find(
+      (event) => event.event === "started"
+    );
+    expect(JSON.stringify(started)).not.toContain(readyFile);
+    expect(started).toMatchObject({ conditionHead: "test", resumed: false });
   });
 
   it("supports notify-only completion without waking the agent", async () => {
-    let tool: CapturedTool | undefined;
-    const entries: { customType: string; data: unknown }[] = [];
-    const sendMessage = vi.fn();
-    const notify = vi.fn();
-    const pi = {
-      appendEntry: vi.fn((customType, data) => {
-        entries.push({ customType, data });
-      }),
-      on: vi.fn((event: string, handler: () => Promise<void> | void) => {
-        if (event === "session_shutdown") {
-          shutdownHandlers.push(handler);
-        }
-      }),
-      registerCommand: vi.fn(),
-      registerTool: vi.fn((definition: CapturedTool) => {
-        tool = definition;
-      }),
-      sendMessage,
-    } as unknown as ExtensionAPI;
-    piUntil(pi);
-    if (!tool) {
-      throw new Error("until tool was not registered");
-    }
-    const context = {
-      cwd: process.cwd(),
-      mode: "tui",
-      ui: { notify, setWidget: vi.fn() },
-    } as unknown as ExtensionContext;
+    const session = new FakeSession();
+    const extension = loadExtension(session);
+    live.push(extension);
+    const { ctx, notify } = session.context();
 
-    await tool.execute(
+    await extension.tool(
       "notify-watch",
       { action: "start", condition: "true", label: "quiet", wake: "notify" },
       new AbortController().signal,
       undefined,
-      context
+      ctx
     );
 
     await vi.waitFor(() => {
       expect(notify).toHaveBeenCalledWith("quiet: condition met", "info");
     });
-    expect(sendMessage).not.toHaveBeenCalled();
-    const finished = entries.find(
+    expect(extension.sendMessage).not.toHaveBeenCalled();
+    const finished = extension.entries.find(
       (entry) => entry.customType === "pi-until-finished"
     );
     expect(finished?.data).toMatchObject({ status: "succeeded" });
     expect(finished?.data).not.toHaveProperty("lastOutput");
   });
 
+  it("records a cancel in telemetry but not as a finished receipt", async () => {
+    const session = new FakeSession();
+    const extension = loadExtension(session);
+    live.push(extension);
+    const { ctx } = session.context();
+    const started = await extension.tool(
+      "cancel-watch",
+      { action: "start", condition: "false", intervalSeconds: 60, label: "c" },
+      new AbortController().signal,
+      undefined,
+      ctx
+    );
+    const { id } = receiptOf(started);
+    const cancelled = await extension.tool(
+      "cancel",
+      { action: "cancel", id },
+      new AbortController().signal,
+      undefined,
+      ctx
+    );
+    expect(cancelled.details).toMatchObject({ status: "cancelled" });
+    expect(extension.sendMessage).not.toHaveBeenCalled();
+    expect(
+      extension.entries.some(
+        (entry) => entry.customType === "pi-until-finished"
+      )
+    ).toBe(false);
+    expect(extension.telemetry).toContainEqual(
+      expect.objectContaining({ event: "finished", status: "cancelled" })
+    );
+  });
+
+  it("rejects print and json modes", async () => {
+    const session = new FakeSession();
+    const extension = loadExtension(session);
+    live.push(extension);
+    const { ctx } = session.context({ mode: "print" });
+    await expect(
+      extension.tool(
+        "print",
+        { action: "start", condition: "true" },
+        new AbortController().signal,
+        undefined,
+        ctx
+      )
+    ).rejects.toThrow(/long-lived/u);
+  });
+
   it.skipIf(process.platform === "win32")(
     "stops active watches and descendants on session shutdown without waking the agent",
     async () => {
-      let tool: CapturedTool | undefined;
       const directory = mkdtempSync(join(tmpdir(), "pi-until-shutdown-"));
       const pidFile = join(directory, "child.pid");
       tempDirectories.push(directory);
-      const sendMessage = vi.fn();
-      const pi = {
-        appendEntry: vi.fn(),
-        on: vi.fn((event: string, handler: () => Promise<void> | void) => {
-          if (event === "session_shutdown") {
-            shutdownHandlers.push(handler);
-          }
-        }),
-        registerCommand: vi.fn(),
-        registerTool: vi.fn((definition: CapturedTool) => {
-          tool = definition;
-        }),
-        sendMessage,
-      } as unknown as ExtensionAPI;
-      piUntil(pi);
-      if (!tool) {
-        throw new Error("until tool was not registered");
-      }
-      const context = {
-        cwd: process.cwd(),
-        mode: "tui",
-        ui: { notify: vi.fn(), setWidget: vi.fn() },
-      } as unknown as ExtensionContext;
+      const session = new FakeSession();
+      const extension = loadExtension(session);
+      const { ctx } = session.context();
 
-      await tool.execute(
+      await extension.tool(
         "shutdown-watch",
         {
           action: "start",
@@ -241,7 +201,7 @@ describe("pi-until extension", () => {
         },
         new AbortController().signal,
         undefined,
-        context
+        ctx
       );
       await vi.waitFor(() => {
         expect(existsSync(pidFile)).toBe(true);
@@ -249,9 +209,7 @@ describe("pi-until extension", () => {
       const childPid = Math.trunc(
         Number(readFileSync(pidFile, "utf-8").trim())
       );
-      const shutdown = shutdownHandlers.pop();
-      expect(shutdown).toBeDefined();
-      await shutdown?.();
+      await extension.shutdown("quit");
 
       await vi.waitFor(
         () => {
@@ -259,7 +217,12 @@ describe("pi-until extension", () => {
         },
         { timeout: 2_000 }
       );
-      expect(sendMessage).not.toHaveBeenCalled();
+      expect(extension.sendMessage).not.toHaveBeenCalled();
+      expect(
+        extension.entries.some(
+          (entry) => entry.customType === "pi-until-suspended"
+        )
+      ).toBe(false);
     }
   );
 });

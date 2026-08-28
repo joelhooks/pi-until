@@ -1,0 +1,37 @@
+---
+title: pi-until survives /reload, gains local telemetry
+type: project
+status: active
+created: 2026-08-27
+tags: [pi-until, pi-extension, reload, telemetry, uncomplect]
+---
+
+## Problem
+
+Joel runs long "recursive" agent loops on `pi-until`. `/reload` killed every open watch. The `session_shutdown` handler ignored `event.reason` and treated reload like quit.
+
+## Facts (pi 0.84.2 source)
+
+- `AgentSession.reload()` emits `session_shutdown { reason: "reload" }`, invalidates the old runner, re-imports the extension with jiti, then emits `session_start { reason: "reload" }`. The process and the session file stay the same.
+- `pi.appendEntry` calls `sessionManager.appendCustomEntry` directly. The runner is invalidated only after the shutdown handlers resolve, so writing from `session_shutdown` is safe.
+- Upstream warns against reusing a captured `pi` or `ctx` after reload (`agent-session.ts` stale-context message).
+
+## Design
+
+Watch definitions are values (`UntilInput`); watch runs are actors. Only the value crosses the reload boundary.
+
+- On `session_shutdown { reason: "reload" }`: terminate in-flight checks, write `pi-until-suspended` with every active watch plus attempts so far and a reload count. Always write it, even empty, so the newest entry has authority.
+- On `session_start { reason: "reload" }`: parse the newest suspension entry with a typebox schema, restart each watch with the original `startedAt`, attempts carried as history, and the overall timeout measured from the original start.
+- `new`, `resume`, `fork`, `startup` never resurrect. A dead process's entry is history, not authority.
+
+Rejected alternative: stash live actors on `globalThis` and rebind `pi`/`ctx`. Two shell runners with split drain, invisible state, and the exact stale-context trap upstream documents.
+
+## Telemetry
+
+Local JSONL at `~/.pi/agent/pi-until/events.jsonl`. Events: `started`, `finished`, `suspended`, `resumed`, `action`. Condition stored as sha256 prefix plus first word only. `PI_UNTIL_TELEMETRY=0` disables. `/until-stats` summarizes. No network.
+
+## Receipts
+
+- anti-slop findings: 28 before, 3 after, all remaining in test fakes.
+- Tests: 34 pass, including reload round trip, no-resurrect on four other reasons, empty-entry-wins, timeout anchoring, descendant termination on reload.
+- `npm run` and `npm pack` refuse on this machine: local npm 11.19.0 versus pinned 11.16.0 `devEngines`. Checks ran from `node_modules/.bin`.
