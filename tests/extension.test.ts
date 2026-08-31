@@ -166,6 +166,221 @@ describe("pi-until extension", () => {
     );
   });
 
+  it("delivers an immutable Markdown follow-up after the current turn", async () => {
+    const session = new FakeSession();
+    const extension = loadExtension(session);
+    live.push(extension);
+    const { ctx } = session.context({ idle: false });
+    const opaqueTarget = "  custom://release context?view=raw  ";
+
+    const started = await extension.tool(
+      "repeat",
+      {
+        action: "repeat",
+        contextRefs: [{ label: "Runbook", target: opaqueTarget }],
+        immediate: true,
+        instruction: "Review the deployment and fix remaining failures.",
+        intervalSeconds: 60,
+        quickRef: "Release 42 verification",
+        timeoutSeconds: 3_600,
+      },
+      new AbortController().signal,
+      undefined,
+      ctx
+    );
+    const { id } = receiptOf(started);
+    expect(extension.messages).toHaveLength(0);
+
+    const { ctx: idleCtx } = session.context({ idle: true });
+    await extension.agentSettled(idleCtx);
+    await vi.waitFor(() => {
+      expect(extension.messages).toHaveLength(1);
+    });
+
+    const [sent] = extension.messages;
+    expect(sent?.message.content).toContain("# Recurring follow-up");
+    expect(sent?.message.content).toContain(
+      "Review the deployment and fix remaining failures."
+    );
+    expect(sent?.message.content).toContain("Release 42 verification");
+    expect(sent?.message.content).toContain(`Runbook: \`${opaqueTarget}\``);
+    expect(JSON.stringify(extension.entries)).toContain(opaqueTarget);
+    expect(sent?.message.content).toContain("origin-entry");
+    expect(sent?.message.content).toContain(`action=complete`);
+    expect(sent?.message.content).toContain(`id=${id}`);
+    expect(sent?.options).toEqual({
+      deliverAs: "followUp",
+      triggerTurn: true,
+    });
+    expect(JSON.stringify(extension.telemetry)).not.toContain(
+      "Review the deployment"
+    );
+    expect(JSON.stringify(extension.telemetry)).not.toContain(
+      "Release 42 verification"
+    );
+
+    const completed = await extension.tool(
+      "complete",
+      { action: "complete", id },
+      new AbortController().signal,
+      undefined,
+      idleCtx
+    );
+    expect(completed.details).toMatchObject({
+      deliveries: 1,
+      kind: "recurring",
+      status: "completed",
+    });
+    expect(extension.messages).toHaveLength(1);
+  });
+
+  it("coalesces recurring ticks while a delivered follow-up is unsettled", async () => {
+    const session = new FakeSession();
+    const extension = loadExtension(session);
+    live.push(extension);
+    const { ctx } = session.context({ idle: false });
+
+    const started = await extension.tool(
+      "repeat-coalescing",
+      {
+        action: "repeat",
+        instruction: "Check again.",
+        intervalSeconds: 0.02,
+        quickRef: "coalescing test",
+        timeoutSeconds: 1,
+      },
+      new AbortController().signal,
+      undefined,
+      ctx
+    );
+    const { id } = receiptOf(started);
+    await extension.agentSettled(ctx);
+
+    await vi.waitFor(() => {
+      expect(extension.messages).toHaveLength(1);
+    });
+    await sleep(70);
+    expect(extension.messages).toHaveLength(1);
+
+    await extension.agentSettled(ctx);
+    const status = await extension.tool(
+      "repeat-status",
+      { action: "status", id },
+      new AbortController().signal,
+      undefined,
+      ctx
+    );
+    expect(receiptOf(status).deliveries).toBe(1);
+    expect(receiptOf(status).missedTicks).toBeGreaterThanOrEqual(2);
+
+    await extension.tool(
+      "repeat-complete",
+      { action: "complete", id },
+      new AbortController().signal,
+      undefined,
+      ctx
+    );
+  });
+
+  it("uses an optional shell gate without treating it as the action", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "pi-until-repeat-gate-"));
+    const readyFile = join(directory, "ready");
+    tempDirectories.push(directory);
+    const session = new FakeSession();
+    const extension = loadExtension(session);
+    live.push(extension);
+    const { ctx } = session.context({ idle: true });
+
+    const started = await extension.tool(
+      "repeat-gated",
+      {
+        action: "repeat",
+        condition: `test -f ${JSON.stringify(readyFile)}`,
+        immediate: true,
+        instruction: "Inspect the gated work.",
+        intervalSeconds: 0.02,
+        quickRef: "gated follow-up",
+        timeoutSeconds: 1,
+      },
+      new AbortController().signal,
+      undefined,
+      ctx
+    );
+    const { id } = receiptOf(started);
+    await sleep(10);
+    expect(extension.messages).toHaveLength(0);
+
+    writeFileSync(readyFile, "ready\n", "utf-8");
+    await vi.waitFor(() => {
+      expect(extension.messages).toHaveLength(1);
+    });
+    expect(extension.messages[0]?.message.content).toContain(
+      "Inspect the gated work."
+    );
+
+    await extension.tool(
+      "repeat-gated-complete",
+      { action: "complete", id },
+      new AbortController().signal,
+      undefined,
+      ctx
+    );
+  });
+
+  it("wakes once with a terminal receipt when a recurrence expires", async () => {
+    const session = new FakeSession();
+    const extension = loadExtension(session);
+    live.push(extension);
+    const { ctx } = session.context({ idle: true });
+
+    await extension.tool(
+      "repeat-expiry",
+      {
+        action: "repeat",
+        instruction: "This instruction must not be reactivated at expiry.",
+        intervalSeconds: 0.1,
+        quickRef: "expiry test",
+        timeoutSeconds: 0.02,
+      },
+      new AbortController().signal,
+      undefined,
+      ctx
+    );
+
+    await vi.waitFor(() => {
+      expect(extension.messages).toHaveLength(1);
+    });
+    const [expired] = extension.messages;
+    expect(expired?.message.content).toContain("# Recurring follow-up expired");
+    expect(expired?.message.content).toContain(
+      "This recurrence is no longer active"
+    );
+    expect(expired?.message.content).not.toContain(
+      "This instruction must not be reactivated"
+    );
+  });
+
+  it("requires a bounded immutable snapshot for repeat", async () => {
+    const session = new FakeSession();
+    const extension = loadExtension(session);
+    live.push(extension);
+    const { ctx } = session.context();
+
+    await expect(
+      extension.tool(
+        "repeat-invalid",
+        {
+          action: "repeat",
+          instruction: "Check later.",
+          quickRef: "missing deadline",
+        },
+        new AbortController().signal,
+        undefined,
+        ctx
+      )
+    ).rejects.toThrow(/timeoutSeconds/u);
+  });
+
   it("rejects print and json modes", async () => {
     const session = new FakeSession();
     const extension = loadExtension(session);

@@ -11,11 +11,17 @@ import type { PiUntilOptions, WatchReceipt } from "../extensions/pi-until.ts";
 import type { TelemetryEventInput } from "../src/telemetry.ts";
 
 export interface UntilToolParams {
-  action: "start" | "list" | "status" | "cancel";
+  action: "start" | "repeat" | "list" | "status" | "complete" | "cancel";
+  checkTimeoutSeconds?: number;
   condition?: string;
+  contextRefs?: { label: string; target: string }[];
+  cwd?: string;
   id?: string;
+  immediate?: boolean;
+  instruction?: string;
   intervalSeconds?: number;
   label?: string;
+  quickRef?: string;
   timeoutSeconds?: number;
   wake?: "agent" | "notify";
 }
@@ -50,7 +56,9 @@ export type StartReason = "startup" | "reload" | "new" | "resume" | "fork";
 export type ShutdownReason = "quit" | "reload" | "new" | "resume" | "fork";
 export type SessionEvent =
   | { type: "session_start"; reason: StartReason }
-  | { type: "session_shutdown"; reason: ShutdownReason };
+  | { type: "session_shutdown"; reason: ShutdownReason }
+  | { type: "agent_start" }
+  | { type: "agent_settled" };
 
 type SessionHandler = (
   event: SessionEvent,
@@ -78,15 +86,21 @@ export class FakeSession {
   }
 
   context(
-    overrides: Partial<{ mode: string; notify: ReturnType<typeof vi.fn> }> = {}
+    overrides: Partial<{
+      idle: boolean;
+      mode: string;
+      notify: ReturnType<typeof vi.fn>;
+    }> = {}
   ) {
     const notify = overrides.notify ?? vi.fn();
     const setWidget = vi.fn();
     const ctx = {
       cwd: process.cwd(),
+      isIdle: () => overrides.idle ?? true,
       mode: overrides.mode ?? "tui",
       sessionManager: {
         getBranch: () => [...this.entries],
+        getLeafId: () => this.entries.at(-1)?.id ?? "origin-entry",
         getSessionId: () => this.id,
       },
       ui: { notify, setWidget },
@@ -99,6 +113,8 @@ export class FakeSession {
 }
 
 export interface FakeExtension {
+  readonly agentSettled: (ctx: ExtensionContext) => Promise<void>;
+  readonly agentStart: (ctx: ExtensionContext) => Promise<void>;
   readonly appendEntry: ReturnType<typeof vi.fn>;
   readonly commands: Map<
     string,
@@ -184,6 +200,8 @@ export const loadExtension = (
   const shutdownContext = session.context().ctx;
 
   return {
+    agentSettled: (ctx) => emit({ type: "agent_settled" }, ctx),
+    agentStart: (ctx) => emit({ type: "agent_start" }, ctx),
     appendEntry,
     commands,
     entries,

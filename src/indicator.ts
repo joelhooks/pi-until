@@ -5,17 +5,26 @@ export type WatchDisplayStatus =
   | "running"
   | "succeeded"
   | "timedOut"
+  | "completed"
+  | "expired"
   | "cancelled"
   | "failed";
 
-export type WatchPhase = "checking" | "sleeping";
+export type WatchPhase =
+  | "checking"
+  | "sleeping"
+  | "duePending"
+  | "awaitingSettlement";
 
 export interface WatchDisplay {
   readonly attempts: number;
+  readonly deliveries: number;
   readonly id: string;
   readonly intervalMs: number;
+  readonly kind: "until" | "recurring";
   readonly label: string;
-  readonly lastCheckedAt?: number;
+  readonly missedTicks: number;
+  readonly nextDueAt: number;
   readonly phase?: WatchPhase;
   readonly startedAt: number;
   readonly status: WatchDisplayStatus;
@@ -45,25 +54,29 @@ function spinnerFrame(now: number): string {
 }
 
 function nextCheckText(watch: WatchDisplay, now: number): string | undefined {
-  if (
-    watch.status !== "running" ||
-    watch.phase !== "sleeping" ||
-    watch.lastCheckedAt === undefined
-  ) {
+  if (watch.status !== "running" || watch.phase !== "sleeping") {
     return undefined;
   }
-  return `next ${formatDuration(watch.lastCheckedAt + watch.intervalMs - now)}`;
+  return `next ${formatDuration(watch.nextDueAt - now)}`;
 }
 
 function statusText(watch: WatchDisplay, now: number): string {
   if (watch.status !== "running") return watch.status;
   if (watch.phase === "checking") return "checking";
+  if (watch.phase === "duePending") return "due · waiting for idle";
+  if (watch.phase === "awaitingSettlement") return "follow-up running";
   return nextCheckText(watch, now) ?? "sleeping";
 }
 
 function statusIcon(watch: WatchDisplay, now: number, theme: Theme): string {
-  if (watch.status === "succeeded") return theme.fg("success", "✓");
-  if (watch.status === "failed" || watch.status === "timedOut") {
+  if (watch.status === "succeeded" || watch.status === "completed") {
+    return theme.fg("success", "✓");
+  }
+  if (
+    watch.status === "failed" ||
+    watch.status === "timedOut" ||
+    watch.status === "expired"
+  ) {
     return theme.fg("error", "✗");
   }
   if (watch.status === "cancelled") return theme.fg("muted", "■");
@@ -106,10 +119,14 @@ function bottomBorder(content: string, width: number, theme: Theme): string {
 }
 
 function watchMetrics(watch: WatchDisplay, now: number, theme: Theme): string {
+  const activity =
+    watch.kind === "recurring"
+      ? `${watch.deliveries} ${watch.deliveries === 1 ? "wake" : "wakes"}${watch.missedTicks > 0 ? ` · ${watch.missedTicks} missed` : ""}`
+      : `${watch.attempts} ${watch.attempts === 1 ? "check" : "checks"}`;
   const parts = [
     statusText(watch, now),
     `${formatDuration(now - watch.startedAt)} elapsed`,
-    `${watch.attempts} ${watch.attempts === 1 ? "check" : "checks"}`,
+    activity,
   ];
   return theme.fg("muted", parts.join(" · "));
 }
@@ -132,7 +149,7 @@ export function renderWatchIndicator(
     const body = `${statusIcon(watch, now, theme)} ${watchMetrics(watch, now, theme)}`;
     const footer = theme.fg(
       "dim",
-      `${watch.id} · wakes ${watch.wake} · /until-list`
+      `${watch.id} · ${watch.kind === "recurring" ? "recurring" : `wakes ${watch.wake}`} · /until-list`
     );
     return [
       topBorder(title, width, theme),
@@ -204,7 +221,7 @@ export function renderWatchPanel(
         row(
           theme.fg(
             "dim",
-            `${watch.id} · ${statusText(watch, now)} · ${formatDuration(now - watch.startedAt)} elapsed · ${watch.attempts} checks · wakes ${watch.wake}`
+            `${watch.id} · ${watch.kind} · ${statusText(watch, now)} · ${formatDuration(now - watch.startedAt)} elapsed · ${watch.kind === "recurring" ? `${watch.deliveries} wakes · ${watch.missedTicks} missed` : `${watch.attempts} checks · wakes ${watch.wake}`}`
           ),
           width,
           theme

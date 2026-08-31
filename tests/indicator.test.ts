@@ -8,6 +8,7 @@ import {
   type WatchDisplay,
 } from "../src/indicator.ts";
 
+// SAFETY: indicator tests use only Theme.bold and Theme.fg.
 const theme = {
   bold: (text: string) => text,
   fg: (_color: string, text: string) => text,
@@ -16,10 +17,13 @@ const theme = {
 function watch(overrides: Partial<WatchDisplay> = {}): WatchDisplay {
   return {
     attempts: 5,
+    deliveries: 0,
     id: "8f2c1a7d",
     intervalMs: 30_000,
+    kind: "until",
     label: "deploy verification",
-    lastCheckedAt: 100_000,
+    missedTicks: 0,
+    nextDueAt: 130_000,
     phase: "sleeping",
     startedAt: -34_000,
     status: "running",
@@ -39,6 +43,25 @@ describe("pi-until watch indicator", () => {
     expect(lines.join("\n")).toContain("5 checks");
     expect(lines.join("\n")).toContain("wakes agent");
     expect(lines.every((line) => visibleWidth(line) === 64)).toBe(true);
+  });
+
+  it("shows recurring delivery and missed-tick counts", () => {
+    const lines = renderWatchIndicator(
+      [
+        watch({
+          attempts: 0,
+          deliveries: 3,
+          kind: "recurring",
+          missedTicks: 2,
+        }),
+      ],
+      100_000,
+      64,
+      theme
+    );
+
+    expect(lines.join("\n")).toContain("3 wakes · 2 missed");
+    expect(lines.join("\n")).toContain("recurring");
   });
 
   it("compresses multiple watches and points to the full panel", () => {

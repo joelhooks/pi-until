@@ -1,14 +1,15 @@
 {
   "name": "@joelhooks/pi-until",
-  "version": "0.2.0",
-  "description": "Non-blocking shell-condition watches that wake a live Pi session when work is ready to continue.",
+  "version": "0.3.0",
+  "description": "Session-scoped shell-condition watches and recurring agent follow-ups for Pi.",
   "keywords": [
     "async",
     "monitor",
     "pi",
     "pi-extension",
     "pi-package",
-    "polling"
+    "polling",
+    "recurring"
   ],
   "homepage": "https://github.com/joelhooks/pi-until#readme",
   "bugs": {

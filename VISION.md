@@ -2,21 +2,23 @@
 
 ## Who it serves
 
-Pi users and agents that start slow external work and need the same live session to resume when a cheap condition becomes true.
+Pi users and agents that need the same live session to resume when a cheap condition becomes true or a recurring task becomes due.
 
 ## Outcome
 
-The agent can release its turn, keep working on other requests, and wake with a small completion receipt. No polling loops consume a tool call or model turn.
+The agent can release its turn, keep working on other requests, and wake with a small receipt. No polling loop consumes a tool call or model turn. A recurring task can return on fixed cadence without stacking follow-up turns or escaping the owning session.
 
 ## Boundaries
 
-- One universal condition: a side-effect-free shell command exits 0.
+- One universal shell gate: a side-effect-free command exits 0.
+- A recurring wake carries an immutable instruction, quick reference, opaque context pointers, origin entry, and receipt.
+- Recurring work ends only through explicit completion, cancellation, failure, or expiry. The shell gate permits a wake; it never completes the work.
 - Watches belong to one live Pi session/process. `/reload` keeps both alive, so watches survive it by suspending to a session entry and restarting in the new extension instance.
-- Agent wake and notification-only completion are both supported.
-- Cancellation, per-check timeout, and overall timeout are explicit machine states.
-- The extension does not become a daemon, scheduler, workflow engine, or outward notification gateway.
+- Agent wake and notification-only completion are supported for one-shot shell watches. Recurring watches always wake the agent.
+- Cancellation, completion, per-check timeout, overall expiry, pending delivery, and settlement are explicit machine states.
+- The extension does not become a daemon, durable scheduler, workflow engine, side-effect runner, or outward notification gateway.
 - The extension never claims durability across session replacement, process exit, or machine reboot. A suspension entry written by a dead process is a historical fact, not authority.
-- Usage telemetry stays local: a JSONL file under `~/.pi/agent/pi-until/`, condition text never written, no network.
+- Usage telemetry stays local: a JSONL file under `~/.pi/agent/pi-until/`; condition text, recurring instructions, and context pointers are never written; no network.
 
 ## Taste
 

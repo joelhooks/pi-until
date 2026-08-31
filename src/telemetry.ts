@@ -23,9 +23,15 @@ export const DEFAULT_TELEMETRY_FILE = join(
 );
 
 const wakeSchema = Type.Union([Type.Literal("agent"), Type.Literal("notify")]);
+const watchKindSchema = Type.Union([
+  Type.Literal("until"),
+  Type.Literal("recurring"),
+]);
 const finalStatusSchema = Type.Union([
   Type.Literal("succeeded"),
   Type.Literal("timedOut"),
+  Type.Literal("completed"),
+  Type.Literal("expired"),
   Type.Literal("cancelled"),
   Type.Literal("failed"),
 ]);
@@ -48,20 +54,24 @@ const startedSchema = Type.Object({
   resumed: Type.Boolean(),
   timeoutMs: Type.Optional(Type.Number()),
   wake: wakeSchema,
+  watchKind: Type.Optional(watchKindSchema),
 });
 
 const finishedSchema = Type.Object({
   ...base,
   attempts: Type.Number(),
   conditionHash: Type.String(),
+  deliveries: Type.Optional(Type.Number()),
   durationMs: Type.Number(),
   event: Type.Literal("finished"),
   id: Type.String(),
   lastCheckKilled: Type.Optional(Type.Boolean()),
   lastExitCode: Type.Optional(Type.Number()),
+  missedTicks: Type.Optional(Type.Number()),
   reloads: Type.Number(),
   status: finalStatusSchema,
   wake: wakeSchema,
+  watchKind: Type.Optional(watchKindSchema),
 });
 
 const suspendedSchema = Type.Object({
@@ -80,8 +90,10 @@ const actionSchema = Type.Object({
   ...base,
   action: Type.Union([
     Type.Literal("start"),
+    Type.Literal("repeat"),
     Type.Literal("list"),
     Type.Literal("status"),
+    Type.Literal("complete"),
     Type.Literal("cancel"),
     Type.Literal("stats"),
   ]),

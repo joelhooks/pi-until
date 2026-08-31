@@ -1,30 +1,65 @@
 import { describe, expect, it, vi } from "vitest";
 import { createActor } from "xstate";
 
-import { createUntilMachine } from "../src/machine.ts";
+import { initialFacts } from "../src/domain.ts";
 import type {
-  RunUntilCheck,
-  UntilInput,
-  UntilTerminalState,
-} from "../src/machine.ts";
+  RecurringDefinition,
+  UntilDefinition,
+  WatchActorInput,
+  WatchFacts,
+} from "../src/domain.ts";
+import { createWatchMachine } from "../src/machine.ts";
+import type { RunUntilCheck, WatchTerminalState } from "../src/machine.ts";
 
-function input(overrides: Partial<UntilInput> = {}): UntilInput {
-  return {
+const untilDefinition = (
+  overrides: Partial<UntilDefinition> = {}
+): UntilDefinition => ({
+  gate: {
     checkTimeoutMs: 100,
     command: "true",
     cwd: process.cwd(),
-    id: "test",
-    intervalMs: 5,
-    label: "test condition",
-    startedAt: Date.now(),
-    wake: "agent",
-    ...overrides,
-  };
-}
+  },
+  intervalMs: 5,
+  kind: "until",
+  label: "test condition",
+  wake: "agent",
+  ...overrides,
+});
+
+const recurringDefinition = (
+  overrides: Partial<RecurringDefinition> = {}
+): RecurringDefinition => ({
+  expiresAt: 100,
+  first: "now",
+  intervalMs: 5,
+  kind: "recurring",
+  label: "recurring test",
+  snapshot: {
+    capturedAt: 0,
+    contextRefs: [],
+    instruction: "Check the work.",
+    origin: { sessionId: "s1" },
+    quickRef: "test",
+  },
+  ...overrides,
+});
+
+const input = (
+  definition: UntilDefinition | RecurringDefinition,
+  facts: Partial<WatchFacts> = {},
+  sessionIdle = true
+): WatchActorInput => ({
+  definition,
+  facts: {
+    ...initialFacts(definition, "test", 0),
+    ...facts,
+  },
+  sessionIdle,
+});
 
 async function waitForDone(
-  actor: ReturnType<typeof createActor<ReturnType<typeof createUntilMachine>>>
-): Promise<UntilTerminalState> {
+  actor: ReturnType<typeof createActor<ReturnType<typeof createWatchMachine>>>
+): Promise<WatchTerminalState> {
   return new Promise((resolve, reject) => {
     const subscription = actor.subscribe({
       error: reject,
@@ -33,58 +68,66 @@ async function waitForDone(
         subscription.unsubscribe();
         const value = snapshot.value;
         if (
-          value === "succeeded" ||
-          value === "timedOut" ||
+          value === "satisfied" ||
+          value === "completed" ||
+          value === "expired" ||
           value === "cancelled"
-        )
+        ) {
           resolve(value);
-        else reject(new Error(`unexpected terminal state: ${String(value)}`));
+        } else {
+          reject(new Error(`unexpected terminal state: ${String(value)}`));
+        }
       },
     });
   });
 }
 
-describe("pi-until machine", () => {
-  it("polls until a check exits zero", async () => {
+describe("pi-until watch machine", () => {
+  it("polls until a gate exits zero", async () => {
     const runCheck = vi
       .fn<RunUntilCheck>()
-      .mockResolvedValueOnce({
-        code: 1,
-        killed: false,
-      })
-      .mockResolvedValueOnce({
-        code: 0,
-        killed: false,
-      });
-    const actor = createActor(createUntilMachine(runCheck), { input: input() });
+      .mockResolvedValueOnce({ code: 1, killed: false })
+      .mockResolvedValueOnce({ code: 0, killed: false });
+    const startedAt = Date.now();
+    const definition = untilDefinition();
+    const actor = createActor(createWatchMachine(runCheck), {
+      input: input(definition, {
+        nextDueAt: startedAt,
+        startedAt,
+      }),
+    });
     const done = waitForDone(actor);
 
     actor.start();
 
-    await expect(done).resolves.toBe("succeeded");
+    await expect(done).resolves.toBe("satisfied");
     expect(runCheck).toHaveBeenCalledTimes(2);
-    expect(actor.getSnapshot().context.attempts).toBe(2);
-    expect(actor.getSnapshot().context.lastResult).toEqual({
+    expect(actor.getSnapshot().context.facts.attempts).toBe(2);
+    expect(actor.getSnapshot().context.facts.lastResult).toEqual({
       code: 0,
       killed: false,
     });
   });
 
-  it("does not treat a killed check with code zero as success", async () => {
+  it("does not treat a killed gate with code zero as true", async () => {
     const runCheck = vi
       .fn<RunUntilCheck>()
       .mockResolvedValueOnce({ code: 0, killed: true })
       .mockResolvedValueOnce({ code: 0, killed: false });
-    const actor = createActor(createUntilMachine(runCheck), { input: input() });
+    const startedAt = Date.now();
+    const definition = untilDefinition();
+    const actor = createActor(createWatchMachine(runCheck), {
+      input: input(definition, { nextDueAt: startedAt, startedAt }),
+    });
     const done = waitForDone(actor);
 
     actor.start();
 
-    await expect(done).resolves.toBe("succeeded");
+    await expect(done).resolves.toBe("satisfied");
     expect(runCheck).toHaveBeenCalledTimes(2);
   });
 
-  it("cancels an in-flight check through AbortSignal", async () => {
+  it("cancels an in-flight gate through AbortSignal", async () => {
     let aborted = false;
     const runCheck: RunUntilCheck = async (_input, signal) =>
       new Promise((_resolve, reject) => {
@@ -97,12 +140,16 @@ describe("pi-until machine", () => {
           { once: true }
         );
       });
-    const actor = createActor(createUntilMachine(runCheck), { input: input() });
+    const startedAt = Date.now();
+    const definition = untilDefinition();
+    const actor = createActor(createWatchMachine(runCheck), {
+      input: input(definition, { nextDueAt: startedAt, startedAt }),
+    });
     const done = waitForDone(actor);
 
     actor.start();
     await vi.waitFor(() => {
-      expect(actor.getSnapshot().context.attempts).toBe(1);
+      expect(actor.getSnapshot().context.facts.attempts).toBe(1);
     });
     actor.send({ type: "CANCEL" });
 
@@ -112,16 +159,52 @@ describe("pi-until machine", () => {
     });
   });
 
-  it("separates watch timeout from cancellation", async () => {
+  it("expires independently from cancellation", async () => {
+    const startedAt = Date.now();
+    const definition = untilDefinition({ expiresAt: startedAt + 5 });
     const runCheck = vi
       .fn<RunUntilCheck>()
       .mockResolvedValue({ code: 1, killed: false });
-    const actor = createActor(createUntilMachine(runCheck), { input: input() });
+    const actor = createActor(createWatchMachine(runCheck), {
+      input: input(definition, { nextDueAt: startedAt, startedAt }),
+    });
     const done = waitForDone(actor);
 
     actor.start();
-    actor.send({ type: "TIMEOUT" });
 
-    await expect(done).resolves.toBe("timedOut");
+    await expect(done).resolves.toBe("expired");
+  });
+
+  it("coalesces fixed-cadence ticks while one follow-up is pending", async () => {
+    let now = 0;
+    const definition = recurringDefinition();
+    const actor = createActor(
+      createWatchMachine(vi.fn<RunUntilCheck>(), () => now),
+      { input: input(definition, {}, false) }
+    );
+
+    actor.start();
+    expect(actor.getSnapshot().matches({ active: "duePending" })).toBe(true);
+    expect(actor.getSnapshot().context.facts.deliveries).toBe(0);
+
+    now = 1;
+    actor.send({ at: now, type: "SESSION_SETTLED" });
+    expect(actor.getSnapshot().matches({ active: "awaitingSettlement" })).toBe(
+      true
+    );
+    expect(actor.getSnapshot().context.facts).toMatchObject({
+      deliveries: 1,
+      missedTicks: 0,
+      nextDueAt: 5,
+    });
+
+    now = 16;
+    actor.send({ at: now, type: "SESSION_SETTLED" });
+    expect(actor.getSnapshot().matches({ active: "waiting" })).toBe(true);
+    expect(actor.getSnapshot().context.facts).toMatchObject({
+      deliveries: 1,
+      missedTicks: 3,
+      nextDueAt: 20,
+    });
   });
 });

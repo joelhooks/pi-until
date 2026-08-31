@@ -1,4 +1,18 @@
-import { assign, fromPromise, setup } from "xstate";
+import { assign, fromCallback, fromPromise, setup } from "xstate";
+
+import {
+  advanceAfterTick,
+  coalescePastDue,
+  expiresAtOf,
+  gateOf,
+} from "./domain.ts";
+import type {
+  CheckResult,
+  ShellGate,
+  WatchActorInput,
+  WatchContext,
+  WatchFacts,
+} from "./domain.ts";
 
 export interface UntilCheckInput {
   readonly command: string;
@@ -6,114 +20,318 @@ export interface UntilCheckInput {
   readonly checkTimeoutMs: number;
 }
 
-export interface UntilCheckResult {
-  readonly code: number;
-  readonly killed: boolean;
-}
+export type UntilCheckResult = CheckResult;
 
-export interface UntilInput extends UntilCheckInput {
-  readonly id: string;
-  readonly label: string;
-  readonly intervalMs: number;
-  readonly timeoutMs?: number;
-  readonly wake: "agent" | "notify";
-  readonly startedAt: number;
-}
-
-export interface UntilContext extends UntilInput {
-  readonly attempts: number;
-  readonly lastCheckedAt?: number;
-  readonly lastResult?: UntilCheckResult;
-}
-
-export type UntilEvent =
+export type WatchEvent =
   | { readonly type: "CANCEL" }
-  | { readonly type: "TIMEOUT" };
+  | { readonly type: "COMPLETE" }
+  | { readonly at: number; readonly type: "EXPIRE" }
+  | { readonly type: "SESSION_BUSY" }
+  | { readonly at: number; readonly type: "SESSION_SETTLED" };
 
-export type UntilTerminalState = "succeeded" | "timedOut" | "cancelled";
+export type WatchTerminalState =
+  | "satisfied"
+  | "completed"
+  | "expired"
+  | "cancelled";
 
 export type RunUntilCheck = (
   input: UntilCheckInput,
   signal: AbortSignal
 ) => Promise<UntilCheckResult>;
 
-export function createUntilMachine(runCheck: RunUntilCheck) {
+const passed = (result: UntilCheckResult): boolean =>
+  result.code === 0 && !result.killed;
+
+const withCheckResult = (
+  facts: WatchFacts,
+  result: UntilCheckResult,
+  checkedAt: number
+): WatchFacts => ({
+  ...facts,
+  lastCheckedAt: checkedAt,
+  lastResult: result,
+});
+
+const afterNoMatch = (
+  context: WatchContext,
+  result: UntilCheckResult,
+  checkedAt: number
+): WatchFacts => {
+  const checked = {
+    ...withCheckResult(context.facts, result, checkedAt),
+    deliveryPending: false,
+  };
+  return context.definition.kind === "until"
+    ? {
+        ...checked,
+        nextDueAt: checkedAt + context.definition.intervalMs,
+      }
+    : advanceAfterTick(checked, context.definition.intervalMs, checkedAt);
+};
+
+const afterDeliveryRequested = (
+  context: WatchContext,
+  requestedAt: number,
+  result?: UntilCheckResult
+): WatchFacts => {
+  const checked =
+    result === undefined
+      ? context.facts
+      : withCheckResult(context.facts, result, requestedAt);
+  return advanceAfterTick(
+    {
+      ...checked,
+      deliveries: checked.deliveries + 1,
+      deliveryPending: false,
+    },
+    context.definition.intervalMs,
+    requestedAt
+  );
+};
+
+export function createWatchMachine(
+  runCheck: RunUntilCheck,
+  now: () => number = Date.now
+) {
   return setup({
     actions: {
+      coalesceAtExpiry: assign({
+        facts: ({ context, event }) => {
+          if (context.definition.kind !== "recurring") return context.facts;
+          const at = event.type === "EXPIRE" ? event.at : now();
+          return coalescePastDue(
+            context.facts,
+            context.definition.intervalMs,
+            at
+          );
+        },
+      }),
       countAttempt: assign({
-        attempts: ({ context }) => context.attempts + 1,
+        facts: ({ context }) => ({
+          ...context.facts,
+          attempts: context.facts.attempts + 1,
+        }),
+      }),
+      markDeliveryPending: assign({
+        facts: ({ context }) => ({
+          ...context.facts,
+          deliveryPending: true,
+        }),
+      }),
+      markSessionBusy: assign({ sessionIdle: false }),
+      markSessionIdle: assign({ sessionIdle: true }),
+      prepareDelivery: assign({
+        facts: ({ context }) => afterDeliveryRequested(context, now()),
+      }),
+      settleDelivery: assign({
+        facts: ({ context, event }) =>
+          context.definition.kind === "recurring"
+            ? coalescePastDue(
+                context.facts,
+                context.definition.intervalMs,
+                event.type === "SESSION_SETTLED" ? event.at : now()
+              )
+            : context.facts,
+        sessionIdle: true,
       }),
     },
     actors: {
-      checkCondition: fromPromise<UntilCheckResult, UntilCheckInput>(
+      checkCondition: fromPromise<UntilCheckResult, ShellGate>(
         async ({ input, signal }) => runCheck(input, signal)
+      ),
+      expiryTimer: fromCallback<WatchEvent, { expiresAt?: number }>(
+        ({ input, sendBack }) => {
+          const expiresAt = input.expiresAt;
+          const timer =
+            expiresAt === undefined
+              ? undefined
+              : setTimeout(
+                  () => sendBack({ at: expiresAt, type: "EXPIRE" }),
+                  Math.max(0, expiresAt - now())
+                );
+          return () => {
+            if (timer !== undefined) clearTimeout(timer);
+          };
+        }
       ),
     },
     delays: {
-      pollInterval: ({ context }) => context.intervalMs,
+      untilDue: ({ context }) => Math.max(0, context.facts.nextDueAt - now()),
     },
-    types: {},
+    guards: {
+      dueWithoutGate: ({ context }) =>
+        context.definition.kind === "recurring" &&
+        gateOf(context.definition) === undefined &&
+        context.facts.nextDueAt <= now(),
+      expired: ({ context }) => {
+        const expiresAt = expiresAtOf(context.definition);
+        return expiresAt !== undefined && expiresAt <= now();
+      },
+      hasDueGate: ({ context }) =>
+        gateOf(context.definition) !== undefined &&
+        context.facts.nextDueAt <= now(),
+      isRecurring: ({ context }) => context.definition.kind === "recurring",
+      sessionIdle: ({ context }) => context.sessionIdle,
+    },
+    types: {
+      // SAFETY: XState reads these empty values only as compile-time type witnesses.
+      context: {} as WatchContext,
+      // SAFETY: XState reads these empty values only as compile-time type witnesses.
+      events: {} as WatchEvent,
+      // SAFETY: XState reads these empty values only as compile-time type witnesses.
+      input: {} as WatchActorInput,
+    },
   }).createMachine({
-    context: ({ input }) => ({ ...input, attempts: 0 }),
-    id: "until",
-    initial: "running",
+    context: ({ input }) => input,
+    id: "watch",
+    initial: "active",
     states: {
-      cancelled: { type: "final" },
-      running: {
-        initial: "checking",
+      active: {
+        initial: "routing",
+        invoke: {
+          id: "expiryTimer",
+          input: ({ context }) => ({
+            expiresAt: expiresAtOf(context.definition),
+          }),
+          src: "expiryTimer",
+        },
         on: {
           CANCEL: "cancelled",
-          TIMEOUT: "timedOut",
+          COMPLETE: {
+            guard: "isRecurring",
+            target: "completed",
+          },
+          EXPIRE: {
+            actions: "coalesceAtExpiry",
+            target: "expired",
+          },
+          SESSION_BUSY: { actions: "markSessionBusy" },
+          SESSION_SETTLED: { actions: "markSessionIdle" },
         },
         states: {
+          awaitingSettlement: {
+            on: {
+              SESSION_SETTLED: {
+                actions: "settleDelivery",
+                target: "routing",
+              },
+            },
+          },
           checking: {
             entry: "countAttempt",
             invoke: {
-              input: ({ context }) => ({
-                command: context.command,
-                cwd: context.cwd,
-                checkTimeoutMs: context.checkTimeoutMs,
-              }),
+              id: "checkCondition",
+              input: ({ context }) => {
+                const gate = gateOf(context.definition);
+                if (gate === undefined) {
+                  throw new Error("checking requires a shell gate");
+                }
+                return gate;
+              },
               onDone: [
                 {
-                  guard: ({ event }) =>
-                    event.output.code === 0 && !event.output.killed,
-                  target: "#until.succeeded",
                   actions: assign({
-                    lastCheckedAt: () => Date.now(),
-                    lastResult: ({ event }) => event.output,
+                    facts: ({ context, event }) =>
+                      withCheckResult(context.facts, event.output, now()),
                   }),
+                  guard: ({ context, event }) =>
+                    context.definition.kind === "until" && passed(event.output),
+                  target: "#watch.satisfied",
                 },
                 {
-                  target: "sleeping",
                   actions: assign({
-                    lastCheckedAt: () => Date.now(),
-                    lastResult: ({ event }) => event.output,
+                    facts: ({ context, event }) =>
+                      afterDeliveryRequested(context, now(), event.output),
                   }),
+                  guard: ({ context, event }) =>
+                    context.definition.kind === "recurring" &&
+                    passed(event.output) &&
+                    context.sessionIdle,
+                  target: "awaitingSettlement",
+                },
+                {
+                  actions: assign({
+                    facts: ({ context, event }) => ({
+                      ...withCheckResult(context.facts, event.output, now()),
+                      deliveryPending: true,
+                    }),
+                  }),
+                  guard: ({ context, event }) =>
+                    context.definition.kind === "recurring" &&
+                    passed(event.output),
+                  target: "duePending",
+                },
+                {
+                  actions: assign({
+                    facts: ({ context, event }) =>
+                      afterNoMatch(context, event.output, now()),
+                  }),
+                  target: "routing",
                 },
               ],
               onError: {
                 actions: assign({
-                  lastCheckedAt: () => Date.now(),
-                  lastResult: () => ({
-                    code: -1,
-                    killed: false,
-                  }),
+                  facts: ({ context }) =>
+                    afterNoMatch(context, { code: -1, killed: false }, now()),
                 }),
-                target: "sleeping",
+                target: "routing",
               },
               src: "checkCondition",
             },
           },
-          sleeping: {
-            after: {
-              pollInterval: "checking",
+          duePending: {
+            on: {
+              SESSION_SETTLED: {
+                actions: ["markSessionIdle", "prepareDelivery"],
+                target: "awaitingSettlement",
+              },
             },
+          },
+          routing: {
+            always: [
+              {
+                actions: "coalesceAtExpiry",
+                guard: "expired",
+                target: "#watch.expired",
+              },
+              {
+                actions: "prepareDelivery",
+                guard: ({ context }) =>
+                  context.facts.deliveryPending && context.sessionIdle,
+                target: "awaitingSettlement",
+              },
+              {
+                guard: ({ context }) => context.facts.deliveryPending,
+                target: "duePending",
+              },
+              { guard: "hasDueGate", target: "checking" },
+              {
+                actions: "prepareDelivery",
+                guard: ({ context }) =>
+                  context.definition.kind === "recurring" &&
+                  gateOf(context.definition) === undefined &&
+                  context.facts.nextDueAt <= now() &&
+                  context.sessionIdle,
+                target: "awaitingSettlement",
+              },
+              {
+                actions: "markDeliveryPending",
+                guard: "dueWithoutGate",
+                target: "duePending",
+              },
+              { target: "waiting" },
+            ],
+          },
+          waiting: {
+            after: { untilDue: "routing" },
           },
         },
       },
-      succeeded: { type: "final" },
-      timedOut: { type: "final" },
+      cancelled: { type: "final" },
+      completed: { type: "final" },
+      expired: { type: "final" },
+      satisfied: { type: "final" },
     },
   });
 }

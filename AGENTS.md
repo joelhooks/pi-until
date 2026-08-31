@@ -14,14 +14,16 @@ Node is `24.18.0`. Use npm `11.16.0`; never Bun. `devEngines` fails hard on any 
 
 ## Architecture
 
-- `src/machine.ts` owns the XState v5 watch lifecycle.
+- `src/domain.ts` owns immutable watch definitions, facts, and fixed-cadence math.
+- `src/machine.ts` owns the XState v5 shell and recurring watch lifecycle.
+- `src/packet.ts` owns recurring Markdown wake and expiry packets.
 - `src/check.ts` owns bounded shell execution and process-group termination.
 - `src/completion.ts` owns agent-wake versus notify-only routing.
 - `src/suspension.ts` owns the `pi-until-suspended` session entry: suspend a watch to a value, parse it back at the boundary, keep the timeout anchored.
 - `src/telemetry.ts` owns local JSONL usage events, the condition hash/head, and `/until-stats` summaries.
 - `extensions/pi-until.ts` owns Pi integration, receipts, UI status, reload suspend/resume, and lifecycle cleanup.
 - `tests/fake-pi.ts` is the typed Pi fake. Use it instead of `as unknown as ExtensionAPI` in new tests.
-- Tests must exercise transitions, retries, per-check timeout, cancellation, descendant termination, wake behavior, and reload suspend/resume.
+- Tests must exercise transitions, retries, per-check timeout, cancellation, descendant termination, wake behavior, recurring coalescing, explicit completion, expiry, and reload suspend/resume.
 
 ## Invariants
 

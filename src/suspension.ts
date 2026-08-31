@@ -3,18 +3,35 @@ import { Type } from "typebox";
 import type { Static } from "typebox";
 import { Value } from "typebox/value";
 
-import type { UntilInput } from "./machine.ts";
+import { watchDefinitionSchema, watchFactsSchema } from "./domain.ts";
+import type {
+  WatchActorInput,
+  WatchContext,
+  WatchDefinition,
+  WatchFacts,
+} from "./domain.ts";
 
-/**
- * Session entry written on `session_shutdown { reason: "reload" }` and read
- * back on `session_start { reason: "reload" }`. Pi keeps the process and the
- * session alive across `/reload`; only the extension closure is replaced. The
- * watch definitions are plain values, so they cross that boundary as data and
- * the runs are rebuilt on the other side.
- */
 export const SUSPENDED_ENTRY_TYPE = "pi-until-suspended";
+export const SUSPENSION_VERSION = 2;
 
-const suspendedWatchSchema = Type.Object({
+const persistedWatchSchema = Type.Object(
+  {
+    definition: watchDefinitionSchema,
+    facts: watchFactsSchema,
+  },
+  { additionalProperties: false }
+);
+
+const suspensionDataSchema = Type.Object(
+  {
+    suspendedAt: Type.String(),
+    v: Type.Literal(SUSPENSION_VERSION),
+    watches: Type.Array(persistedWatchSchema),
+  },
+  { additionalProperties: false }
+);
+
+const legacyWatchSchema = Type.Object({
   attempts: Type.Number(),
   checkTimeoutMs: Type.Number(),
   command: Type.String(),
@@ -28,92 +45,106 @@ const suspendedWatchSchema = Type.Object({
   wake: Type.Union([Type.Literal("agent"), Type.Literal("notify")]),
 });
 
-const suspensionDataSchema = Type.Object({
+const legacySuspensionDataSchema = Type.Object({
   suspendedAt: Type.String(),
-  watches: Type.Array(suspendedWatchSchema),
+  watches: Type.Array(legacyWatchSchema),
 });
 
-export type SuspendedWatch = Static<typeof suspendedWatchSchema>;
-export type SuspensionData = Static<typeof suspensionDataSchema>;
-
-export interface WatchHistory {
-  /** Attempts made by earlier runs of the same watch before a reload. */
-  readonly attempts: number;
-  /** Number of reloads this watch has survived. */
-  readonly reloads: number;
+export interface PersistedWatch {
+  readonly definition: WatchDefinition;
+  readonly facts: WatchFacts;
 }
 
-export const suspendWatch = (
-  input: UntilInput,
-  history: WatchHistory,
-  attemptsThisRun: number
-): SuspendedWatch => {
-  const watch: SuspendedWatch = {
-    attempts: history.attempts + attemptsThisRun,
-    checkTimeoutMs: input.checkTimeoutMs,
-    command: input.command,
-    cwd: input.cwd,
-    id: input.id,
-    intervalMs: input.intervalMs,
-    label: input.label,
-    reloads: history.reloads + 1,
-    startedAt: input.startedAt,
-    wake: input.wake,
-  };
-  return input.timeoutMs === undefined
-    ? watch
-    : { ...watch, timeoutMs: input.timeoutMs };
-};
+export interface SuspensionData {
+  readonly suspendedAt: string;
+  readonly v: typeof SUSPENSION_VERSION;
+  readonly watches: readonly PersistedWatch[];
+}
+
+type LegacyWatch = Static<typeof legacyWatchSchema>;
+
+export const suspendWatch = (context: WatchContext): PersistedWatch => ({
+  definition: context.definition,
+  facts: {
+    ...context.facts,
+    reloads: context.facts.reloads + 1,
+  },
+});
 
 export const suspensionData = (
-  watches: readonly SuspendedWatch[],
+  watches: readonly PersistedWatch[],
   now: number
 ): SuspensionData => ({
   suspendedAt: new Date(now).toISOString(),
+  v: SUSPENSION_VERSION,
   watches: [...watches],
 });
 
+const normalizeLegacyWatch = (
+  watch: LegacyWatch,
+  suspendedAt: number
+): PersistedWatch => {
+  const base: WatchDefinition = {
+    gate: {
+      checkTimeoutMs: watch.checkTimeoutMs,
+      command: watch.command,
+      cwd: watch.cwd,
+    },
+    intervalMs: watch.intervalMs,
+    kind: "until",
+    label: watch.label,
+    wake: watch.wake,
+  };
+  const definition: WatchDefinition =
+    watch.timeoutMs === undefined
+      ? base
+      : { ...base, expiresAt: watch.startedAt + watch.timeoutMs };
+  const facts: WatchFacts = {
+    attempts: watch.attempts,
+    deliveries: 0,
+    deliveryPending: false,
+    id: watch.id,
+    missedTicks: 0,
+    nextDueAt: suspendedAt,
+    reloads: watch.reloads,
+    startedAt: watch.startedAt,
+  };
+  return { definition, facts };
+};
+
 /**
- * The most recent suspension entry on the branch is the only one with
- * authority. Every reload writes one, even when it is empty, so an older
- * entry can never resurrect watches that already finished.
+ * The newest suspension entry on the branch is the only authority. Version 1
+ * entries are normalized at this boundary; malformed newest entries resolve
+ * to an empty set instead of reviving older facts.
  */
 export const suspendedWatchesFrom = (
   entries: readonly SessionEntry[]
-): readonly SuspendedWatch[] => {
+): readonly PersistedWatch[] => {
   for (let index = entries.length - 1; index >= 0; index -= 1) {
     const entry = entries[index];
     if (entry?.type !== "custom" || entry.customType !== SUSPENDED_ENTRY_TYPE) {
       continue;
     }
-    return Value.Check(suspensionDataSchema, entry.data)
-      ? entry.data.watches
-      : [];
+    if (Value.Check(suspensionDataSchema, entry.data)) {
+      return entry.data.watches;
+    }
+    if (Value.Check(legacySuspensionDataSchema, entry.data)) {
+      const suspendedAt = Date.parse(entry.data.suspendedAt);
+      const normalizedAt = Number.isFinite(suspendedAt) ? suspendedAt : 0;
+      return entry.data.watches.map((watch) =>
+        normalizeLegacyWatch(watch, normalizedAt)
+      );
+    }
+    return [];
   }
   return [];
 };
 
-export const resumeInput = (watch: SuspendedWatch): UntilInput => {
-  const input: UntilInput = {
-    checkTimeoutMs: watch.checkTimeoutMs,
-    command: watch.command,
-    cwd: watch.cwd,
-    id: watch.id,
-    intervalMs: watch.intervalMs,
-    label: watch.label,
-    startedAt: watch.startedAt,
-    wake: watch.wake,
-  };
-  return watch.timeoutMs === undefined
-    ? input
-    : { ...input, timeoutMs: watch.timeoutMs };
-};
-
-/** Remaining overall timeout measured from the original start, never reset. */
-export const remainingTimeoutMs = (
-  watch: Pick<SuspendedWatch, "startedAt" | "timeoutMs">,
-  now: number
-): number | undefined =>
-  watch.timeoutMs === undefined
-    ? undefined
-    : Math.max(0, watch.startedAt + watch.timeoutMs - now);
+export const resumeInput = (
+  watch: PersistedWatch,
+  sessionIdle: boolean
+): WatchActorInput => ({
+  definition: watch.definition,
+  facts: watch.facts,
+  sessionIdle,
+});

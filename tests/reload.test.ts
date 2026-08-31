@@ -72,12 +72,16 @@ describe("pi-until across /reload", () => {
     );
     expect(suspended).toBeDefined();
     expect(suspended?.data).toMatchObject({
+      v: 2,
       watches: [
-        expect.objectContaining({ id: details.id, reloads: 1, wake: "agent" }),
+        expect.objectContaining({
+          definition: expect.objectContaining({ wake: "agent" }),
+          facts: expect.objectContaining({ id: details.id, reloads: 1 }),
+        }),
       ],
     });
     const suspendedWatches = suspendedWatchesFrom(session.entries);
-    const suspendedAttempts = suspendedWatches[0]?.attempts ?? 0;
+    const suspendedAttempts = suspendedWatches[0]?.facts.attempts ?? 0;
     expect(suspendedAttempts).toBeGreaterThan(0);
     expect(first.messages).toHaveLength(0);
     expect(first.telemetry).toContainEqual({ count: 1, event: "suspended" });
@@ -126,6 +130,127 @@ describe("pi-until across /reload", () => {
     expect(first.messages).toHaveLength(0);
   });
 
+  it("restores a recurring snapshot and its original fixed cadence", async () => {
+    const session = new FakeSession();
+    const first = loadExtension(session);
+    const { ctx } = session.context({ idle: true });
+    const started = await first.tool(
+      "repeat-reload",
+      {
+        action: "repeat",
+        contextRefs: [{ label: "Runbook", target: "docs/runbook.md" }],
+        instruction: "Inspect the release after reload.",
+        intervalSeconds: 0.05,
+        quickRef: "reload recurrence",
+        timeoutSeconds: 1,
+      },
+      new AbortController().signal,
+      undefined,
+      ctx
+    );
+    const { id } = receiptOf(started);
+    await sleep(10);
+    await first.shutdown("reload");
+    expect(first.messages).toHaveLength(0);
+
+    const second = loadExtension(session);
+    live.push(second);
+    const { ctx: resumedCtx } = session.context({ idle: true });
+    await second.sessionStart("reload", resumedCtx);
+    await vi.waitFor(() => {
+      expect(second.messages).toHaveLength(1);
+    });
+    expect(second.messages[0]?.message.content).toContain(
+      "Inspect the release after reload."
+    );
+    expect(second.messages[0]?.message.content).toContain("docs/runbook.md");
+
+    const status = await second.tool(
+      "repeat-reload-status",
+      { action: "status", id },
+      new AbortController().signal,
+      undefined,
+      resumedCtx
+    );
+    expect(status.details).toMatchObject({
+      deliveries: 1,
+      reloads: 1,
+      status: "running",
+    });
+    await second.tool(
+      "repeat-reload-complete",
+      { action: "complete", id },
+      new AbortController().signal,
+      undefined,
+      resumedCtx
+    );
+  });
+
+  it("preserves an approved gated delivery across reload", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "pi-until-pending-reload-"));
+    tempDirectories.push(directory);
+    const gateFile = join(directory, "gate-open");
+    writeFileSync(gateFile, "open\n", "utf-8");
+    const session = new FakeSession();
+    const first = loadExtension(session);
+    const { ctx } = session.context({ idle: false });
+    const started = await first.tool(
+      "repeat-pending-reload",
+      {
+        action: "repeat",
+        condition: `test -f ${JSON.stringify(gateFile)}`,
+        immediate: true,
+        instruction: "Deliver the already-approved follow-up.",
+        intervalSeconds: 60,
+        quickRef: "pending reload",
+        timeoutSeconds: 600,
+      },
+      new AbortController().signal,
+      undefined,
+      ctx
+    );
+    const { id } = receiptOf(started);
+
+    await vi.waitFor(async () => {
+      const status = await first.tool(
+        "repeat-pending-status",
+        { action: "status", id },
+        new AbortController().signal,
+        undefined,
+        ctx
+      );
+      expect(status.details).toMatchObject({
+        deliveryPending: true,
+        status: "running",
+      });
+    });
+    rmSync(gateFile);
+    await first.shutdown("reload");
+
+    const [persisted] = suspendedWatchesFrom(session.entries);
+    expect(persisted?.facts.deliveryPending).toBe(true);
+
+    const second = loadExtension(session);
+    live.push(second);
+    const { ctx: resumedCtx } = session.context({ idle: true });
+    await second.sessionStart("reload", resumedCtx);
+    await vi.waitFor(() => {
+      expect(second.messages).toHaveLength(1);
+    });
+    expect(second.messages[0]?.message.content).toContain(
+      "Deliver the already-approved follow-up."
+    );
+    expect(existsSync(gateFile)).toBe(false);
+
+    await second.tool(
+      "repeat-pending-complete",
+      { action: "complete", id },
+      new AbortController().signal,
+      undefined,
+      resumedCtx
+    );
+  });
+
   it.each(["new", "resume", "fork", "startup"] as const)(
     "does not resurrect suspended watches on session_start %s",
     async (reason) => {
@@ -163,7 +288,7 @@ describe("pi-until across /reload", () => {
     const middle = loadExtension(session);
     const { ctx: middleCtx } = session.context();
     await middle.sessionStart("reload", middleCtx);
-    const staleId = suspendedWatchesFrom(session.entries)[0]?.id ?? "";
+    const staleId = suspendedWatchesFrom(session.entries)[0]?.facts.id ?? "";
     await middle.tool(
       "cancel",
       { action: "cancel", id: staleId },
@@ -247,7 +372,11 @@ describe("pi-until across /reload", () => {
         (entry) => entry.customType === SUSPENDED_ENTRY_TYPE
       );
       expect(suspended?.data).toMatchObject({
-        watches: [expect.objectContaining({ label: "descendants" })],
+        watches: [
+          expect.objectContaining({
+            definition: expect.objectContaining({ label: "descendants" }),
+          }),
+        ],
       });
     }
   );
