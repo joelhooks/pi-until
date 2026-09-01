@@ -7,15 +7,22 @@ import { StringEnum } from "@earendil-works/pi-ai";
 import type {
   ExtensionAPI,
   ExtensionContext,
+  ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import type { Static } from "typebox";
+import { Value } from "typebox/value";
 import { createActor } from "xstate";
 import type { ActorRefFrom, SnapshotFrom } from "xstate";
 
 import { createShellConditionRunner } from "../src/check.ts";
 import { planCompletion } from "../src/completion.ts";
-import { gateOf, initialFacts, wakeOf } from "../src/domain.ts";
+import {
+  contextRefSchema,
+  gateOf,
+  initialFacts,
+  wakeOf,
+} from "../src/domain.ts";
 import type {
   ContextRef,
   FollowUpSnapshot,
@@ -56,106 +63,126 @@ const WIDGET_KEY = "pi-until-watches";
 const PANEL_PAGE_SIZE = 6;
 const INDICATOR_REFRESH_MS = 250;
 
-const checkTimeoutSeconds = Type.Optional(
-  Type.Number({
-    minimum: 1,
-    maximum: 3_600,
-    description: "Maximum runtime for one gate check. Defaults to 30.",
-  })
-);
-const cwdParameter = Type.Optional(
-  Type.String({
-    description:
-      "Working directory for the shell gate. Defaults to Pi's current directory.",
-  })
-);
-const intervalSeconds = Type.Optional(
-  Type.Number({
-    minimum: 1,
-    maximum: 86_400,
-    description:
-      "Seconds between checks or recurring follow-ups. Defaults to 30.",
-  })
-);
-const label = Type.Optional(
-  Type.String({ description: "Short safe label. Do not include secrets." })
-);
-
-const parameters = Type.Union([
-  Type.Object(
-    {
-      action: Type.Literal("start"),
-      checkTimeoutSeconds,
-      condition: Type.String({
+export const untilParameters = Type.Object(
+  {
+    action: StringEnum([
+      "start",
+      "repeat",
+      "list",
+      "status",
+      "complete",
+      "cancel",
+    ] as const),
+    checkTimeoutSeconds: Type.Optional(
+      Type.Number({
+        minimum: 1,
+        maximum: 3_600,
+        description: "Maximum runtime for one gate check. Defaults to 30.",
+      })
+    ),
+    condition: Type.Optional(
+      Type.String({
         minLength: 1,
         description:
-          "Side-effect-free shell condition. Exit code 0 means true.",
-      }),
-      cwd: cwdParameter,
-      intervalSeconds,
-      label,
-      timeoutSeconds: Type.Optional(
-        Type.Number({ minimum: 1, maximum: 2_000_000 })
-      ),
-      wake: Type.Optional(StringEnum(["agent", "notify"] as const)),
-    },
-    { additionalProperties: false }
-  ),
-  Type.Object(
-    {
-      action: Type.Literal("repeat"),
-      checkTimeoutSeconds,
-      condition: Type.Optional(
-        Type.String({
-          minLength: 1,
-          description:
-            "Optional side-effect-free gate. Exit 0 permits this tick to wake the agent.",
-        })
-      ),
-      contextRefs: Type.Optional(
-        Type.Array(
-          Type.Object(
-            {
-              label: Type.String({ minLength: 1, maxLength: 120 }),
-              target: Type.String({ minLength: 1, maxLength: 2_048 }),
-            },
-            { additionalProperties: false }
-          ),
-          { maxItems: 16 }
-        )
-      ),
-      cwd: cwdParameter,
-      immediate: Type.Optional(Type.Boolean()),
-      instruction: Type.String({ minLength: 1, maxLength: 20_000 }),
-      intervalSeconds,
-      label,
-      quickRef: Type.String({ minLength: 1, maxLength: 500 }),
-      timeoutSeconds: Type.Number({ minimum: 1, maximum: 2_000_000 }),
-    },
-    { additionalProperties: false }
-  ),
-  Type.Object(
-    { action: Type.Literal("list") },
-    { additionalProperties: false }
-  ),
-  Type.Object(
-    { action: Type.Literal("status"), id: Type.String({ minLength: 1 }) },
-    { additionalProperties: false }
-  ),
-  Type.Object(
-    { action: Type.Literal("complete"), id: Type.String({ minLength: 1 }) },
-    { additionalProperties: false }
-  ),
-  Type.Object(
-    { action: Type.Literal("cancel"), id: Type.String({ minLength: 1 }) },
-    { additionalProperties: false }
-  ),
-]);
+          "Side-effect-free shell condition or recurring gate. Exit code 0 means true.",
+      })
+    ),
+    contextRefs: Type.Optional(Type.Array(contextRefSchema, { maxItems: 16 })),
+    cwd: Type.Optional(
+      Type.String({
+        description:
+          "Working directory for the shell gate. Defaults to Pi's current directory.",
+      })
+    ),
+    id: Type.Optional(Type.String({ minLength: 1, description: "Watch ID." })),
+    immediate: Type.Optional(
+      Type.Boolean({
+        description: "For repeat: wake after this turn before fixed cadence.",
+      })
+    ),
+    instruction: Type.Optional(
+      Type.String({ minLength: 1, maxLength: 20_000 })
+    ),
+    intervalSeconds: Type.Optional(
+      Type.Number({
+        minimum: 1,
+        maximum: 86_400,
+        description:
+          "Seconds between checks or recurring follow-ups. Defaults to 30.",
+      })
+    ),
+    label: Type.Optional(
+      Type.String({ description: "Short safe label. Do not include secrets." })
+    ),
+    quickRef: Type.Optional(Type.String({ minLength: 1, maxLength: 500 })),
+    timeoutSeconds: Type.Optional(
+      Type.Number({ minimum: 1, maximum: 2_000_000 })
+    ),
+    wake: Type.Optional(StringEnum(["agent", "notify"] as const)),
+  },
+  { additionalProperties: false }
+);
 
-type UntilParameters = Static<typeof parameters>;
-type StartParameters = Extract<UntilParameters, { action: "start" }>;
-type RepeatParameters = Extract<UntilParameters, { action: "repeat" }>;
-type StartWatchParameters = StartParameters | RepeatParameters;
+type UntilParameters = Static<typeof untilParameters>;
+
+const bridgeArgumentsSchema = Type.Object(
+  {
+    checkTimeoutSeconds: Type.Optional(
+      Type.Union([Type.Number(), Type.String()])
+    ),
+    contextRefs: Type.Optional(
+      Type.Union([Type.Array(contextRefSchema), Type.String()])
+    ),
+    immediate: Type.Optional(Type.Union([Type.Boolean(), Type.String()])),
+    intervalSeconds: Type.Optional(Type.Union([Type.Number(), Type.String()])),
+    timeoutSeconds: Type.Optional(Type.Union([Type.Number(), Type.String()])),
+  },
+  { additionalProperties: true }
+);
+
+const stringSchema = Type.String();
+
+const coerceFiniteNumber = (
+  value: number | string | undefined
+): number | string | undefined => {
+  if (!Value.Check(stringSchema, value) || value.trim() === "") return value;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : value;
+};
+
+type PrepareUntilArguments = NonNullable<
+  ToolDefinition<typeof untilParameters>["prepareArguments"]
+>;
+
+/** Repair known provider bridges that serialize every non-string argument as JSON text. */
+export const prepareUntilArguments: PrepareUntilArguments = (input) => {
+  if (!Value.Check(bridgeArgumentsSchema, input)) {
+    // SAFETY: Pi validates this return value against untilParameters immediately.
+    return input as UntilParameters;
+  }
+
+  const prepared = { ...input };
+  prepared.checkTimeoutSeconds = coerceFiniteNumber(
+    prepared.checkTimeoutSeconds
+  );
+  prepared.intervalSeconds = coerceFiniteNumber(prepared.intervalSeconds);
+  prepared.timeoutSeconds = coerceFiniteNumber(prepared.timeoutSeconds);
+  if (prepared.immediate === "true") prepared.immediate = true;
+  if (prepared.immediate === "false") prepared.immediate = false;
+  if (Value.Check(stringSchema, prepared.contextRefs)) {
+    try {
+      const parsed: unknown = JSON.parse(prepared.contextRefs);
+      if (Value.Check(Type.Array(contextRefSchema), parsed)) {
+        prepared.contextRefs = parsed;
+      }
+    } catch {
+      // Leave malformed JSON intact so normal schema validation reports it.
+    }
+  }
+
+  // SAFETY: Pi validates required fields and action-specific rules after this shim.
+  return prepared as UntilParameters;
+};
 type ReceiptStatus =
   | "running"
   | "succeeded"
@@ -542,7 +569,7 @@ export default function piUntil(
   };
 
   const gateFrom = (
-    params: StartWatchParameters,
+    params: UntilParameters,
     ctx: ExtensionContext
   ): ShellGate => {
     const command = params.condition?.trim();
@@ -560,7 +587,7 @@ export default function piUntil(
   };
 
   const untilDefinitionFrom = (
-    params: StartParameters,
+    params: UntilParameters,
     ctx: ExtensionContext,
     startedAt: number,
     intervalMs: number
@@ -578,7 +605,7 @@ export default function piUntil(
   };
 
   const recurringDefinitionFrom = (
-    params: RepeatParameters,
+    params: UntilParameters,
     ctx: ExtensionContext,
     startedAt: number,
     intervalMs: number
@@ -590,6 +617,11 @@ export default function piUntil(
       throw new Error("quickRef is required for action=repeat");
     if (params.timeoutSeconds === undefined) {
       throw new Error("timeoutSeconds is required for action=repeat");
+    }
+    if (params.wake === "notify") {
+      throw new Error(
+        "repeat always wakes the agent; wake=notify is not supported"
+      );
     }
     const contextRefs = Object.freeze(
       (params.contextRefs ?? []).map((reference) =>
@@ -632,7 +664,7 @@ export default function piUntil(
   };
 
   const definitionFrom = (
-    params: StartWatchParameters,
+    params: UntilParameters,
     ctx: ExtensionContext,
     startedAt: number
   ): WatchDefinition => {
@@ -648,7 +680,7 @@ export default function piUntil(
   };
 
   const startWatch = (
-    params: StartWatchParameters,
+    params: UntilParameters,
     ctx: ExtensionContext
   ): WatchRecord => {
     if (ctx.mode === "print" || ctx.mode === "json") {
@@ -930,7 +962,8 @@ export default function piUntil(
     },
     label: "Until",
     name: "until",
-    parameters,
+    parameters: untilParameters,
+    prepareArguments: prepareUntilArguments,
     promptGuidelines: [
       "Use until with action=start when work should resume after a side-effect-free shell condition exits 0; do not block bash with polling or sleep loops.",
       "Use until with action=repeat for session-scoped recurring agent follow-ups. Supply timeoutSeconds, instruction, and quickRef; contextRefs are opaque pointers expanded by the waking agent.",

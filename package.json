@@ -1,6 +1,6 @@
 {
   "name": "@joelhooks/pi-until",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Session-scoped shell-condition watches and recurring agent follow-ups for Pi.",
   "keywords": [
     "async",

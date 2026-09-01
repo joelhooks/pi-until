@@ -35,6 +35,8 @@ Node is `24.18.0`. Use npm `11.16.0`; never Bun. `devEngines` fails hard on any 
 - Session shutdown awaits process-tree cleanup before Pi may exit.
 - Only `session_shutdown { reason: "reload" }` suspends watches, and only `session_start { reason: "reload" }` resumes them. Every reload writes a suspension entry, even an empty one, so the newest entry always wins.
 - Telemetry never writes condition text and never touches the network. It must never throw into a watch.
+- Tool parameter schemas must have one `Type.Object` root. Root object unions make the OpenAI Codex bridge serialize arrays, booleans, and numbers as strings.
+- `prepareArguments` may repair only known bridge encodings before normal schema validation; malformed values must still fail validation.
 - Only `wake=agent` calls `pi.sendMessage(..., { triggerTurn: true })`.
 - Never persist or publish secrets from commands or output.
 - Do not add a daemon, scheduler, or reboot durability without a separate design decision.
