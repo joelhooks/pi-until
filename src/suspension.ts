@@ -140,11 +140,7 @@ export const suspendedWatchesFrom = (
   return [];
 };
 
-export const resumeInput = (
-  watch: PersistedWatch,
-  sessionIdle: boolean
-): WatchActorInput => ({
+export const resumeInput = (watch: PersistedWatch): WatchActorInput => ({
   definition: watch.definition,
   facts: watch.facts,
-  sessionIdle,
 });

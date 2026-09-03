@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { createActor } from "xstate";
+import { createActor, SimulatedClock } from "xstate";
 
 import { initialFacts } from "../src/domain.ts";
 import type {
@@ -46,15 +46,13 @@ const recurringDefinition = (
 
 const input = (
   definition: UntilDefinition | RecurringDefinition,
-  facts: Partial<WatchFacts> = {},
-  sessionIdle = true
+  facts: Partial<WatchFacts> = {}
 ): WatchActorInput => ({
   definition,
   facts: {
     ...initialFacts(definition, "test", 0),
     ...facts,
   },
-  sessionIdle,
 });
 
 async function waitForDone(
@@ -71,7 +69,8 @@ async function waitForDone(
           value === "satisfied" ||
           value === "completed" ||
           value === "expired" ||
-          value === "cancelled"
+          value === "cancelled" ||
+          value === "failed"
         ) {
           resolve(value);
         } else {
@@ -88,9 +87,11 @@ describe("pi-until watch machine", () => {
       .fn<RunUntilCheck>()
       .mockResolvedValueOnce({ code: 1, killed: false })
       .mockResolvedValueOnce({ code: 0, killed: false });
-    const startedAt = Date.now();
+    const clock = new SimulatedClock();
+    const startedAt = clock.now();
     const definition = untilDefinition();
-    const actor = createActor(createWatchMachine(runCheck), {
+    const actor = createActor(createWatchMachine(runCheck, clock), {
+      clock,
       input: input(definition, {
         nextDueAt: startedAt,
         startedAt,
@@ -99,6 +100,10 @@ describe("pi-until watch machine", () => {
     const done = waitForDone(actor);
 
     actor.start();
+    await vi.waitFor(() => {
+      expect(actor.getSnapshot().matches({ active: "waiting" })).toBe(true);
+    });
+    clock.increment(5);
 
     await expect(done).resolves.toBe("satisfied");
     expect(runCheck).toHaveBeenCalledTimes(2);
@@ -114,14 +119,20 @@ describe("pi-until watch machine", () => {
       .fn<RunUntilCheck>()
       .mockResolvedValueOnce({ code: 0, killed: true })
       .mockResolvedValueOnce({ code: 0, killed: false });
-    const startedAt = Date.now();
+    const clock = new SimulatedClock();
+    const startedAt = clock.now();
     const definition = untilDefinition();
-    const actor = createActor(createWatchMachine(runCheck), {
+    const actor = createActor(createWatchMachine(runCheck, clock), {
+      clock,
       input: input(definition, { nextDueAt: startedAt, startedAt }),
     });
     const done = waitForDone(actor);
 
     actor.start();
+    await vi.waitFor(() => {
+      expect(actor.getSnapshot().matches({ active: "waiting" })).toBe(true);
+    });
+    clock.increment(5);
 
     await expect(done).resolves.toBe("satisfied");
     expect(runCheck).toHaveBeenCalledTimes(2);
@@ -159,12 +170,12 @@ describe("pi-until watch machine", () => {
     });
   });
 
-  it("expires independently from cancellation", async () => {
+  it("enters a terminal failure state when the gate runner rejects", async () => {
     const startedAt = Date.now();
-    const definition = untilDefinition({ expiresAt: startedAt + 5 });
+    const definition = untilDefinition({ intervalMs: 60_000 });
     const runCheck = vi
       .fn<RunUntilCheck>()
-      .mockResolvedValue({ code: 1, killed: false });
+      .mockRejectedValue(new Error("shell failed to start"));
     const actor = createActor(createWatchMachine(runCheck), {
       input: input(definition, { nextDueAt: startedAt, startedAt }),
     });
@@ -172,23 +183,52 @@ describe("pi-until watch machine", () => {
 
     actor.start();
 
+    await expect(done).resolves.toBe("failed");
+    expect(actor.getSnapshot().context.facts.failure).toEqual({
+      kind: "gate",
+      message: "shell failed to start",
+    });
+  });
+
+  it("expires independently from cancellation", async () => {
+    const clock = new SimulatedClock();
+    const startedAt = clock.now();
+    const definition = untilDefinition({ expiresAt: startedAt + 5 });
+    const runCheck = vi
+      .fn<RunUntilCheck>()
+      .mockResolvedValue({ code: 1, killed: false });
+    const actor = createActor(createWatchMachine(runCheck, clock), {
+      clock,
+      input: input(definition, { nextDueAt: startedAt, startedAt }),
+    });
+    const done = waitForDone(actor);
+
+    actor.start();
+    await vi.waitFor(() => {
+      expect(actor.getSnapshot().matches({ active: "waiting" })).toBe(true);
+    });
+    clock.increment(5);
+
     await expect(done).resolves.toBe("expired");
   });
 
   it("coalesces fixed-cadence ticks while one follow-up is pending", async () => {
-    let now = 0;
+    const clock = new SimulatedClock();
     const definition = recurringDefinition();
     const actor = createActor(
-      createWatchMachine(vi.fn<RunUntilCheck>(), () => now),
-      { input: input(definition, {}, false) }
+      createWatchMachine(vi.fn<RunUntilCheck>(), clock),
+      {
+        clock,
+        input: input(definition),
+      }
     );
 
     actor.start();
     expect(actor.getSnapshot().matches({ active: "duePending" })).toBe(true);
     expect(actor.getSnapshot().context.facts.deliveries).toBe(0);
 
-    now = 1;
-    actor.send({ at: now, type: "SESSION_SETTLED" });
+    clock.set(1);
+    actor.send({ at: clock.now(), type: "DELIVERY_STARTED" });
     expect(actor.getSnapshot().matches({ active: "awaitingSettlement" })).toBe(
       true
     );
@@ -198,8 +238,8 @@ describe("pi-until watch machine", () => {
       nextDueAt: 5,
     });
 
-    now = 16;
-    actor.send({ at: now, type: "SESSION_SETTLED" });
+    clock.set(16);
+    actor.send({ at: clock.now(), type: "DELIVERY_SETTLED" });
     expect(actor.getSnapshot().matches({ active: "waiting" })).toBe(true);
     expect(actor.getSnapshot().context.facts).toMatchObject({
       deliveries: 1,

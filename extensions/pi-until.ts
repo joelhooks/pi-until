@@ -1,35 +1,43 @@
 import { randomUUID } from "node:crypto";
-import { existsSync, statSync } from "node:fs";
-import { homedir } from "node:os";
-import { resolve } from "node:path";
 
-import { StringEnum } from "@earendil-works/pi-ai";
 import type {
   ExtensionAPI,
   ExtensionContext,
-  ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import type { Static } from "typebox";
 import { Value } from "typebox/value";
 import { createActor } from "xstate";
 import type { ActorRefFrom, SnapshotFrom } from "xstate";
 
 import { createShellConditionRunner } from "../src/check.ts";
+import { systemClock } from "../src/clock.ts";
+import type { UntilClock } from "../src/clock.ts";
+import {
+  parseUntilCommand,
+  prepareUntilArguments,
+  untilParameters,
+} from "../src/command.ts";
+import type {
+  StartWatchCommand,
+  UntilCommand,
+  UntilParameters,
+} from "../src/command.ts";
 import { planCompletion } from "../src/completion.ts";
 import {
-  contextRefSchema,
+  advanceAfterTick,
   gateOf,
   initialFacts,
   wakeOf,
 } from "../src/domain.ts";
 import type {
   ContextRef,
-  FollowUpSnapshot,
-  ShellGate,
   WatchActorInput,
   WatchDefinition,
 } from "../src/domain.ts";
+import {
+  createFollowUpMachine,
+  type FollowUpRequest,
+} from "../src/follow-up.ts";
 import { renderWatchIndicator, renderWatchPanel } from "../src/indicator.ts";
 import type { WatchDisplay, WatchPhase } from "../src/indicator.ts";
 import { createWatchMachine } from "../src/machine.ts";
@@ -48,7 +56,7 @@ import {
 import type { PersistedWatch } from "../src/suspension.ts";
 import {
   createTelemetrySink,
-  describeCondition,
+  hashCondition,
   readTelemetry,
   summarizeTelemetry,
   summaryText,
@@ -56,133 +64,14 @@ import {
 } from "../src/telemetry.ts";
 import type { TelemetrySink } from "../src/telemetry.ts";
 
-const DEFAULT_INTERVAL_SECONDS = 30;
-const DEFAULT_CHECK_TIMEOUT_SECONDS = 30;
+export { prepareUntilArguments, untilParameters } from "../src/command.ts";
+
 const MAX_ACTIVE_WATCHES = 32;
+const MAX_TERMINAL_RECEIPTS = 50;
 const WIDGET_KEY = "pi-until-watches";
 const PANEL_PAGE_SIZE = 6;
-const INDICATOR_REFRESH_MS = 250;
+const INDICATOR_REFRESH_MS = 1_000;
 
-export const untilParameters = Type.Object(
-  {
-    action: StringEnum([
-      "start",
-      "repeat",
-      "list",
-      "status",
-      "complete",
-      "cancel",
-    ] as const),
-    checkTimeoutSeconds: Type.Optional(
-      Type.Number({
-        minimum: 1,
-        maximum: 3_600,
-        description: "Maximum runtime for one gate check. Defaults to 30.",
-      })
-    ),
-    condition: Type.Optional(
-      Type.String({
-        minLength: 1,
-        description:
-          "Side-effect-free shell condition or recurring gate. Exit code 0 means true.",
-      })
-    ),
-    contextRefs: Type.Optional(Type.Array(contextRefSchema, { maxItems: 16 })),
-    cwd: Type.Optional(
-      Type.String({
-        description:
-          "Working directory for the shell gate. Defaults to Pi's current directory.",
-      })
-    ),
-    id: Type.Optional(Type.String({ minLength: 1, description: "Watch ID." })),
-    immediate: Type.Optional(
-      Type.Boolean({
-        description: "For repeat: wake after this turn before fixed cadence.",
-      })
-    ),
-    instruction: Type.Optional(
-      Type.String({ minLength: 1, maxLength: 20_000 })
-    ),
-    intervalSeconds: Type.Optional(
-      Type.Number({
-        minimum: 1,
-        maximum: 86_400,
-        description:
-          "Seconds between checks or recurring follow-ups. Defaults to 30.",
-      })
-    ),
-    label: Type.Optional(
-      Type.String({ description: "Short safe label. Do not include secrets." })
-    ),
-    quickRef: Type.Optional(Type.String({ minLength: 1, maxLength: 500 })),
-    timeoutSeconds: Type.Optional(
-      Type.Number({ minimum: 1, maximum: 2_000_000 })
-    ),
-    wake: Type.Optional(StringEnum(["agent", "notify"] as const)),
-  },
-  { additionalProperties: false }
-);
-
-type UntilParameters = Static<typeof untilParameters>;
-
-const bridgeArgumentsSchema = Type.Object(
-  {
-    checkTimeoutSeconds: Type.Optional(
-      Type.Union([Type.Number(), Type.String()])
-    ),
-    contextRefs: Type.Optional(
-      Type.Union([Type.Array(contextRefSchema), Type.String()])
-    ),
-    immediate: Type.Optional(Type.Union([Type.Boolean(), Type.String()])),
-    intervalSeconds: Type.Optional(Type.Union([Type.Number(), Type.String()])),
-    timeoutSeconds: Type.Optional(Type.Union([Type.Number(), Type.String()])),
-  },
-  { additionalProperties: true }
-);
-
-const stringSchema = Type.String();
-
-const coerceFiniteNumber = (
-  value: number | string | undefined
-): number | string | undefined => {
-  if (!Value.Check(stringSchema, value) || value.trim() === "") return value;
-  const parsed = Number(value);
-  return Number.isFinite(parsed) ? parsed : value;
-};
-
-type PrepareUntilArguments = NonNullable<
-  ToolDefinition<typeof untilParameters>["prepareArguments"]
->;
-
-/** Repair known provider bridges that serialize every non-string argument as JSON text. */
-export const prepareUntilArguments: PrepareUntilArguments = (input) => {
-  if (!Value.Check(bridgeArgumentsSchema, input)) {
-    // SAFETY: Pi validates this return value against untilParameters immediately.
-    return input as UntilParameters;
-  }
-
-  const prepared = { ...input };
-  prepared.checkTimeoutSeconds = coerceFiniteNumber(
-    prepared.checkTimeoutSeconds
-  );
-  prepared.intervalSeconds = coerceFiniteNumber(prepared.intervalSeconds);
-  prepared.timeoutSeconds = coerceFiniteNumber(prepared.timeoutSeconds);
-  if (prepared.immediate === "true") prepared.immediate = true;
-  if (prepared.immediate === "false") prepared.immediate = false;
-  if (Value.Check(stringSchema, prepared.contextRefs)) {
-    try {
-      const parsed: unknown = JSON.parse(prepared.contextRefs);
-      if (Value.Check(Type.Array(contextRefSchema), parsed)) {
-        prepared.contextRefs = parsed;
-      }
-    } catch {
-      // Leave malformed JSON intact so normal schema validation reports it.
-    }
-  }
-
-  // SAFETY: Pi validates required fields and action-specific rules after this shim.
-  return prepared as UntilParameters;
-};
 type ReceiptStatus =
   | "running"
   | "succeeded"
@@ -195,15 +84,21 @@ type FinalReceiptStatus = Exclude<ReceiptStatus, "running">;
 type WatchMachine = ReturnType<typeof createWatchMachine>;
 type WatchActor = ActorRefFrom<WatchMachine>;
 type WatchSnapshot = SnapshotFrom<WatchMachine>;
+type FollowUpMachine = ReturnType<typeof createFollowUpMachine>;
+type FollowUpActor = ActorRefFrom<FollowUpMachine>;
+
+const followUpMarkerSchema = Type.Object(
+  { followUpId: Type.String({ minLength: 1 }) },
+  { additionalProperties: true }
+);
 
 interface WatchRecord {
   readonly actor: WatchActor;
-  defect?: string;
-  dispatchedDeliveries: number;
-  finishedAt?: number;
 }
 
 export interface PiUntilOptions {
+  readonly clock?: UntilClock;
+  readonly followUpDispatchAckMs?: number;
   readonly telemetry?: TelemetrySink;
 }
 
@@ -216,6 +111,7 @@ export interface WatchReceipt {
   readonly expiresAt?: string;
   readonly finishedAt?: string;
   readonly id: string;
+  readonly intervalMs: number;
   readonly kind: WatchDefinition["kind"];
   readonly label: string;
   readonly lastCheckKilled?: boolean;
@@ -233,16 +129,6 @@ export interface WatchReceipt {
 const sessionId = (ctx: ExtensionContext | undefined) =>
   ctx?.sessionManager.getSessionId() ?? "unknown";
 
-function expandPath(value: string): string {
-  if (value === "~") {
-    return homedir();
-  }
-  if (value.startsWith("~/")) {
-    return resolve(homedir(), value.slice(2));
-  }
-  return value;
-}
-
 function terminalState(
   snapshot: WatchSnapshot
 ): WatchTerminalState | undefined {
@@ -251,15 +137,17 @@ function terminalState(
   if (snapshot.matches("completed")) return "completed";
   if (snapshot.matches("expired")) return "expired";
   if (snapshot.matches("cancelled")) return "cancelled";
+  if (snapshot.matches("failed")) return "failed";
   return undefined;
 }
 
 function receiptStatus(record: WatchRecord): ReceiptStatus {
-  if (record.defect !== undefined) return "failed";
   const snapshot = record.actor.getSnapshot();
+  if (snapshot.status === "error") return "failed";
   const terminal = terminalState(snapshot);
   if (terminal === undefined) return "running";
   if (terminal === "satisfied") return "succeeded";
+  if (terminal === "failed") return "failed";
   if (terminal === "expired") {
     return snapshot.context.definition.kind === "until"
       ? "timedOut"
@@ -276,14 +164,25 @@ function finalReceiptStatus(record: WatchRecord): FinalReceiptStatus {
   return status;
 }
 
+function defectFrom(snapshot: WatchSnapshot): string | undefined {
+  if (snapshot.context.facts.failure !== undefined) {
+    return snapshot.context.facts.failure.message;
+  }
+  if (snapshot.status !== "error") return undefined;
+  return snapshot.error instanceof Error
+    ? snapshot.error.message
+    : String(snapshot.error);
+}
+
 function toReceipt(record: WatchRecord): WatchReceipt {
-  const { definition, facts } = record.actor.getSnapshot().context;
+  const snapshot = record.actor.getSnapshot();
+  const { definition, facts } = snapshot.context;
   const status = receiptStatus(record);
   const recurring = definition.kind === "recurring" ? definition : undefined;
   return {
     attempts: facts.attempts,
     contextRefs: recurring?.snapshot.contextRefs,
-    defect: record.defect,
+    defect: defectFrom(snapshot),
     deliveries: facts.deliveries,
     deliveryPending: facts.deliveryPending,
     expiresAt:
@@ -291,10 +190,11 @@ function toReceipt(record: WatchRecord): WatchReceipt {
         ? undefined
         : new Date(definition.expiresAt).toISOString(),
     finishedAt:
-      record.finishedAt === undefined
+      facts.finishedAt === undefined
         ? undefined
-        : new Date(record.finishedAt).toISOString(),
+        : new Date(facts.finishedAt).toISOString(),
     id: facts.id,
+    intervalMs: definition.intervalMs,
     kind: definition.kind,
     label: definition.label,
     lastCheckedAt:
@@ -325,6 +225,51 @@ function watchPhase(record: WatchRecord): WatchPhase | undefined {
     return "awaitingSettlement";
   }
   return "sleeping";
+}
+
+function toWatchDisplay(record: WatchRecord): WatchDisplay {
+  const { definition, facts } = record.actor.getSnapshot().context;
+  return {
+    attempts: facts.attempts,
+    deliveries: facts.deliveries,
+    id: facts.id,
+    intervalMs: definition.intervalMs,
+    kind: definition.kind,
+    label: definition.label,
+    missedTicks: facts.missedTicks,
+    nextDueAt: facts.nextDueAt,
+    phase: watchPhase(record),
+    startedAt: facts.startedAt,
+    status: receiptStatus(record),
+    wake: wakeOf(definition),
+  };
+}
+
+function displayFromReceipt(receipt: WatchReceipt): WatchDisplay {
+  return {
+    attempts: receipt.attempts,
+    deliveries: receipt.deliveries,
+    id: receipt.id,
+    intervalMs: receipt.intervalMs,
+    kind: receipt.kind,
+    label: receipt.label,
+    missedTicks: receipt.missedTicks,
+    nextDueAt:
+      receipt.nextDueAt === undefined ? 0 : Date.parse(receipt.nextDueAt),
+    startedAt: Date.parse(receipt.startedAt),
+    status: receipt.status,
+    wake: receipt.wake,
+  };
+}
+
+function listText(receipts: readonly WatchReceipt[]): string {
+  if (receipts.length === 0) return "No pi-until watches.";
+  return receipts
+    .map(
+      (receipt) =>
+        `${receipt.id}\t${receipt.status}\t${receipt.label}\tattempts=${receipt.attempts}`
+    )
+    .join("\n");
 }
 
 function receiptText(receipt: WatchReceipt): string {
@@ -362,51 +307,53 @@ export default function piUntil(
   options: PiUntilOptions = {}
 ) {
   const watches = new Map<string, WatchRecord>();
+  const terminalReceipts: WatchReceipt[] = [];
   let currentContext: ExtensionContext | undefined;
   let indicatorMounted = false;
   let requestIndicatorRender: (() => void) | undefined;
   let shuttingDown = false;
+  let followUps: FollowUpActor;
 
+  const clock = options.clock ?? systemClock;
   const shellRunner = createShellConditionRunner();
-  const machine = createWatchMachine(shellRunner.run);
+  const machine = createWatchMachine(shellRunner.run, clock);
   const telemetry =
     options.telemetry ??
-    createTelemetrySink(telemetryOptionsFromEnv(process.env));
+    createTelemetrySink({
+      ...telemetryOptionsFromEnv(process.env),
+      now: () => clock.now(),
+    });
 
   const track = telemetry.record;
 
-  const activeWatches = () =>
-    [...watches.values()].filter((watch) => receiptStatus(watch) === "running");
+  const activeWatches = () => [...watches.values()];
 
-  const toWatchDisplay = (record: WatchRecord): WatchDisplay => {
-    const { definition, facts } = record.actor.getSnapshot().context;
-    return {
-      attempts: facts.attempts,
-      deliveries: facts.deliveries,
-      id: facts.id,
-      intervalMs: definition.intervalMs,
-      kind: definition.kind,
-      label: definition.label,
-      missedTicks: facts.missedTicks,
-      nextDueAt: facts.nextDueAt,
-      phase: watchPhase(record),
-      startedAt: facts.startedAt,
-      status: receiptStatus(record),
-      wake: wakeOf(definition),
-    };
-  };
+  const allReceipts = () => [
+    ...activeWatches().map(toReceipt),
+    ...terminalReceipts,
+  ];
 
-  const orderedWatches = () =>
-    [...watches.values()].sort((left, right) => {
-      const leftReceipt = toReceipt(left);
-      const rightReceipt = toReceipt(right);
+  const terminalReceiptFor = (id: string) =>
+    terminalReceipts.find((receipt) => receipt.id === id);
+
+  const orderedReceipts = () =>
+    allReceipts().sort((left, right) => {
       const runningDifference =
-        Number(rightReceipt.status === "running") -
-        Number(leftReceipt.status === "running");
+        Number(right.status === "running") - Number(left.status === "running");
       return (
         runningDifference ||
-        Date.parse(rightReceipt.startedAt) - Date.parse(leftReceipt.startedAt)
+        Date.parse(right.startedAt) - Date.parse(left.startedAt)
       );
+    });
+
+  const orderedWatchDisplays = () =>
+    [
+      ...activeWatches().map(toWatchDisplay),
+      ...terminalReceipts.map(displayFromReceipt),
+    ].sort((left, right) => {
+      const runningDifference =
+        Number(right.status === "running") - Number(left.status === "running");
+      return runningDifference || right.startedAt - left.startedAt;
     });
 
   const refreshIndicator = () => {
@@ -440,7 +387,7 @@ export default function piUntil(
           render(width: number) {
             return renderWatchIndicator(
               activeWatches().map(toWatchDisplay),
-              Date.now(),
+              clock.now(),
               width,
               theme
             );
@@ -453,20 +400,50 @@ export default function piUntil(
     requestIndicatorRender?.();
   };
 
-  const finishWatch = (record: WatchRecord) => {
-    if (record.finishedAt !== undefined) return;
-    record.finishedAt = Date.now();
-    refreshIndicator();
-    if (shuttingDown) return;
+  const enqueueTerminalFollowUp = (
+    receipt: WatchReceipt,
+    customType: string,
+    content: string
+  ) => {
+    followUps.send({
+      request: {
+        content,
+        customType,
+        dedupeKey: `terminal:${receipt.id}:${receipt.status}`,
+        details: receipt,
+        id: randomUUID(),
+        kind: "terminal",
+        watchId: receipt.id,
+      },
+      type: "ENQUEUE",
+    });
+  };
 
-    const receipt = toReceipt(record);
-    const { definition, facts } = record.actor.getSnapshot().context;
-    const condition = describeCondition(gateOf(definition)?.command ?? "");
+  const finishWatch = (record: WatchRecord) => {
+    const snapshot = record.actor.getSnapshot();
+    const { definition, facts } = snapshot.context;
+    if (watches.get(facts.id) !== record) return;
+
+    const finishedAt = facts.finishedAt ?? clock.now();
+    const receipt = {
+      ...toReceipt(record),
+      finishedAt: new Date(finishedAt).toISOString(),
+    } satisfies WatchReceipt;
+    watches.delete(facts.id);
+    terminalReceipts.unshift(receipt);
+    if (terminalReceipts.length > MAX_TERMINAL_RECEIPTS) {
+      terminalReceipts.length = MAX_TERMINAL_RECEIPTS;
+    }
+    if (shuttingDown) return;
+    followUps.send({ dedupeKey: `recurring:${facts.id}`, type: "DROP" });
+    refreshIndicator();
+
+    const conditionHash = hashCondition(gateOf(definition)?.command ?? "");
     void track(sessionId(currentContext), {
       attempts: receipt.attempts,
-      conditionHash: condition.hash,
+      conditionHash,
       deliveries: receipt.deliveries,
-      durationMs: record.finishedAt - facts.startedAt,
+      durationMs: finishedAt - facts.startedAt,
       event: "finished",
       id: receipt.id,
       lastCheckKilled: receipt.lastCheckKilled,
@@ -482,30 +459,22 @@ export default function piUntil(
 
     if (definition.kind === "recurring") {
       if (receipt.status === "expired") {
-        pi.sendMessage(
-          {
-            content: renderRecurringExpiredPacket(definition.snapshot, {
-              delivery: facts.deliveries,
-              expiresAt: definition.expiresAt,
-              id: facts.id,
-              missedTicks: facts.missedTicks,
-              reloads: facts.reloads,
-            }),
-            customType: "pi-until-recurring",
-            details: receipt,
-            display: true,
-          },
-          { deliverAs: "followUp", triggerTurn: true }
+        enqueueTerminalFollowUp(
+          receipt,
+          "pi-until-recurring",
+          renderRecurringExpiredPacket(definition.snapshot, {
+            delivery: facts.deliveries,
+            expiresAt: definition.expiresAt,
+            id: facts.id,
+            missedTicks: facts.missedTicks,
+            reloads: facts.reloads,
+          })
         );
       } else if (receipt.status === "failed") {
-        pi.sendMessage(
-          {
-            content: `The recurring watch failed. Inspect this receipt before deciding what to do.\n\n${receiptText(receipt)}`,
-            customType: "pi-until-recurring",
-            details: receipt,
-            display: true,
-          },
-          { deliverAs: "followUp", triggerTurn: true }
+        enqueueTerminalFollowUp(
+          receipt,
+          "pi-until-recurring",
+          `The recurring watch failed. Inspect this receipt before deciding what to do.\n\n${receiptText(receipt)}`
         );
       }
       return;
@@ -520,14 +489,10 @@ export default function piUntil(
     }
     const plan = planCompletion(receipt.status, receipt.wake);
     if (plan.kind === "agent") {
-      pi.sendMessage(
-        {
-          content: `${plan.instruction}\n\n${receiptText(receipt)}`,
-          customType: "pi-until",
-          details: receipt,
-          display: true,
-        },
-        { deliverAs: "followUp", triggerTurn: true }
+      enqueueTerminalFollowUp(
+        receipt,
+        "pi-until",
+        `${plan.instruction}\n\n${receiptText(receipt)}`
       );
     } else {
       currentContext?.ui.notify(
@@ -537,152 +502,144 @@ export default function piUntil(
     }
   };
 
-  const deliverRecurringFollowUp = (record: WatchRecord) => {
+  const dispatchFollowUp = (request: FollowUpRequest) => {
     if (shuttingDown) return;
-    const { definition, facts } = record.actor.getSnapshot().context;
-    if (
-      definition.kind !== "recurring" ||
-      facts.deliveries <= record.dispatchedDeliveries
-    ) {
-      return;
+    try {
+      if (request.kind === "terminal") {
+        pi.sendMessage(
+          {
+            content: request.content,
+            customType: request.customType,
+            details: { followUpId: request.id, receipt: request.details },
+            display: true,
+          },
+          { deliverAs: "followUp", triggerTurn: true }
+        );
+        return;
+      }
+
+      const record = watches.get(request.watchId);
+      if (
+        record === undefined ||
+        !record.actor.getSnapshot().matches({ active: "duePending" })
+      ) {
+        followUps.send({ id: request.id, type: "DISPATCH_FAILED" });
+        return;
+      }
+      const { definition, facts } = record.actor.getSnapshot().context;
+      if (definition.kind !== "recurring") {
+        followUps.send({ id: request.id, type: "DISPATCH_FAILED" });
+        return;
+      }
+      const deliveredAt = request.dispatchedAt ?? clock.now();
+      const plannedFacts = advanceAfterTick(
+        {
+          ...facts,
+          deliveries: facts.deliveries + 1,
+          deliveryPending: false,
+        },
+        definition.intervalMs,
+        deliveredAt
+      );
+      const receipt = {
+        ...toReceipt(record),
+        deliveries: plannedFacts.deliveries,
+        deliveryPending: false,
+        missedTicks: plannedFacts.missedTicks,
+        nextDueAt: new Date(plannedFacts.nextDueAt).toISOString(),
+      } satisfies WatchReceipt;
+      pi.sendMessage(
+        {
+          content: renderRecurringWakePacket(definition.snapshot, {
+            deliveredAt,
+            delivery: plannedFacts.deliveries,
+            expiresAt: definition.expiresAt,
+            id: facts.id,
+            missedTicks: plannedFacts.missedTicks,
+            nextDueAt: plannedFacts.nextDueAt,
+            reloads: facts.reloads,
+          }),
+          customType: "pi-until-recurring",
+          details: { followUpId: request.id, receipt },
+          display: true,
+        },
+        { deliverAs: "followUp", triggerTurn: true }
+      );
+    } catch {
+      followUps.send({ id: request.id, type: "DISPATCH_FAILED" });
     }
-    record.dispatchedDeliveries = facts.deliveries;
-    const deliveredAt = Date.now();
-    const receipt = toReceipt(record);
-    pi.sendMessage(
-      {
-        content: renderRecurringWakePacket(definition.snapshot, {
-          deliveredAt,
-          delivery: facts.deliveries,
-          expiresAt: definition.expiresAt,
-          id: facts.id,
-          missedTicks: facts.missedTicks,
-          nextDueAt: facts.nextDueAt,
-          reloads: facts.reloads,
-        }),
-        customType: "pi-until-recurring",
-        details: receipt,
-        display: true,
-      },
-      { deliverAs: "followUp", triggerTurn: true }
-    );
   };
 
-  const gateFrom = (
+  const createSessionFollowUps = (sessionBusy: boolean): FollowUpActor => {
+    const actor = createActor(
+      createFollowUpMachine({
+        dispatch: dispatchFollowUp,
+        dispatchAckMs: options.followUpDispatchAckMs,
+        failed: (request) => {
+          const record = watches.get(request.watchId);
+          if (request.kind === "recurring" && record !== undefined) {
+            record.actor.send({
+              failure: {
+                kind: "delivery",
+                message: "Pi did not accept the follow-up message",
+              },
+              type: "DELIVERY_FAILED",
+            });
+            return;
+          }
+          currentContext?.ui.notify(
+            `pi-until could not deliver follow-up for ${request.watchId}`,
+            "error"
+          );
+        },
+        isLive: (request) =>
+          request.kind === "terminal" || watches.has(request.watchId),
+        settled: (request) => {
+          if (request.kind !== "recurring") return;
+          watches
+            .get(request.watchId)
+            ?.actor.send({ at: clock.now(), type: "DELIVERY_SETTLED" });
+        },
+        started: (request) => {
+          if (request.kind !== "recurring") return;
+          watches.get(request.watchId)?.actor.send({
+            at: request.dispatchedAt ?? clock.now(),
+            type: "DELIVERY_STARTED",
+          });
+        },
+        unacknowledged: (request) => {
+          currentContext?.ui.notify(
+            `pi-until is still waiting for Pi to start follow-up ${request.id}; its delivery queue is paused`,
+            "warning"
+          );
+        },
+        now: () => clock.now(),
+      }),
+      { clock, input: { sessionBusy } }
+    );
+    actor.start();
+    return actor;
+  };
+  followUps = createSessionFollowUps(true);
+
+  const parseCommand = (
     params: UntilParameters,
     ctx: ExtensionContext
-  ): ShellGate => {
-    const command = params.condition?.trim();
-    if (!command) throw new Error("condition is required for action=start");
-    const cwd = resolve(ctx.cwd, expandPath(params.cwd ?? "."));
-    if (!existsSync(cwd) || !statSync(cwd).isDirectory()) {
-      throw new Error(`cwd is not a directory: ${cwd}`);
-    }
-    return {
-      checkTimeoutMs:
-        (params.checkTimeoutSeconds ?? DEFAULT_CHECK_TIMEOUT_SECONDS) * 1_000,
-      command,
-      cwd,
-    };
-  };
-
-  const untilDefinitionFrom = (
-    params: UntilParameters,
-    ctx: ExtensionContext,
-    startedAt: number,
-    intervalMs: number
-  ): WatchDefinition => {
-    const base = {
-      gate: gateFrom(params, ctx),
-      intervalMs,
-      kind: "until" as const,
-      label: params.label?.trim() || "condition",
-      wake: params.wake ?? "agent",
-    };
-    return params.timeoutSeconds === undefined
-      ? base
-      : { ...base, expiresAt: startedAt + params.timeoutSeconds * 1_000 };
-  };
-
-  const recurringDefinitionFrom = (
-    params: UntilParameters,
-    ctx: ExtensionContext,
-    startedAt: number,
-    intervalMs: number
-  ): WatchDefinition => {
-    const { instruction, quickRef } = params;
-    if (!instruction?.trim())
-      throw new Error("instruction is required for action=repeat");
-    if (!quickRef?.trim())
-      throw new Error("quickRef is required for action=repeat");
-    if (params.timeoutSeconds === undefined) {
-      throw new Error("timeoutSeconds is required for action=repeat");
-    }
-    if (params.wake === "notify") {
-      throw new Error(
-        "repeat always wakes the agent; wake=notify is not supported"
-      );
-    }
-    const contextRefs = Object.freeze(
-      (params.contextRefs ?? []).map((reference) =>
-        Object.freeze({
-          label: reference.label,
-          target: reference.target,
-        })
-      )
-    );
-    if (
-      contextRefs.some(
-        (reference) => !reference.label.trim() || !reference.target.trim()
-      )
-    ) {
-      throw new Error("contextRefs require non-empty label and target values");
-    }
-    const entryId = ctx.sessionManager.getLeafId() ?? undefined;
-    const origin = Object.freeze(
-      entryId === undefined
-        ? { sessionId: sessionId(ctx) }
-        : { entryId, sessionId: sessionId(ctx) }
-    );
-    const snapshot: FollowUpSnapshot = Object.freeze({
-      capturedAt: startedAt,
-      contextRefs,
-      instruction,
-      origin,
-      quickRef,
+  ): UntilCommand =>
+    parseUntilCommand(params, {
+      cwd: ctx.cwd,
+      entryId: ctx.sessionManager.getLeafId() ?? undefined,
+      sessionId: sessionId(ctx),
+      startedAt: clock.now(),
     });
-    const condition = params.condition?.trim();
-    return {
-      expiresAt: startedAt + params.timeoutSeconds * 1_000,
-      first: params.immediate === true ? "now" : "afterInterval",
-      gate: condition ? gateFrom(params, ctx) : undefined,
-      intervalMs,
-      kind: "recurring",
-      label: params.label?.trim() || "recurring follow-up",
-      snapshot,
-    };
-  };
-
-  const definitionFrom = (
-    params: UntilParameters,
-    ctx: ExtensionContext,
-    startedAt: number
-  ): WatchDefinition => {
-    const intervalMs =
-      (params.intervalSeconds ?? DEFAULT_INTERVAL_SECONDS) * 1_000;
-    if (params.action === "start") {
-      return untilDefinitionFrom(params, ctx, startedAt, intervalMs);
-    }
-    if (params.action === "repeat") {
-      return recurringDefinitionFrom(params, ctx, startedAt, intervalMs);
-    }
-    throw new Error("cannot start a watch with this action");
-  };
 
   const startWatch = (
-    params: UntilParameters,
+    command: StartWatchCommand,
     ctx: ExtensionContext
   ): WatchRecord => {
+    followUps.send({
+      type: ctx.isIdle() ? "SESSION_SETTLED" : "SESSION_BUSY",
+    });
     if (ctx.mode === "print" || ctx.mode === "json") {
       throw new Error(
         "pi-until requires a long-lived interactive or RPC Pi process"
@@ -695,12 +652,10 @@ export default function piUntil(
     }
 
     const id = randomUUID().slice(0, 8);
-    const startedAt = Date.now();
-    const definition = definitionFrom(params, ctx, startedAt);
+    const { definition, startedAt } = command;
     const input: WatchActorInput = {
       definition,
       facts: initialFacts(definition, id, startedAt),
-      sessionIdle: ctx.isIdle(),
     };
     const record = runWatch(input);
     const receipt = toReceipt(record);
@@ -710,13 +665,10 @@ export default function piUntil(
         definition.kind === "recurring" ? definition.snapshot : undefined,
     });
     const gate = gateOf(definition);
-    const condition = describeCondition(gate?.command ?? "");
+    const conditionHash = hashCondition(gate?.command ?? "");
     void track(sessionId(ctx), {
-      checkTimeoutMs:
-        gate?.checkTimeoutMs ??
-        (params.checkTimeoutSeconds ?? DEFAULT_CHECK_TIMEOUT_SECONDS) * 1_000,
-      conditionHash: condition.hash,
-      conditionHead: condition.head,
+      checkTimeoutMs: gate?.checkTimeoutMs ?? 0,
+      conditionHash,
       event: "started",
       id,
       intervalMs: definition.intervalMs,
@@ -739,15 +691,13 @@ export default function piUntil(
   ) => {
     for (const watch of suspended) {
       if (watches.has(watch.facts.id)) continue;
-      const input = resumeInput(watch, ctx.isIdle());
+      const input = resumeInput(watch);
       runWatch(input);
       const gate = gateOf(input.definition);
-      const condition = describeCondition(gate?.command ?? "");
+      const conditionHash = hashCondition(gate?.command ?? "");
       void track(sessionId(ctx), {
-        checkTimeoutMs:
-          gate?.checkTimeoutMs ?? DEFAULT_CHECK_TIMEOUT_SECONDS * 1_000,
-        conditionHash: condition.hash,
-        conditionHead: condition.head,
+        checkTimeoutMs: gate?.checkTimeoutMs ?? 0,
+        conditionHash,
         event: "started",
         id: input.facts.id,
         intervalMs: input.definition.intervalMs,
@@ -772,27 +722,30 @@ export default function piUntil(
 
   /** Start one authoritative actor from a fresh or restored watch value. */
   const runWatch = (input: WatchActorInput): WatchRecord => {
-    const actor = createActor(machine, { input });
-    const record: WatchRecord = {
-      actor,
-      dispatchedDeliveries: input.facts.deliveries,
-    };
+    const actor = createActor(machine, { clock, input });
+    const record: WatchRecord = { actor };
     watches.set(input.facts.id, record);
 
     actor.subscribe({
-      error(error) {
-        if (record.finishedAt !== undefined) return;
-        record.defect = error instanceof Error ? error.message : String(error);
+      error() {
         finishWatch(record);
       },
       next(snapshot) {
-        if (
-          snapshot.matches({ active: "awaitingSettlement" }) &&
-          snapshot.context.facts.deliveries > record.dispatchedDeliveries
-        ) {
-          deliverRecurringFollowUp(record);
+        if (snapshot.matches({ active: "duePending" })) {
+          followUps.send({
+            request: {
+              dedupeKey: `recurring:${snapshot.context.facts.id}`,
+              id: randomUUID(),
+              kind: "recurring",
+              watchId: snapshot.context.facts.id,
+            },
+            type: "ENQUEUE",
+          });
         }
-        if (terminalState(snapshot) !== undefined) {
+        if (
+          terminalState(snapshot) !== undefined ||
+          snapshot.status === "error"
+        ) {
           finishWatch(record);
           return;
         }
@@ -805,21 +758,9 @@ export default function piUntil(
     return record;
   };
 
-  const listText = (records: WatchRecord[]) => {
-    if (records.length === 0) {
-      return "No pi-until watches.";
-    }
-    return records
-      .map((record) => {
-        const receipt = toReceipt(record);
-        return `${receipt.id}\t${receipt.status}\t${receipt.label}\tattempts=${receipt.attempts}`;
-      })
-      .join("\n");
-  };
-
   const showWatchPanel = async (ctx: ExtensionContext) => {
     if (ctx.mode !== "tui") {
-      ctx.ui.notify(listText(orderedWatches()), "info");
+      ctx.ui.notify(listText(orderedReceipts()), "info");
       return;
     }
 
@@ -838,7 +779,7 @@ export default function piUntil(
             clearInterval(refreshTimer);
           },
           handleInput(data: string) {
-            const count = orderedWatches().length;
+            const count = orderedWatchDisplays().length;
             const maximumOffset = Math.max(0, count - 1);
             if (keybindings.matches(data, "tui.select.up")) {
               offset = Math.max(0, offset - 1);
@@ -862,8 +803,8 @@ export default function piUntil(
           },
           render(width: number) {
             return renderWatchPanel(
-              orderedWatches().map(toWatchDisplay),
-              Date.now(),
+              orderedWatchDisplays(),
+              clock.now(),
               width,
               offset,
               PANEL_PAGE_SIZE,
@@ -891,13 +832,14 @@ export default function piUntil(
       "Start one-shot shell-condition watches or recurring Markdown follow-ups. Recurrences use fixed cadence, optional side-effect-free gates, immutable task snapshots, explicit completion, and session-scoped /reload survival.",
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       currentContext = ctx;
+      const command = parseCommand(params, ctx);
       void track(sessionId(ctx), {
-        action: params.action,
+        action: command.action,
         event: "action",
         source: "tool",
       });
-      if (params.action === "start" || params.action === "repeat") {
-        const record = startWatch(params, ctx);
+      if (command.action === "start" || command.action === "repeat") {
+        const record = startWatch(command, ctx);
         const receipt = toReceipt(record);
         const { definition } = record.actor.getSnapshot().context;
         const timing =
@@ -915,20 +857,27 @@ export default function piUntil(
         };
       }
 
-      if (params.action === "list") {
-        const records = [...watches.values()];
+      if (command.action === "list") {
+        const receipts = allReceipts();
         return {
-          content: [{ type: "text", text: listText(records) }],
-          details: { watches: records.map(toReceipt) },
+          content: [{ type: "text", text: listText(receipts) }],
+          details: { watches: receipts },
         };
       }
 
-      if (!params.id)
-        throw new Error(`id is required for action=${params.action}`);
-      const record = watches.get(params.id);
-      if (!record) throw new Error(`unknown pi-until watch: ${params.id}`);
+      const record = watches.get(command.id);
+      const historical = terminalReceiptFor(command.id);
+      if (record === undefined) {
+        if (historical === undefined) {
+          throw new Error(`unknown pi-until watch: ${command.id}`);
+        }
+        return {
+          content: [{ type: "text", text: receiptText(historical) }],
+          details: historical,
+        };
+      }
 
-      if (params.action === "complete") {
+      if (command.action === "complete") {
         const { definition } = record.actor.getSnapshot().context;
         if (definition.kind !== "recurring") {
           throw new Error("only recurring watches can be completed explicitly");
@@ -943,7 +892,7 @@ export default function piUntil(
         };
       }
 
-      if (params.action === "cancel") {
+      if (command.action === "cancel") {
         if (receiptStatus(record) === "running") {
           record.actor.send({ type: "CANCEL" });
         }
@@ -992,7 +941,9 @@ export default function piUntil(
         return;
       }
       try {
-        const record = startWatch({ action: "start", condition: args }, ctx);
+        const command = parseCommand({ action: "start", condition: args }, ctx);
+        if (command.action !== "start") return;
+        const record = startWatch(command, ctx);
         const receipt = toReceipt(record);
         ctx.ui.notify(`Watching ${receipt.label} as ${receipt.id}`, "info");
       } catch (error) {
@@ -1097,21 +1048,38 @@ export default function piUntil(
 
   pi.on("agent_start", (_event, ctx) => {
     currentContext = ctx;
-    for (const record of activeWatches()) {
-      record.actor.send({ type: "SESSION_BUSY" });
-    }
+    followUps.send({ type: "SESSION_BUSY" });
   });
 
   pi.on("agent_settled", (_event, ctx) => {
     currentContext = ctx;
-    const at = Date.now();
-    for (const record of activeWatches()) {
-      record.actor.send({ at, type: "SESSION_SETTLED" });
+    followUps.send({ type: "SESSION_SETTLED" });
+  });
+
+  pi.on("message_start", (event, ctx) => {
+    currentContext = ctx;
+    if (
+      event.message.role !== "custom" ||
+      !Value.Check(followUpMarkerSchema, event.message.details)
+    ) {
+      return;
     }
+    followUps.send({
+      id: event.message.details.followUpId,
+      type: "MESSAGE_STARTED",
+    });
   });
 
   pi.on("session_start", (event, ctx) => {
     currentContext = ctx;
+    if (shuttingDown) {
+      shuttingDown = false;
+      followUps = createSessionFollowUps(!ctx.isIdle());
+    } else {
+      followUps.send({
+        type: ctx.isIdle() ? "SESSION_SETTLED" : "SESSION_BUSY",
+      });
+    }
     // Only a reload keeps the same process and session. new/resume/fork
     // replace the session, and a suspension entry from an earlier process
     // must never resurrect watches nobody is running.
@@ -1123,6 +1091,7 @@ export default function piUntil(
 
   pi.on("session_shutdown", async (event) => {
     shuttingDown = true;
+    followUps.stop();
     const active = activeWatches();
     if (event.reason === "reload") {
       const suspended = active.map((record) =>
@@ -1131,7 +1100,7 @@ export default function piUntil(
       // Written even when empty so the newest entry always wins.
       pi.appendEntry(
         SUSPENDED_ENTRY_TYPE,
-        suspensionData(suspended, Date.now())
+        suspensionData(suspended, clock.now())
       );
       if (suspended.length > 0) {
         void track(sessionId(currentContext), {
@@ -1148,6 +1117,7 @@ export default function piUntil(
       record.actor.stop();
     }
     watches.clear();
+    terminalReceipts.length = 0;
     currentContext?.ui.setWidget(WIDGET_KEY, undefined);
     indicatorMounted = false;
     requestIndicatorRender = undefined;

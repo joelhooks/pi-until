@@ -2,29 +2,17 @@ import type {
   CustomEntry,
   ExtensionAPI,
   ExtensionContext,
+  MessageStartEvent,
   SessionEntry,
 } from "@earendil-works/pi-coding-agent";
 import { vi } from "vitest";
 
 import piUntil from "../extensions/pi-until.ts";
 import type { PiUntilOptions, WatchReceipt } from "../extensions/pi-until.ts";
+import type { UntilParameters } from "../src/command.ts";
 import type { TelemetryEventInput } from "../src/telemetry.ts";
 
-export interface UntilToolParams {
-  action: "start" | "repeat" | "list" | "status" | "complete" | "cancel";
-  checkTimeoutSeconds?: number;
-  condition?: string;
-  contextRefs?: { label: string; target: string }[];
-  cwd?: string;
-  id?: string;
-  immediate?: boolean;
-  instruction?: string;
-  intervalSeconds?: number;
-  label?: string;
-  quickRef?: string;
-  timeoutSeconds?: number;
-  wake?: "agent" | "notify";
-}
+export type UntilToolParams = UntilParameters;
 
 export interface UntilToolResult {
   content: { type: "text"; text: string }[];
@@ -48,7 +36,12 @@ export type UntilToolExecute = (
 ) => Promise<UntilToolResult>;
 
 export interface SentMessage {
-  readonly message: { customType: string; content: string };
+  readonly message: {
+    customType: string;
+    content: string;
+    details?: unknown;
+    display?: boolean;
+  };
   readonly options?: { deliverAs?: string; triggerTurn?: boolean };
 }
 
@@ -58,7 +51,8 @@ export type SessionEvent =
   | { type: "session_start"; reason: StartReason }
   | { type: "session_shutdown"; reason: ShutdownReason }
   | { type: "agent_start" }
-  | { type: "agent_settled" };
+  | { type: "agent_settled" }
+  | MessageStartEvent;
 
 type SessionHandler = (
   event: SessionEvent,
@@ -113,6 +107,10 @@ export class FakeSession {
 }
 
 export interface FakeExtension {
+  readonly acknowledgeMessage: (
+    index: number,
+    ctx: ExtensionContext
+  ) => Promise<void>;
   readonly agentSettled: (ctx: ExtensionContext) => Promise<void>;
   readonly agentStart: (ctx: ExtensionContext) => Promise<void>;
   readonly appendEntry: ReturnType<typeof vi.fn>;
@@ -133,9 +131,14 @@ export interface FakeExtension {
 }
 
 /** Instantiate the extension against a fake Pi bound to `session`. */
+interface FakeExtensionOptions extends PiUntilOptions {
+  readonly acknowledgeMessages?: boolean;
+  readonly sendMessageFailure?: Error;
+}
+
 export const loadExtension = (
   session: FakeSession,
-  options: Pick<PiUntilOptions, "telemetry"> = {}
+  options: FakeExtensionOptions = {}
 ): FakeExtension => {
   const messages: SentMessage[] = [];
   const entries: { customType: string; data: CustomEntry["data"] }[] = [];
@@ -146,6 +149,7 @@ export const loadExtension = (
   >();
   const handlers = new Map<string, SessionHandler>();
   let tool: UntilToolExecute | undefined;
+  let lastContext = session.context().ctx;
 
   const appendEntry = vi.fn((customType: string, data: CustomEntry["data"]) => {
     entries.push({ customType, data });
@@ -153,7 +157,26 @@ export const loadExtension = (
   });
   const sendMessage = vi.fn(
     (message: SentMessage["message"], sendOptions?: SentMessage["options"]) => {
+      if (options.sendMessageFailure !== undefined) {
+        throw options.sendMessageFailure;
+      }
       messages.push({ message, options: sendOptions });
+      if (options.acknowledgeMessages !== false) {
+        queueMicrotask(() => {
+          void handlers.get("message_start")?.(
+            {
+              message: {
+                ...message,
+                display: message.display ?? true,
+                role: "custom",
+                timestamp: Date.now(),
+              },
+              type: "message_start",
+            },
+            lastContext
+          );
+        });
+      }
     }
   );
 
@@ -173,7 +196,16 @@ export const loadExtension = (
       }
     ),
     registerTool: vi.fn((definition: { execute: UntilToolExecute }) => {
-      tool = definition.execute;
+      tool = async (toolCallId, params, signal, onUpdate, context) => {
+        lastContext = context;
+        return definition.execute(
+          toolCallId,
+          params,
+          signal,
+          onUpdate,
+          context
+        );
+      };
     }),
     sendMessage,
   };
@@ -181,6 +213,8 @@ export const loadExtension = (
   // SAFETY: the extension uses only appendEntry, on, registerCommand,
   // registerTool, and sendMessage from ExtensionAPI.
   piUntil(pi as unknown as ExtensionAPI, {
+    clock: options.clock,
+    followUpDispatchAckMs: options.followUpDispatchAckMs,
     telemetry: options.telemetry ?? {
       enabled: true,
       filePath: "memory",
@@ -195,11 +229,28 @@ export const loadExtension = (
   }
 
   const emit = async (event: SessionEvent, ctx: ExtensionContext) => {
+    lastContext = ctx;
     await handlers.get(event.type)?.(event, ctx);
   };
   const shutdownContext = session.context().ctx;
 
   return {
+    acknowledgeMessage: async (index, ctx) => {
+      const sent = messages[index];
+      if (sent === undefined) throw new Error(`unknown sent message: ${index}`);
+      await emit(
+        {
+          message: {
+            ...sent.message,
+            display: sent.message.display ?? true,
+            role: "custom",
+            timestamp: Date.now(),
+          },
+          type: "message_start",
+        },
+        ctx
+      );
+    },
     agentSettled: (ctx) => emit({ type: "agent_settled" }, ctx),
     agentStart: (ctx) => emit({ type: "agent_start" }, ctx),
     appendEntry,

@@ -14,27 +14,31 @@ Node is `24.18.0`. Use npm `11.16.0`; never Bun. `devEngines` fails hard on any 
 
 ## Architecture
 
-- `src/domain.ts` owns immutable watch definitions, facts, and fixed-cadence math.
+- `src/command.ts` owns the provider-compatible tool schema, bridge normalization, and one-time parsing into internal commands.
+- `src/domain.ts` owns immutable watch definitions, facts, failures, and fixed-cadence math.
+- `src/clock.ts` owns the injectable clock port used by machines and tests.
 - `src/machine.ts` owns the XState v5 shell and recurring watch lifecycle.
+- `src/follow-up.ts` owns the XState v5 session delivery queue, message acknowledgement, settlement, deduplication, and stale-work rejection.
 - `src/packet.ts` owns recurring Markdown wake and expiry packets.
 - `src/check.ts` owns bounded shell execution and process-group termination.
 - `src/completion.ts` owns agent-wake versus notify-only routing.
 - `src/suspension.ts` owns the `pi-until-suspended` session entry: suspend a watch to a value, parse it back at the boundary, keep the timeout anchored.
-- `src/telemetry.ts` owns local JSONL usage events, the condition hash/head, and `/until-stats` summaries.
+- `src/telemetry.ts` owns local JSONL usage events, condition hashes, and `/until-stats` summaries.
 - `extensions/pi-until.ts` owns Pi integration, receipts, UI status, reload suspend/resume, and lifecycle cleanup.
 - `tests/fake-pi.ts` is the typed Pi fake. Use it instead of `as unknown as ExtensionAPI` in new tests.
-- Tests must exercise transitions, retries, per-check timeout, cancellation, descendant termination, wake behavior, recurring coalescing, explicit completion, expiry, and reload suspend/resume.
+- Tests must exercise transitions, retries, per-check timeout, cancellation, descendant termination, wake behavior, session-wide delivery serialization, dispatch acknowledgement, recurring coalescing, explicit completion, failure, expiry, and reload suspend/resume.
 
 ## Invariants
 
 - Exit code 0 is the only success condition.
 - Checks must not overlap for one watch.
+- Only one `pi-until` follow-up may be submitted to or running in Pi at a time. Correlate it through `details.followUpId`.
 - Starting a watch returns immediately.
 - Cancellation aborts the active check and its descendants on macOS and Linux.
 - Condition stdout and stderr are discarded, never added to receipts or model context.
 - Session shutdown awaits process-tree cleanup before Pi may exit.
 - Only `session_shutdown { reason: "reload" }` suspends watches, and only `session_start { reason: "reload" }` resumes them. Every reload writes a suspension entry, even an empty one, so the newest entry always wins.
-- Telemetry never writes condition text and never touches the network. It must never throw into a watch.
+- Telemetry never writes condition text or command fragments and never touches the network. It must never throw into a watch.
 - Tool parameter schemas must have one `Type.Object` root. Root object unions make the OpenAI Codex bridge serialize arrays, booleans, and numbers as strings.
 - `prepareArguments` may repair only known bridge encodings before normal schema validation; malformed values must still fail validation.
 - Only `wake=agent` calls `pi.sendMessage(..., { triggerTurn: true })`.

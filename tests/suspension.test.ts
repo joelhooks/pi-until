@@ -57,7 +57,6 @@ const context = (
     deliveries: definition.kind === "recurring" ? 2 : 0,
     reloads: 1,
   },
-  sessionIdle: false,
 });
 
 const custom = (
@@ -79,10 +78,9 @@ describe("suspension", () => {
       definition: recurringDefinition,
       facts: { attempts: 7, deliveries: 2, reloads: 2 },
     });
-    expect(resumeInput(persisted, true)).toEqual({
+    expect(resumeInput(persisted)).toEqual({
       definition: recurringDefinition,
       facts: persisted.facts,
-      sessionIdle: true,
     });
   });
 

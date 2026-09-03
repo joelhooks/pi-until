@@ -98,11 +98,32 @@ export const checkResultSchema = Type.Object(
 
 export type CheckResult = DeepReadonly<Static<typeof checkResultSchema>>;
 
+export const watchFailureSchema = Type.Union([
+  Type.Object(
+    {
+      kind: Type.Literal("gate"),
+      message: Type.String({ minLength: 1 }),
+    },
+    { additionalProperties: false }
+  ),
+  Type.Object(
+    {
+      kind: Type.Literal("delivery"),
+      message: Type.String({ minLength: 1 }),
+    },
+    { additionalProperties: false }
+  ),
+]);
+
+export type WatchFailure = DeepReadonly<Static<typeof watchFailureSchema>>;
+
 export const watchFactsSchema = Type.Object(
   {
     attempts: Type.Number({ minimum: 0 }),
     deliveries: Type.Number({ minimum: 0 }),
     deliveryPending: Type.Boolean(),
+    failure: Type.Optional(watchFailureSchema),
+    finishedAt: Type.Optional(Type.Number()),
     id: Type.String({ minLength: 1 }),
     lastCheckedAt: Type.Optional(Type.Number()),
     lastResult: Type.Optional(checkResultSchema),
@@ -119,7 +140,6 @@ export type WatchFacts = DeepReadonly<Static<typeof watchFactsSchema>>;
 export interface WatchActorInput {
   readonly definition: WatchDefinition;
   readonly facts: WatchFacts;
-  readonly sessionIdle: boolean;
 }
 
 export type WatchContext = WatchActorInput;

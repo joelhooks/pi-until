@@ -41,7 +41,7 @@ const startFileWatch = async (
     {
       action: "start",
       condition: `test -f ${JSON.stringify(file)}`,
-      intervalSeconds: 0.01,
+      intervalSeconds: 1,
       label: "reload test",
       ...extra,
     },
@@ -110,9 +110,12 @@ describe("pi-until across /reload", () => {
     expect(second.messages).toHaveLength(0);
 
     writeFileSync(readyFile, "ready\n", "utf-8");
-    await vi.waitFor(() => {
-      expect(second.messages).toHaveLength(1);
-    });
+    await vi.waitFor(
+      () => {
+        expect(second.messages).toHaveLength(1);
+      },
+      { timeout: 2_000 }
+    );
     expect(second.messages[0]?.message.content).toContain(
       "Survived reloads: 1"
     );
@@ -140,9 +143,9 @@ describe("pi-until across /reload", () => {
         action: "repeat",
         contextRefs: [{ label: "Runbook", target: "docs/runbook.md" }],
         instruction: "Inspect the release after reload.",
-        intervalSeconds: 0.05,
+        intervalSeconds: 1,
         quickRef: "reload recurrence",
-        timeoutSeconds: 1,
+        timeoutSeconds: 10,
       },
       new AbortController().signal,
       undefined,
@@ -157,9 +160,12 @@ describe("pi-until across /reload", () => {
     live.push(second);
     const { ctx: resumedCtx } = session.context({ idle: true });
     await second.sessionStart("reload", resumedCtx);
-    await vi.waitFor(() => {
-      expect(second.messages).toHaveLength(1);
-    });
+    await vi.waitFor(
+      () => {
+        expect(second.messages).toHaveLength(1);
+      },
+      { timeout: 2_000 }
+    );
     expect(second.messages[0]?.message.content).toContain(
       "Inspect the release after reload."
     );
@@ -248,6 +254,30 @@ describe("pi-until across /reload", () => {
       new AbortController().signal,
       undefined,
       resumedCtx
+    );
+  });
+
+  it("creates a fresh delivery arbiter when the same extension changes sessions", async () => {
+    const session = new FakeSession();
+    const extension = loadExtension(session);
+    live.push(extension);
+    const { ctx } = session.context({ idle: true });
+
+    await extension.shutdown("new");
+    await extension.sessionStart("new", ctx);
+    await extension.tool(
+      "new-session-watch",
+      { action: "start", condition: "true", label: "new session" },
+      new AbortController().signal,
+      undefined,
+      ctx
+    );
+
+    await vi.waitFor(() => {
+      expect(extension.messages).toHaveLength(1);
+    });
+    expect(extension.messages[0]?.message.content).toContain(
+      "condition is true"
     );
   });
 

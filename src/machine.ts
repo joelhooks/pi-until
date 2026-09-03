@@ -1,5 +1,7 @@
 import { assign, fromCallback, fromPromise, setup } from "xstate";
 
+import { systemClock } from "./clock.ts";
+import type { UntilClock } from "./clock.ts";
 import {
   advanceAfterTick,
   coalescePastDue,
@@ -12,6 +14,7 @@ import type {
   WatchActorInput,
   WatchContext,
   WatchFacts,
+  WatchFailure,
 } from "./domain.ts";
 
 export interface UntilCheckInput {
@@ -25,15 +28,17 @@ export type UntilCheckResult = CheckResult;
 export type WatchEvent =
   | { readonly type: "CANCEL" }
   | { readonly type: "COMPLETE" }
-  | { readonly at: number; readonly type: "EXPIRE" }
-  | { readonly type: "SESSION_BUSY" }
-  | { readonly at: number; readonly type: "SESSION_SETTLED" };
+  | { readonly at: number; readonly type: "DELIVERY_STARTED" }
+  | { readonly at: number; readonly type: "DELIVERY_SETTLED" }
+  | { readonly failure: WatchFailure; readonly type: "DELIVERY_FAILED" }
+  | { readonly at: number; readonly type: "EXPIRE" };
 
 export type WatchTerminalState =
   | "satisfied"
   | "completed"
   | "expired"
-  | "cancelled";
+  | "cancelled"
+  | "failed";
 
 export type RunUntilCheck = (
   input: UntilCheckInput,
@@ -92,8 +97,9 @@ const afterDeliveryRequested = (
 
 export function createWatchMachine(
   runCheck: RunUntilCheck,
-  now: () => number = Date.now
+  clock: UntilClock = systemClock
 ) {
+  const now = () => clock.now();
   return setup({
     actions: {
       coalesceAtExpiry: assign({
@@ -119,10 +125,27 @@ export function createWatchMachine(
           deliveryPending: true,
         }),
       }),
-      markSessionBusy: assign({ sessionIdle: false }),
-      markSessionIdle: assign({ sessionIdle: true }),
-      prepareDelivery: assign({
-        facts: ({ context }) => afterDeliveryRequested(context, now()),
+      markFinished: assign({
+        facts: ({ context }) => ({
+          ...context.facts,
+          finishedAt: context.facts.finishedAt ?? now(),
+        }),
+      }),
+      markDeliveryFailure: assign({
+        facts: ({ context, event }) => ({
+          ...context.facts,
+          failure:
+            event.type === "DELIVERY_FAILED"
+              ? event.failure
+              : { kind: "delivery", message: "follow-up delivery failed" },
+        }),
+      }),
+      startDelivery: assign({
+        facts: ({ context, event }) =>
+          afterDeliveryRequested(
+            context,
+            event.type === "DELIVERY_STARTED" ? event.at : now()
+          ),
       }),
       settleDelivery: assign({
         facts: ({ context, event }) =>
@@ -130,10 +153,9 @@ export function createWatchMachine(
             ? coalescePastDue(
                 context.facts,
                 context.definition.intervalMs,
-                event.type === "SESSION_SETTLED" ? event.at : now()
+                event.type === "DELIVERY_SETTLED" ? event.at : now()
               )
             : context.facts,
-        sessionIdle: true,
       }),
     },
     actors: {
@@ -146,12 +168,12 @@ export function createWatchMachine(
           const timer =
             expiresAt === undefined
               ? undefined
-              : setTimeout(
+              : clock.setTimeout(
                   () => sendBack({ at: expiresAt, type: "EXPIRE" }),
                   Math.max(0, expiresAt - now())
                 );
           return () => {
-            if (timer !== undefined) clearTimeout(timer);
+            if (timer !== undefined) clock.clearTimeout(timer);
           };
         }
       ),
@@ -172,7 +194,6 @@ export function createWatchMachine(
         gateOf(context.definition) !== undefined &&
         context.facts.nextDueAt <= now(),
       isRecurring: ({ context }) => context.definition.kind === "recurring",
-      sessionIdle: ({ context }) => context.sessionIdle,
     },
     types: {
       // SAFETY: XState reads these empty values only as compile-time type witnesses.
@@ -206,13 +227,15 @@ export function createWatchMachine(
             actions: "coalesceAtExpiry",
             target: "expired",
           },
-          SESSION_BUSY: { actions: "markSessionBusy" },
-          SESSION_SETTLED: { actions: "markSessionIdle" },
+          DELIVERY_FAILED: {
+            actions: "markDeliveryFailure",
+            target: "failed",
+          },
         },
         states: {
           awaitingSettlement: {
             on: {
-              SESSION_SETTLED: {
+              DELIVERY_SETTLED: {
                 actions: "settleDelivery",
                 target: "routing",
               },
@@ -241,17 +264,6 @@ export function createWatchMachine(
                 },
                 {
                   actions: assign({
-                    facts: ({ context, event }) =>
-                      afterDeliveryRequested(context, now(), event.output),
-                  }),
-                  guard: ({ context, event }) =>
-                    context.definition.kind === "recurring" &&
-                    passed(event.output) &&
-                    context.sessionIdle,
-                  target: "awaitingSettlement",
-                },
-                {
-                  actions: assign({
                     facts: ({ context, event }) => ({
                       ...withCheckResult(context.facts, event.output, now()),
                       deliveryPending: true,
@@ -272,18 +284,26 @@ export function createWatchMachine(
               ],
               onError: {
                 actions: assign({
-                  facts: ({ context }) =>
-                    afterNoMatch(context, { code: -1, killed: false }, now()),
+                  facts: ({ context, event }) => ({
+                    ...context.facts,
+                    failure: {
+                      kind: "gate" as const,
+                      message:
+                        event.error instanceof Error
+                          ? event.error.message
+                          : String(event.error),
+                    },
+                  }),
                 }),
-                target: "routing",
+                target: "#watch.failed",
               },
               src: "checkCondition",
             },
           },
           duePending: {
             on: {
-              SESSION_SETTLED: {
-                actions: ["markSessionIdle", "prepareDelivery"],
+              DELIVERY_STARTED: {
+                actions: "startDelivery",
                 target: "awaitingSettlement",
               },
             },
@@ -296,25 +316,10 @@ export function createWatchMachine(
                 target: "#watch.expired",
               },
               {
-                actions: "prepareDelivery",
-                guard: ({ context }) =>
-                  context.facts.deliveryPending && context.sessionIdle,
-                target: "awaitingSettlement",
-              },
-              {
                 guard: ({ context }) => context.facts.deliveryPending,
                 target: "duePending",
               },
               { guard: "hasDueGate", target: "checking" },
-              {
-                actions: "prepareDelivery",
-                guard: ({ context }) =>
-                  context.definition.kind === "recurring" &&
-                  gateOf(context.definition) === undefined &&
-                  context.facts.nextDueAt <= now() &&
-                  context.sessionIdle,
-                target: "awaitingSettlement",
-              },
               {
                 actions: "markDeliveryPending",
                 guard: "dueWithoutGate",
@@ -328,10 +333,11 @@ export function createWatchMachine(
           },
         },
       },
-      cancelled: { type: "final" },
-      completed: { type: "final" },
-      expired: { type: "final" },
-      satisfied: { type: "final" },
+      cancelled: { entry: "markFinished", type: "final" },
+      completed: { entry: "markFinished", type: "final" },
+      expired: { entry: "markFinished", type: "final" },
+      failed: { entry: "markFinished", type: "final" },
+      satisfied: { entry: "markFinished", type: "final" },
     },
   });
 }

@@ -15,10 +15,11 @@ The agent can release its turn, keep working on other requests, and wake with a 
 - Recurring work ends only through explicit completion, cancellation, failure, or expiry. The shell gate permits a wake; it never completes the work.
 - Watches belong to one live Pi session/process. `/reload` keeps both alive, so watches survive it by suspending to a session entry and restarting in the new extension instance.
 - Agent wake and notification-only completion are supported for one-shot shell watches. Recurring watches always wake the agent.
-- Cancellation, completion, per-check timeout, overall expiry, pending delivery, and settlement are explicit machine states.
+- Cancellation, completion, per-check timeout, overall expiry, pending delivery, settlement, and failure are explicit machine states.
+- One session arbiter serializes all `pi-until` follow-ups. It correlates dispatch acknowledgement by message ID and waits for the resulting agent turn to settle.
 - The extension does not become a daemon, durable scheduler, workflow engine, side-effect runner, or outward notification gateway.
 - The extension never claims durability across session replacement, process exit, or machine reboot. A suspension entry written by a dead process is a historical fact, not authority.
-- Usage telemetry stays local: a JSONL file under `~/.pi/agent/pi-until/`; condition text, recurring instructions, and context pointers are never written; no network.
+- Usage telemetry stays local: a JSONL file under `~/.pi/agent/pi-until/`; only condition hashes are written, never command fragments, recurring instructions, quick references, or context pointers; no network.
 
 ## Taste
 

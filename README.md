@@ -92,7 +92,7 @@ until({
 
 The extension snapshots `instruction`, `quickRef`, `contextRefs`, and the origin session entry at start. Change the intent by completing or cancelling the old recurrence and starting another one.
 
-Cadence stays anchored to the original schedule. Pi permits at most one pending follow-up. If a task remains unsettled across later ticks, the next receipt reports `missedTicks` instead of stacking agent turns.
+Cadence stays anchored to the original schedule. One session-wide arbiter sends only one `pi-until` follow-up into Pi at a time. It waits for Pi to start that exact message and for the resulting agent turn to settle before it sends another. Missed ticks increase `missedTicks` instead of stacking agent turns. If acknowledgement takes more than five seconds, the arbiter pauses and warns instead of guessing that Pi discarded an accepted message. A late `message_start` resumes the lifecycle safely. A synchronous dispatch rejection fails the recurring watch.
 
 ## Session display
 
@@ -133,11 +133,11 @@ This boundary is intentional. `pi-until` is a session primitive, not another sch
 
 ## Telemetry
 
-The extension appends one JSON line per event to `~/.pi/agent/pi-until/events.jsonl`. Nothing leaves the machine. Events: `started`, `finished`, `suspended`, `resumed`, and `action` (tool or command use). A condition is recorded as a 12-character hash plus its first word (for example `test`, `gh`, `curl`); the command text is never written. Recurring instructions and context pointers are never written to telemetry. Labels are written, so keep them safe.
+The extension appends one JSON line per event to `~/.pi/agent/pi-until/events.jsonl`. Nothing leaves the machine. Events: `started`, `finished`, `suspended`, `resumed`, and `action` (tool or command use). A condition is recorded only as a 12-character hash; no command fragment is written. Recurring instructions, quick references, and context pointers are never written to telemetry. Labels are written, so keep them safe.
 
 - `PI_UNTIL_TELEMETRY=0` disables it.
 - `PI_UNTIL_TELEMETRY_FILE=/path/events.jsonl` moves it.
-- `/until-stats` prints counts by status and wake mode, median attempts and duration, reload suspend/resume counts, and the top condition heads.
+- `/until-stats` prints counts by status and wake mode, median attempts and duration, and reload suspend/resume counts.
 
 ## Safety
 
@@ -153,7 +153,7 @@ npm run check
 npm run pack:dry
 ```
 
-One XState v5 machine owns shell and recurring lifecycles:
+One XState v5 machine owns each watch:
 
 ```text
 active.routing -> waiting -> checking -----------------> satisfied
@@ -161,7 +161,13 @@ active.routing -> waiting -> checking -----------------> satisfied
        |            |          +-> duePending
        |            +------------> duePending -> awaitingSettlement
        |                                      -> routing  (recurring)
-       +-> completed | expired | cancelled
+       +-> completed | expired | cancelled | failed
 ```
 
-The machine owns cadence, expiry, gate checks, delivery counts, missed ticks, and terminal state. The extension adapts Pi lifecycle events and performs delivery.
+A second XState v5 machine owns the session delivery queue:
+
+```text
+ready -> queued -> awaiting message_start -> awaiting agent_settled -> ready
+```
+
+`src/command.ts` parses the flat provider schema once into an internal command. The watch machine owns cadence, expiry, checks, delivery counts, missed ticks, and terminal state. The session queue owns cross-watch serialization, message correlation, deduplication, and dispatch acknowledgement. The extension only adapts these parts to Pi lifecycle events, receipts, and UI.

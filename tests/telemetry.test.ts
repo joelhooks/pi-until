@@ -6,7 +6,7 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import {
   createTelemetrySink,
-  describeCondition,
+  hashCondition,
   parseTelemetryLines,
   readTelemetry,
   summarizeTelemetry,
@@ -22,17 +22,12 @@ afterEach(() => {
 });
 
 describe("telemetry", () => {
-  it("describes a condition without keeping the command", () => {
-    const described = describeCondition(
-      "  /usr/bin/gh run view 123 --exit-status "
-    );
-    expect(described.head).toBe("gh");
-    expect(described.hash).toHaveLength(12);
-    expect(described.hash).toBe(
-      describeCondition("/usr/bin/gh run view 123 --exit-status").hash
-    );
-    expect(describeCondition("").head).toBe("(empty)");
-    expect(describeCondition("-f x").head).toBe("(empty)");
+  it("hashes a condition without retaining any command fragment", () => {
+    const hash = hashCondition("  TOKEN=secret command --flag ");
+    expect(hash).toHaveLength(12);
+    expect(hash).toBe(hashCondition("TOKEN=secret command --flag"));
+    expect(hash).not.toContain("TOKEN");
+    expect(hashCondition("")).toHaveLength(12);
   });
 
   it("appends JSONL events and reads them back, skipping garbage", async () => {
@@ -52,7 +47,6 @@ describe("telemetry", () => {
     await sink.record("s1", {
       checkTimeoutMs: 30_000,
       conditionHash: "abc",
-      conditionHead: "test",
       event: "started",
       id: "w1",
       intervalMs: 30_000,
@@ -64,6 +58,7 @@ describe("telemetry", () => {
     expect(raw.split("\n").filter(Boolean)).toHaveLength(2);
     expect(raw).toContain('"at":"2023-11-14T22:13:20.000Z"');
     expect(raw).not.toContain("secret");
+    expect(raw).not.toContain("conditionHead");
 
     const events = await readTelemetry(filePath);
     expect(events.map((event) => event.event)).toEqual(["action", "started"]);
@@ -98,7 +93,6 @@ describe("telemetry", () => {
         ...base,
         checkTimeoutMs: 1,
         conditionHash: "a",
-        conditionHead: "gh",
         event: "started",
         id: "1",
         intervalMs: 1,
@@ -110,7 +104,6 @@ describe("telemetry", () => {
         ...base,
         checkTimeoutMs: 1,
         conditionHash: "b",
-        conditionHead: "test",
         event: "started",
         id: "2",
         intervalMs: 1,
@@ -122,7 +115,6 @@ describe("telemetry", () => {
         ...base,
         checkTimeoutMs: 1,
         conditionHash: "b",
-        conditionHead: "test",
         event: "started",
         id: "2",
         intervalMs: 1,
@@ -167,14 +159,10 @@ describe("telemetry", () => {
       sessions: 2,
       started: 2,
       suspendedWatches: 1,
-      topHeads: [
-        { count: 1, head: "gh" },
-        { count: 1, head: "test" },
-      ],
     });
     const text = summaryText(summary, "/x.jsonl");
     expect(text).toContain("Watches started: 2  finished: 2");
     expect(text).toContain("median duration: 50.0s");
-    expect(text).toContain("Top conditions: gh=1 test=1");
+    expect(text).not.toContain("Top conditions");
   });
 });

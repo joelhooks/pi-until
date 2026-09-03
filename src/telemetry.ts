@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { appendFile, mkdir, readFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { basename, dirname, join } from "node:path";
+import { dirname, join } from "node:path";
 
 import { Type } from "typebox";
 import type { Static } from "typebox";
@@ -10,8 +10,7 @@ import { Value } from "typebox/value";
 /**
  * Local usage telemetry. One JSON object per line, appended to a file this
  * user owns. Nothing leaves the machine. The condition command is never
- * written; only a hash for grouping and the first word for "what kind of
- * thing do people wait on".
+ * written; only a one-way hash is kept for grouping.
  */
 export const TELEMETRY_VERSION = 1;
 export const DEFAULT_TELEMETRY_FILE = join(
@@ -46,7 +45,6 @@ const startedSchema = Type.Object({
   ...base,
   checkTimeoutMs: Type.Number(),
   conditionHash: Type.String(),
-  conditionHead: Type.String(),
   event: Type.Literal("started"),
   id: Type.String(),
   intervalMs: Type.Number(),
@@ -119,21 +117,9 @@ export type TelemetryEventInput = DistributiveOmit<
   "at" | "sessionId" | "v"
 >;
 
-export interface ConditionDescription {
-  readonly hash: string;
-  readonly head: string;
-}
-
-/** Group by hash, describe by first word. The command itself stays private. */
-export const describeCondition = (command: string): ConditionDescription => {
-  const trimmed = command.trim();
-  const firstWord = trimmed.split(/\s+/u, 1)[0] ?? "";
-  const head = firstWord.startsWith("-") ? "" : basename(firstWord);
-  return {
-    hash: createHash("sha256").update(trimmed).digest("hex").slice(0, 12),
-    head: head || "(empty)",
-  };
-};
+/** Group conditions without writing any fragment of the command. */
+export const hashCondition = (command: string): string =>
+  createHash("sha256").update(command.trim()).digest("hex").slice(0, 12);
 
 export interface TelemetrySink {
   readonly enabled: boolean;
@@ -227,10 +213,6 @@ export interface TelemetrySummary {
   readonly sessions: number;
   readonly started: number;
   readonly suspendedWatches: number;
-  readonly topHeads: readonly {
-    readonly count: number;
-    readonly head: string;
-  }[];
 }
 
 const median = (values: readonly number[]): number | undefined => {
@@ -254,7 +236,6 @@ export const summarizeTelemetry = (
   const actions: Record<string, number> = {};
   const byStatus: Record<string, number> = {};
   const byWake: Record<string, number> = {};
-  const heads: Record<string, number> = {};
   const sessions = new Set<string>();
   const attempts: number[] = [];
   const durations: number[] = [];
@@ -270,7 +251,6 @@ export const summarizeTelemetry = (
         if (!event.resumed) {
           started += 1;
           count(byWake, event.wake);
-          count(heads, event.conditionHead);
         }
         break;
       }
@@ -300,14 +280,6 @@ export const summarizeTelemetry = (
     }
   }
 
-  const topHeads = Object.entries(heads)
-    .map(([head, headCount]) => ({ count: headCount, head }))
-    .sort(
-      (left, right) =>
-        right.count - left.count || left.head.localeCompare(right.head)
-    )
-    .slice(0, 8);
-
   return {
     actions,
     byStatus,
@@ -319,7 +291,6 @@ export const summarizeTelemetry = (
     sessions: sessions.size,
     started,
     suspendedWatches,
-    topHeads,
   };
 };
 
@@ -359,6 +330,5 @@ export const summaryText = (
     `By wake: ${formatTally(summary.byWake)}`,
     `Median attempts: ${summary.medianAttempts ?? "n/a"}  median duration: ${formatDuration(summary.medianDurationMs)}`,
     `Reload suspended: ${summary.suspendedWatches}  resumed: ${summary.resumedWatches}`,
-    `Top conditions: ${summary.topHeads.map((item) => `${item.head}=${item.count}`).join(" ") || "none"}`,
     `Actions: ${formatTally(summary.actions)}`,
   ].join("\n");
