@@ -829,7 +829,7 @@ export default function piUntil(
 
   pi.registerTool({
     description:
-      "Start one-shot shell-condition watches or recurring Markdown follow-ups. Recurrences use fixed cadence, optional side-effect-free gates, immutable task snapshots, explicit completion, and session-scoped /reload survival.",
+      "Start session-scoped shell-condition watches or recurring agent follow-ups. One session arbiter serializes every pi-until wake. Recurrences use fixed cadence, immutable task snapshots, explicit completion, and /reload-only restoration.",
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       currentContext = ctx;
       const command = parseCommand(params, ctx);
@@ -914,13 +914,16 @@ export default function piUntil(
     parameters: untilParameters,
     prepareArguments: prepareUntilArguments,
     promptGuidelines: [
-      "Use until with action=start when work should resume after a side-effect-free shell condition exits 0; do not block bash with polling or sleep loops.",
-      "Use until with action=repeat for session-scoped recurring agent follow-ups. Supply timeoutSeconds, instruction, and quickRef; contextRefs are opaque pointers expanded by the waking agent.",
-      "Keep until recurring snapshots short and secret-free. The instruction, quickRef, and contextRefs are immutable and persist in the private Pi session.",
-      "Use until action=complete when a recurring goal is achieved, or action=cancel when it should stop without success.",
+      "Use until action=start when work should resume after a side-effect-free shell condition exits 0. Do not block bash with polling or sleep loops.",
+      "Use until action=repeat when the same agent must do work on a fixed cadence. Supply timeoutSeconds, instruction, and quickRef.",
+      "Treat contextRefs as opaque pointers. Read a target only when the recurring instruction requires it.",
+      "Keep recurring snapshots short and secret-free. The instruction, quickRef, and contextRefs are immutable private session data.",
+      "Call until action=complete only when the recurring goal is achieved. A finished agent turn is not completion.",
+      "Call until action=cancel when recurring work should stop without success. Do not continue an expired or failed recurrence unless the user asks.",
+      "Use a durable workload scheduler instead when work must survive Pi exit, session replacement, or reboot.",
     ],
     promptSnippet:
-      "Start, inspect, complete, or cancel condition watches and recurring follow-ups",
+      "Watch a shell predicate or schedule serialized work in this live Pi session",
   });
 
   pi.registerCommand("until", {

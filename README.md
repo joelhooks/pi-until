@@ -18,6 +18,16 @@ while ! ssh host 'test -f /tmp/done'; do sleep 30; done
 
 into a session-owned watch that leaves Pi free for other work.
 
+## Choose the primitive
+
+| Need | Use |
+| --- | --- |
+| Resume when a cheap fact becomes true | `action: "start"` |
+| Ask the same agent to do work on a fixed cadence | `action: "repeat"` |
+| Survive Pi exit, session replacement, or reboot | Use a durable workload scheduler instead |
+
+A shell condition is a predicate, not a job. If the command changes the system, it does not belong in `pi-until`.
+
 ## Install
 
 ```bash
@@ -93,6 +103,13 @@ until({
 The extension snapshots `instruction`, `quickRef`, `contextRefs`, and the origin session entry at start. Change the intent by completing or cancelling the old recurrence and starting another one.
 
 Cadence stays anchored to the original schedule. One session-wide arbiter sends only one `pi-until` follow-up into Pi at a time. It waits for Pi to start that exact message and for the resulting agent turn to settle before it sends another. Missed ticks increase `missedTicks` instead of stacking agent turns. If acknowledgement takes more than five seconds, the arbiter pauses and warns instead of guessing that Pi discarded an accepted message. A late `message_start` resumes the lifecycle safely. A synchronous dispatch rejection fails the recurring watch.
+
+## Agent contract
+
+- Treat `contextRefs` as opaque pointers. Read a target only when the instruction requires it.
+- Call `complete` only when the recurring goal is achieved. A finished turn is not a finished recurrence.
+- Call `cancel` when the recurrence should stop without success.
+- An expired or failed receipt is terminal. Do not continue its instruction unless the user asks.
 
 ## Session display
 

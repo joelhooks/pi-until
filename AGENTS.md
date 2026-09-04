@@ -45,6 +45,18 @@ Node is `24.18.0`. Use npm `11.16.0`; never Bun. `devEngines` fails hard on any 
 - Never persist or publish secrets from commands or output.
 - Do not add a daemon, scheduler, or reboot durability without a separate design decision.
 
+## Agent-facing contract
+
+Keep these surfaces aligned when behavior changes:
+
+- `README.md` explains the user and agent contract.
+- `src/command.ts` owns parameter descriptions and boundary parsing.
+- `extensions/pi-until.ts` owns the tool description, prompt snippet, and prompt guidelines.
+- `src/packet.ts` owns the instructions delivered on wake and expiry.
+- `VISION.md` and `.brain/projects/pi-until-reload-survival.svx` hold the durable boundary and its reasons.
+
+Preserve four distinctions in every surface: a gate permits work but does not complete it; dispatch is not acknowledgement; an acknowledgement timeout is uncertain rather than rejected; `/reload` restores watches but a session replacement does not.
+
 ## Sources
 
 Pi extension behavior must be checked against the maintained source mirror in the Dark Wizard repo:

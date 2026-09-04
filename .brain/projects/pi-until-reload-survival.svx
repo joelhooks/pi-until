@@ -1,37 +1,69 @@
 ---
-title: pi-until survives /reload, gains local telemetry
+title: pi-until session lifecycle and delivery arbitration
 type: project
 status: active
 created: 2026-08-27
-tags: [pi-until, pi-extension, reload, telemetry, uncomplect]
+updated: 2026-09-03
+tags: [pi-until, pi-extension, xstate, reload, recurrence, telemetry]
 ---
 
-## Problem
+## Purpose
 
-Joel runs long "recursive" agent loops on `pi-until`. `/reload` killed every open watch. The `session_shutdown` handler ignored `event.reason` and treated reload like quit.
+`pi-until` releases the current model turn while a cheap shell predicate waits or a recurring agent task approaches its next fixed-cadence tick. The owner is the current live Pi session. It is not a durable scheduler.
 
-## Facts (pi 0.84.2 source)
+## Lifecycle boundary
 
-- `AgentSession.reload()` emits `session_shutdown { reason: "reload" }`, invalidates the old runner, re-imports the extension with jiti, then emits `session_start { reason: "reload" }`. The process and the session file stay the same.
-- `pi.appendEntry` calls `sessionManager.appendCustomEntry` directly. The runner is invalidated only after the shutdown handlers resolve, so writing from `session_shutdown` is safe.
-- Upstream warns against reusing a captured `pi` or `ctx` after reload (`agent-session.ts` stale-context message).
+- A normal turn can settle without stopping watches.
+- `/reload` suspends active watch values to the session and restores them in the replacement extension instance before the original expiry.
+- `/new`, resume, fork, process exit, and reboot end ownership. Historical suspension entries have no authority there.
+- Same-process session replacement creates a fresh session delivery arbiter. A stopped arbiter is never reused.
+- Session shutdown waits for shell process-tree cleanup.
 
-## Design
+Pi `0.84.2` supports this boundary through `session_shutdown`, `session_start`, `agent_settled`, `message_start`, `ctx.isIdle()`, custom session entries, and follow-up messages.
 
-Watch definitions are values (`UntilInput`); watch runs are actors. Only the value crosses the reload boundary.
+## Two machines
 
-- On `session_shutdown { reason: "reload" }`: terminate in-flight checks, write `pi-until-suspended` with every active watch plus attempts so far and a reload count. Always write it, even empty, so the newest entry has authority.
-- On `session_start { reason: "reload" }`: parse the newest suspension entry with a typebox schema, restart each watch with the original `startedAt`, attempts carried as history, and the overall timeout measured from the original start.
-- `new`, `resume`, `fork`, `startup` never resurrect. A dead process's entry is history, not authority.
+Each watch is an XState v5 actor. It owns cadence, gate checks, pending delivery, settlement, completion, expiry, cancellation, and typed terminal failure.
 
-Rejected alternative: stash live actors on `globalThis` and rebind `pi`/`ctx`. Two shell runners with split drain, invisible state, and the exact stale-context trap upstream documents.
+One session XState actor owns all `pi-until` delivery. It:
 
-## Telemetry
+- queues due watches without submitting two follow-ups to Pi at once;
+- deduplicates recurring ticks by watch;
+- stamps dispatch time before packet rendering;
+- correlates `message_start` through `details.followUpId`;
+- waits for the resulting `agent_settled` before dispatching the next item;
+- pauses in `startUncertain` when acknowledgement takes more than five seconds;
+- reconciles a late acknowledgement without changing the packet's cadence facts;
+- fails only on explicit dispatch rejection;
+- drops queued work whose watch is no longer live.
 
-Local JSONL at `~/.pi/agent/pi-until/events.jsonl`. Events: `started`, `finished`, `suspended`, `resumed`, `action`. Condition stored as sha256 prefix plus first word only. `PI_UNTIL_TELEMETRY=0` disables. `/until-stats` summarizes. No network.
+An acknowledgement timeout is uncertainty, not proof that Pi rejected the message. Sending another follow-up at that point could stack agent turns.
 
-## Receipts
+## Agent contract
 
-- anti-slop findings: 28 before, 3 after, all remaining in test fakes.
-- Tests: 34 pass, including reload round trip, no-resurrect on four other reasons, empty-entry-wins, timeout anchoring, descendant termination on reload.
-- `npm run` and `npm pack` refuse on this machine: local npm 11.19.0 versus pinned 11.16.0 `devEngines`. Checks ran from `node_modules/.bin`.
+- `start` waits for a side-effect-free shell predicate. Exit code 0 is the only true result.
+- `repeat` asks the same agent to do work on a fixed cadence. A gate permits a tick but never completes the task.
+- `instruction`, `quickRef`, `contextRefs`, and origin are immutable private session data.
+- Context references remain opaque until the waking agent needs one.
+- Only explicit `complete`, `cancel`, typed failure, or expiry ends a recurrence.
+- An expired or failed packet is inactive. The agent does not continue it without a new user request.
+
+The public contract lives across `README.md`, `src/command.ts`, the registered tool guidance in `extensions/pi-until.ts`, and `src/packet.ts`. `AGENTS.md` names this set so future behavior changes update it together.
+
+## Privacy and bounds
+
+- Shell stdout and stderr never enter receipts or model context.
+- Telemetry is local JSONL. It stores a 12-character condition hash, never command fragments, recurring instructions, quick references, or context pointers.
+- The extension retains the newest 50 terminal receipts in memory.
+- The flat tool schema has one `Type.Object` root for the OpenAI Codex bridge. `prepareArguments` repairs only known string encodings before normal validation.
+
+## Rejected designs
+
+- Global live actors across `/reload`: stale Pi contexts and split cleanup ownership.
+- A daemon or reboot scheduler: violates session ownership.
+- Per-watch delivery decisions: cannot enforce session-wide serialization.
+- Treating acknowledgement timeout as rejection: the accepted message can still start after slow `before_agent_start` hooks.
+
+## Current receipt
+
+Version `0.4.0` passed 59 tests, `npm run check`, `npm run pack:dry`, a real Pi RPC recurrence, independent review, and GitHub Actions. The installed Git source is `git:github.com/joelhooks/pi-until@main`.
