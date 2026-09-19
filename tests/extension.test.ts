@@ -192,6 +192,35 @@ describe("pi-until extension", () => {
     expect(extension.emitted.length).toBe(emittedBefore);
   });
 
+  it("hides the widget when PI_UNTIL_WIDGET=0", async () => {
+    vi.stubEnv("PI_UNTIL_WIDGET", "0");
+    try {
+      const session = new FakeSession();
+      const extension = loadExtension(session);
+      live.push(extension);
+      const { ctx, setWidget } = session.context();
+      await extension.tool(
+        "hidden-watch",
+        {
+          action: "start",
+          condition: "false",
+          intervalSeconds: 60,
+          label: "h",
+        },
+        new AbortController().signal,
+        undefined,
+        ctx
+      );
+      expect(setWidget).not.toHaveBeenCalled();
+      expect(extension.emitted.at(-1)).toMatchObject({
+        channel: WATCHES_EVENT,
+        data: [{ label: "h" }],
+      });
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
   it("records a cancel in telemetry but not as a finished receipt", async () => {
     const session = new FakeSession();
     const extension = loadExtension(session);

@@ -121,7 +121,7 @@ Active watches appear in a compact card above the editor. Shell watches show che
 ╰─ 8f2c1a7d · wakes agent · /until-list ────────────────╯
 ```
 
-The footer is not used. `/until-list` opens a scrollable session panel with active and finished watches.
+The footer is not used. `/until-list` opens a scrollable session panel with active and finished watches. Set `PI_UNTIL_WIDGET=0` to hide the card, for example when another extension shows watches from `pi-until:watches`.
 
 Other extensions can follow active watches on `pi.events`. Whenever the visible list changes (a watch starts, ticks, finishes, or is cancelled), the full list is emitted on `pi-until:watches`, including an empty list when the last watch finishes. Refreshes that change nothing do not emit.
 
