@@ -11,6 +11,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { SimulatedClock } from "xstate";
 
+import { WATCHES_EVENT } from "../extensions/pi-until.ts";
 import { FakeSession, loadExtension, receiptOf, sleep } from "./fake-pi.ts";
 import type { FakeExtension } from "./fake-pi.ts";
 
@@ -137,6 +138,37 @@ describe("pi-until extension", () => {
     );
     expect(finished?.data).toMatchObject({ status: "succeeded" });
     expect(finished?.data).not.toHaveProperty("lastOutput");
+  });
+
+  it("emits active watches on start and finish", async () => {
+    const session = new FakeSession();
+    const extension = loadExtension(session);
+    live.push(extension);
+    const { ctx } = session.context();
+    const started = await extension.tool(
+      "event-watch",
+      { action: "start", condition: "false", intervalSeconds: 60, label: "e" },
+      new AbortController().signal,
+      undefined,
+      ctx
+    );
+    const { id } = receiptOf(started);
+    expect(extension.emitted.at(-1)).toMatchObject({
+      channel: WATCHES_EVENT,
+      data: [{ id, label: "e" }],
+    });
+
+    await extension.tool(
+      "cancel",
+      { action: "cancel", id },
+      new AbortController().signal,
+      undefined,
+      ctx
+    );
+    expect(extension.emitted.at(-1)).toEqual({
+      channel: WATCHES_EVENT,
+      data: [],
+    });
   });
 
   it("records a cancel in telemetry but not as a finished receipt", async () => {

@@ -69,6 +69,7 @@ export { prepareUntilArguments, untilParameters } from "../src/command.ts";
 const MAX_ACTIVE_WATCHES = 32;
 const MAX_TERMINAL_RECEIPTS = 50;
 const WIDGET_KEY = "pi-until-watches";
+export const WATCHES_EVENT = "pi-until:watches";
 const PANEL_PAGE_SIZE = 6;
 const INDICATOR_REFRESH_MS = 1_000;
 
@@ -357,6 +358,7 @@ export default function piUntil(
     });
 
   const refreshIndicator = () => {
+    pi.events.emit(WATCHES_EVENT, activeWatches().map(toWatchDisplay));
     const ctx = currentContext;
     if (ctx?.mode !== "tui") return;
 
