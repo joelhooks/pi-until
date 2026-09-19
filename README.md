@@ -123,6 +123,14 @@ Active watches appear in a compact card above the editor. Shell watches show che
 
 The footer is not used. `/until-list` opens a scrollable session panel with active and finished watches.
 
+Other extensions can follow active watches on `pi.events`. Each change emits the full list on `pi-until:watches`, including an empty list when the last watch finishes.
+
+```ts
+pi.events.on("pi-until:watches", (watches) => {
+  // [{ id, label, kind, status, wake, startedAt, nextDueAt, attempts, ... }]
+});
+```
+
 ## Commands
 
 ```text

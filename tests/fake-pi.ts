@@ -45,6 +45,11 @@ export interface SentMessage {
   readonly options?: { deliverAs?: string; triggerTurn?: boolean };
 }
 
+export interface EmittedEvent {
+  readonly channel: string;
+  readonly data: unknown;
+}
+
 export type StartReason = "startup" | "reload" | "new" | "resume" | "fork";
 export type ShutdownReason = "quit" | "reload" | "new" | "resume" | "fork";
 export type SessionEvent =
@@ -118,6 +123,7 @@ export interface FakeExtension {
     string,
     (args: string, ctx: ExtensionContext) => Promise<void>
   >;
+  readonly emitted: EmittedEvent[];
   readonly entries: { customType: string; data: CustomEntry["data"] }[];
   readonly messages: SentMessage[];
   readonly sendMessage: ReturnType<typeof vi.fn>;
@@ -180,8 +186,15 @@ export const loadExtension = (
     }
   );
 
+  const emitted: EmittedEvent[] = [];
+
   const pi = {
     appendEntry,
+    events: {
+      emit: (channel: string, data: unknown) => {
+        emitted.push({ channel, data });
+      },
+    },
     on: vi.fn((event: string, handler: SessionHandler) => {
       handlers.set(event, handler);
     }),
@@ -210,8 +223,8 @@ export const loadExtension = (
     sendMessage,
   };
 
-  // SAFETY: the extension uses only appendEntry, on, registerCommand,
-  // registerTool, and sendMessage from ExtensionAPI.
+  // SAFETY: the extension uses only appendEntry, events.emit, on,
+  // registerCommand, registerTool, and sendMessage from ExtensionAPI.
   piUntil(pi as unknown as ExtensionAPI, {
     clock: options.clock,
     followUpDispatchAckMs: options.followUpDispatchAckMs,
@@ -255,6 +268,7 @@ export const loadExtension = (
     agentStart: (ctx) => emit({ type: "agent_start" }, ctx),
     appendEntry,
     commands,
+    emitted,
     entries,
     messages,
     sendMessage,
