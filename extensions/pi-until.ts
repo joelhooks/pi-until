@@ -357,8 +357,20 @@ export default function piUntil(
       return runningDifference || right.startedAt - left.startedAt;
     });
 
+  // refreshIndicator runs on every actor snapshot, including check ticks
+  // that change nothing a listener can see. Only emit when the display
+  // list actually differs from the last one emitted.
+  let lastEmittedWatches: string | undefined;
+  const emitWatches = () => {
+    const display = activeWatches().map(toWatchDisplay);
+    const serialized = JSON.stringify(display);
+    if (serialized === lastEmittedWatches) return;
+    lastEmittedWatches = serialized;
+    pi.events.emit(WATCHES_EVENT, display);
+  };
+
   const refreshIndicator = () => {
-    pi.events.emit(WATCHES_EVENT, activeWatches().map(toWatchDisplay));
+    emitWatches();
     const ctx = currentContext;
     if (ctx?.mode !== "tui") return;
 

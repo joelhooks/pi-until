@@ -171,6 +171,27 @@ describe("pi-until extension", () => {
     });
   });
 
+  it("does not re-emit watches when a refresh changes nothing", async () => {
+    const session = new FakeSession();
+    const extension = loadExtension(session);
+    live.push(extension);
+    const { ctx } = session.context();
+    await extension.tool(
+      "event-watch",
+      { action: "start", condition: "false", intervalSeconds: 60, label: "e" },
+      new AbortController().signal,
+      undefined,
+      ctx
+    );
+    const emittedBefore = extension.emitted.length;
+
+    // session_start refreshes the indicator without touching any watch.
+    await extension.sessionStart("startup", ctx);
+    await extension.sessionStart("startup", ctx);
+
+    expect(extension.emitted.length).toBe(emittedBefore);
+  });
+
   it("records a cancel in telemetry but not as a finished receipt", async () => {
     const session = new FakeSession();
     const extension = loadExtension(session);
