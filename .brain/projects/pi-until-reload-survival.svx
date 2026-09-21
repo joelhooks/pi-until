@@ -16,6 +16,7 @@ tags: [pi-until, pi-extension, xstate, reload, recurrence, telemetry]
 - A normal turn can settle without stopping watches.
 - `/reload` suspends active watch values to the session and restores them in the replacement extension instance before the original expiry.
 - `/new`, resume, fork, process exit, and reboot end ownership. Historical suspension entries have no authority there.
+- `/quit` still writes a suspension entry. After a process restart against the same session file, `/until-resume` lets the operator revive that entry explicitly. Expired and already-active watches are skipped. Added 2026-09-21 after two long-lived sessions had to be restarted to shed 500k junk entries and their watches had to be re-armed by hand from the entry.
 - Same-process session replacement creates a fresh session delivery arbiter. A stopped arbiter is never reused.
 - Session shutdown waits for shell process-tree cleanup.
 

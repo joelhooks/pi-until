@@ -140,6 +140,31 @@ export const suspendedWatchesFrom = (
   return [];
 };
 
+export interface ResumePartition {
+  /** Watches whose absolute expiry is still ahead of `now`. */
+  readonly resumable: readonly PersistedWatch[];
+  /** Watches whose absolute expiry has already passed. */
+  readonly expired: readonly PersistedWatch[];
+}
+
+/**
+ * Split the newest suspension entry for an explicit `/until-resume`. A watch
+ * whose expiry passed while no process owned it is history, not work.
+ */
+export const partitionResumable = (
+  watches: readonly PersistedWatch[],
+  now: number
+): ResumePartition => {
+  const resumable: PersistedWatch[] = [];
+  const expired: PersistedWatch[] = [];
+  for (const watch of watches) {
+    const expiresAt = watch.definition.expiresAt;
+    if (expiresAt !== undefined && expiresAt <= now) expired.push(watch);
+    else resumable.push(watch);
+  }
+  return { expired, resumable };
+};
+
 export const resumeInput = (watch: PersistedWatch): WatchActorInput => ({
   definition: watch.definition,
   facts: watch.facts,

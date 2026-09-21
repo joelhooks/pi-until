@@ -139,6 +139,7 @@ pi.events.on("pi-until:watches", (watches) => {
 /until-complete <id>
 /until-cancel <id>
 /until-stats
+/until-resume
 ```
 
 `/until` uses the defaults and wakes the agent when the condition succeeds. `/until-stats` summarizes the local telemetry file.
@@ -150,7 +151,8 @@ A watch belongs to one live Pi session/process.
 - It survives normal agent turns.
 - It does not block Pi.
 - It survives `/reload`. Pi keeps the process and session alive across a reload and only replaces the extension instance. On `session_shutdown { reason: "reload" }` the extension terminates the in-flight check and writes a versioned watch value to a `pi-until-suspended` session entry. The new instance restores it only on `session_start { reason: "reload" }`. Definitions, task snapshots, counts, the next due time, and the absolute expiry carry over.
-- It stops on session switch, fork, `/new`, or Pi shutdown. Graceful shutdown waits for process-tree cleanup before Pi exits. A suspension entry from an earlier process is never resurrected on `resume`.
+- It stops on session switch, fork, `/new`, or Pi shutdown. Graceful shutdown waits for process-tree cleanup before Pi exits. A suspension entry from an earlier process is never resurrected automatically on `resume`.
+- It can be resumed explicitly after a process restart. `/quit` writes the same `pi-until-suspended` entry that `/reload` does. Start Pi again against the same session file (`pi --session <file>`) and run `/until-resume` before any `/reload`: it reads the newest suspension entry, skips watches whose absolute expiry already passed, and skips watches that are already active. A recurring watch whose tick came due while no process owned it fires once on resume with `missedTicks` counted. Session replacement (`/new`, fork, switching sessions) still writes nothing.
 - It does not survive a machine reboot.
 - Print and JSON modes reject new watches because those processes are not durable owners.
 
@@ -163,6 +165,7 @@ The extension appends one JSON line per event to `~/.pi/agent/pi-until/events.js
 - `PI_UNTIL_TELEMETRY=0` disables it.
 - `PI_UNTIL_TELEMETRY_FILE=/path/events.jsonl` moves it.
 - `/until-stats` prints counts by status and wake mode, median attempts and duration, and reload suspend/resume counts.
+- `/until-resume` resumes watches from the newest suspension entry after a process restart. It is explicit and never automatic.
 
 ## Safety
 

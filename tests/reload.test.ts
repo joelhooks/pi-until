@@ -13,7 +13,9 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   SUSPENDED_ENTRY_TYPE,
   suspendedWatchesFrom,
+  suspensionData,
 } from "../src/suspension.ts";
+import type { PersistedWatch } from "../src/suspension.ts";
 import { FakeSession, loadExtension, receiptOf, sleep } from "./fake-pi.ts";
 import type { FakeExtension } from "./fake-pi.ts";
 
@@ -51,6 +53,134 @@ const startFileWatch = async (
   );
   return { ctx, details: receiptOf(result) };
 };
+
+describe("pi-until across a process restart", () => {
+  it("writes a suspension entry on quit, restores nothing on startup, and resumes on /until-resume", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "pi-until-restart-"));
+    tempDirectories.push(directory);
+    const readyFile = join(directory, "ready");
+    const session = new FakeSession();
+
+    const first = loadExtension(session);
+    live.push(first);
+    const { details } = await startFileWatch(first, session, readyFile, {
+      timeoutSeconds: 3_600,
+    });
+    await sleep(30);
+    await first.shutdown("quit");
+    live.pop();
+
+    const suspended = first.entries.find(
+      (entry) => entry.customType === SUSPENDED_ENTRY_TYPE
+    );
+    expect(suspended?.data).toMatchObject({
+      v: 2,
+      watches: [
+        expect.objectContaining({
+          facts: expect.objectContaining({ id: details.id }),
+        }),
+      ],
+    });
+
+    // A fresh process resuming the same session file restores nothing by itself.
+    const second = loadExtension(session);
+    live.push(second);
+    const { ctx, notify } = session.context();
+    await second.sessionStart("startup", ctx);
+    expect(notify).not.toHaveBeenCalled();
+    expect(
+      second.telemetry.filter((event) => event.event === "started")
+    ).toHaveLength(0);
+
+    // The operator resumes explicitly.
+    const resume = second.commands.get("until-resume");
+    if (!resume) throw new Error("until-resume command was not registered");
+    await resume("", ctx);
+    expect(notify).toHaveBeenCalledWith(
+      "pi-until resumed 1 watch from the newest suspension entry",
+      "info"
+    );
+    expect(second.telemetry).toContainEqual({
+      action: "resume",
+      event: "action",
+      source: "command",
+    });
+    const status = await second.tool(
+      "status",
+      { action: "status", id: details.id },
+      new AbortController().signal,
+      undefined,
+      ctx
+    );
+    expect(status.details).toMatchObject({ id: details.id, status: "running" });
+    expect(second.telemetry).toContainEqual(
+      expect.objectContaining({
+        event: "started",
+        id: details.id,
+        resumed: true,
+      })
+    );
+
+    // Running it again is a no-op, not a duplicate watch.
+    notify.mockClear();
+    await resume("", ctx);
+    expect(notify).toHaveBeenCalledWith(
+      "No suspended pi-until watches to resume (already active)",
+      "warning"
+    );
+
+    writeFileSync(readyFile, "ready\n", "utf-8");
+    await vi.waitFor(
+      () => {
+        expect(second.messages).toHaveLength(1);
+      },
+      { timeout: 2_000 }
+    );
+  });
+
+  it("skips watches whose expiry passed while no process owned them", async () => {
+    const session = new FakeSession();
+    const expired: PersistedWatch = {
+      definition: {
+        expiresAt: Date.now() - 1_000,
+        gate: { checkTimeoutMs: 1_000, command: "true", cwd: process.cwd() },
+        intervalMs: 1_000,
+        kind: "until",
+        label: "stale",
+        wake: "agent",
+      },
+      facts: {
+        attempts: 3,
+        deliveries: 0,
+        deliveryPending: false,
+        id: "stale001",
+        missedTicks: 0,
+        nextDueAt: Date.now() - 500,
+        reloads: 0,
+        startedAt: Date.now() - 10_000,
+      },
+    };
+    session.appendCustom(
+      SUSPENDED_ENTRY_TYPE,
+      suspensionData([expired], Date.now() - 900)
+    );
+
+    const extension = loadExtension(session);
+    live.push(extension);
+    const { ctx, notify } = session.context();
+    await extension.sessionStart("startup", ctx);
+    const resume = extension.commands.get("until-resume");
+    if (!resume) throw new Error("until-resume command was not registered");
+    await resume("", ctx);
+    expect(notify).toHaveBeenCalledWith(
+      "No suspended pi-until watches to resume (1 expired)",
+      "warning"
+    );
+    expect(
+      extension.telemetry.filter((event) => event.event === "started")
+    ).toHaveLength(0);
+  });
+});
 
 describe("pi-until across /reload", () => {
   it("suspends on reload, resumes in the new instance, and wakes the agent once", async () => {

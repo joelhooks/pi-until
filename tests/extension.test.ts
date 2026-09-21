@@ -721,11 +721,32 @@ describe("pi-until extension", () => {
         { timeout: 2_000 }
       );
       expect(extension.sendMessage).not.toHaveBeenCalled();
+      // Quit leaves a suspension entry behind for an explicit /until-resume;
+      // it never wakes anything by itself.
       expect(
         extension.entries.some(
           (entry) => entry.customType === "pi-until-suspended"
         )
-      ).toBe(false);
+      ).toBe(true);
     }
   );
+
+  it("writes no suspension entry when the session is replaced", async () => {
+    const session = new FakeSession();
+    const extension = loadExtension(session);
+    const { ctx } = session.context();
+    await extension.tool(
+      "replace-watch",
+      { action: "start", condition: "false", label: "replace" },
+      new AbortController().signal,
+      undefined,
+      ctx
+    );
+    await extension.shutdown("new");
+    expect(
+      extension.entries.some(
+        (entry) => entry.customType === "pi-until-suspended"
+      )
+    ).toBe(false);
+  });
 });

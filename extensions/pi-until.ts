@@ -48,6 +48,7 @@ import {
 } from "../src/packet.ts";
 import {
   SUSPENDED_ENTRY_TYPE,
+  partitionResumable,
   resumeInput,
   suspendWatch,
   suspendedWatchesFrom,
@@ -698,13 +699,19 @@ export default function piUntil(
     return record;
   };
 
-  /** Resume watches suspended by the previous extension instance on `/reload`. */
+  /**
+   * Resume watches from a suspension entry: automatically after `/reload`,
+   * or explicitly through `/until-resume` after a process restart.
+   */
   const resumeWatches = (
     suspended: readonly PersistedWatch[],
-    ctx: ExtensionContext
-  ) => {
+    ctx: ExtensionContext,
+    source: "reload" | "command" = "reload"
+  ): number => {
+    let resumed = 0;
     for (const watch of suspended) {
       if (watches.has(watch.facts.id)) continue;
+      resumed += 1;
       const input = resumeInput(watch);
       runWatch(input);
       const gate = gateOf(input.definition);
@@ -725,13 +732,18 @@ export default function piUntil(
         watchKind: input.definition.kind,
       });
     }
-    if (suspended.length > 0) {
-      void track(sessionId(ctx), { count: suspended.length, event: "resumed" });
+    if (resumed > 0) {
+      void track(sessionId(ctx), { count: resumed, event: "resumed" });
       ctx.ui.notify(
-        `pi-until resumed ${suspended.length} watch${suspended.length === 1 ? "" : "es"} after reload`,
+        `pi-until resumed ${resumed} watch${resumed === 1 ? "" : "es"} ${
+          source === "reload"
+            ? "after reload"
+            : "from the newest suspension entry"
+        }`,
         "info"
       );
     }
+    return resumed;
   };
 
   /** Start one authoritative actor from a fresh or restored watch value. */
@@ -1063,6 +1075,43 @@ export default function piUntil(
     },
   });
 
+  pi.registerCommand("until-resume", {
+    description:
+      "Resume watches from the newest pi-until suspension entry after a process restart; expired watches are skipped",
+    handler: async (_args, ctx) => {
+      currentContext = ctx;
+      void track(sessionId(ctx), {
+        action: "resume",
+        event: "action",
+        source: "command",
+      });
+      const now = clock.now();
+      const { expired, resumable } = partitionResumable(
+        suspendedWatchesFrom(ctx.sessionManager.getBranch()),
+        now
+      );
+      const pending = resumable.filter((watch) => !watches.has(watch.facts.id));
+      if (pending.length === 0) {
+        let detail = "";
+        if (expired.length > 0) detail = ` (${expired.length} expired)`;
+        else if (resumable.length > 0) detail = " (already active)";
+        ctx.ui.notify(
+          `No suspended pi-until watches to resume${detail}`,
+          "warning"
+        );
+        return;
+      }
+      resumeWatches(pending, ctx, "command");
+      if (expired.length > 0) {
+        ctx.ui.notify(
+          `Skipped ${expired.length} expired watch${expired.length === 1 ? "" : "es"}`,
+          "warning"
+        );
+      }
+      refreshIndicator();
+    },
+  });
+
   pi.on("agent_start", (_event, ctx) => {
     currentContext = ctx;
     followUps.send({ type: "SESSION_BUSY" });
@@ -1110,7 +1159,10 @@ export default function piUntil(
     shuttingDown = true;
     followUps.stop();
     const active = activeWatches();
-    if (event.reason === "reload") {
+    // `/reload` restores automatically. `quit` leaves the same record behind
+    // so an operator can restart the process against the same session file
+    // and run `/until-resume`. Session replacement writes nothing.
+    if (event.reason === "reload" || event.reason === "quit") {
       const suspended = active.map((record) =>
         suspendWatch(record.actor.getSnapshot().context)
       );

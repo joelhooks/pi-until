@@ -37,7 +37,7 @@ Node is `24.18.0`. Use npm `11.16.0`; never Bun. `devEngines` fails hard on any 
 - Cancellation aborts the active check and its descendants on macOS and Linux.
 - Condition stdout and stderr are discarded, never added to receipts or model context.
 - Session shutdown awaits process-tree cleanup before Pi may exit.
-- Only `session_shutdown { reason: "reload" }` suspends watches, and only `session_start { reason: "reload" }` resumes them. Every reload writes a suspension entry, even an empty one, so the newest entry always wins.
+- `session_shutdown { reason: "reload" }` and `{ reason: "quit" }` suspend watches to a session entry; session replacement writes nothing. Only `session_start { reason: "reload" }` resumes automatically. `/until-resume` is the one explicit path after a process restart: it reads the newest entry, skips expired and already-active watches, and is never run for the operator. Every reload and quit writes a suspension entry, even an empty one, so the newest entry always wins; run `/until-resume` before the first `/reload` in the new process.
 - Telemetry never writes condition text or command fragments and never touches the network. It must never throw into a watch.
 - Tool parameter schemas must have one `Type.Object` root. Root object unions make the OpenAI Codex bridge serialize arrays, booleans, and numbers as strings.
 - `prepareArguments` may repair only known bridge encodings before normal schema validation; malformed values must still fail validation.
@@ -55,7 +55,7 @@ Keep these surfaces aligned when behavior changes:
 - `src/packet.ts` owns the instructions delivered on wake and expiry.
 - `VISION.md` and `.brain/projects/pi-until-reload-survival.svx` hold the durable boundary and its reasons.
 
-Preserve four distinctions in every surface: a gate permits work but does not complete it; dispatch is not acknowledgement; an acknowledgement timeout is uncertain rather than rejected; `/reload` restores watches but a session replacement does not.
+Preserve four distinctions in every surface: a gate permits work but does not complete it; dispatch is not acknowledgement; an acknowledgement timeout is uncertain rather than rejected; `/reload` restores watches automatically, `/until-resume` restores them only when the operator asks, and a session replacement restores nothing.
 
 ## Sources
 

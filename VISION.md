@@ -18,7 +18,7 @@ The agent can release its turn, keep working on other requests, and wake with a 
 - Cancellation, completion, per-check timeout, overall expiry, pending delivery, settlement, and failure are explicit machine states.
 - One session arbiter serializes all `pi-until` follow-ups. It correlates dispatch acknowledgement by message ID and waits for the resulting agent turn to settle.
 - The extension does not become a daemon, durable scheduler, workflow engine, side-effect runner, or outward notification gateway.
-- The extension never claims durability across session replacement, process exit, or machine reboot. A suspension entry written by a dead process is a historical fact, not authority.
+- The extension never claims durability across session replacement, process exit, or machine reboot. A suspension entry written by a dead process is a historical fact, not authority. An operator may turn that fact back into work with `/until-resume`; the extension never does it on its own.
 - Usage telemetry stays local: a JSONL file under `~/.pi/agent/pi-until/`; only condition hashes are written, never command fragments, recurring instructions, quick references, or context pointers; no network.
 
 ## Taste

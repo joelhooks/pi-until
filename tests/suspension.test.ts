@@ -13,6 +13,7 @@ import type {
 import {
   SUSPENDED_ENTRY_TYPE,
   SUSPENSION_VERSION,
+  partitionResumable,
   resumeInput,
   suspendWatch,
   suspendedWatchesFrom,
@@ -72,6 +73,27 @@ const custom = (
 });
 
 describe("suspension", () => {
+  it("partitions suspended watches by absolute expiry for an explicit resume", () => {
+    const until = suspendWatch(context(untilDefinition));
+    const recurring = suspendWatch(context(recurringDefinition));
+    const open: RecurringDefinition = { ...recurringDefinition };
+    delete (open as { expiresAt?: number }).expiresAt;
+    const unbounded = suspendWatch(context(open));
+
+    expect(partitionResumable([until, recurring, unbounded], 60_000)).toEqual({
+      expired: [],
+      resumable: [until, recurring, unbounded],
+    });
+    expect(partitionResumable([until, recurring, unbounded], 61_000)).toEqual({
+      expired: [until],
+      resumable: [recurring, unbounded],
+    });
+    expect(partitionResumable([until, recurring, unbounded], 500_000)).toEqual({
+      expired: [until, recurring],
+      resumable: [unbounded],
+    });
+  });
+
   it("round-trips normalized watch values and increments reload history", () => {
     const persisted = suspendWatch(context(recurringDefinition));
     expect(persisted).toMatchObject({
