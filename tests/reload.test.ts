@@ -235,12 +235,18 @@ describe("pi-until across a quit and relaunch", () => {
       undefined,
       ctx
     );
+    // The one-shot checks once a second; give its next check room on slow CI.
     writeFileSync(readyFile, "ready\n", "utf-8");
-    await vi.waitFor(() => {
-      expect(
-        second.messages.filter((sent) => sent.message.customType === "pi-until")
-      ).toHaveLength(1);
-    });
+    await vi.waitFor(
+      () => {
+        expect(
+          second.messages.filter(
+            (sent) => sent.message.customType === "pi-until"
+          )
+        ).toHaveLength(1);
+      },
+      { timeout: 3_000 }
+    );
   });
 
   it("skips watches whose deadline passed while Pi was closed", async () => {
