@@ -13,12 +13,12 @@ The agent can release its turn, keep working on other requests, and wake with a 
 - One universal shell gate: a side-effect-free command exits 0.
 - A recurring wake carries an immutable instruction, quick reference, opaque context pointers, origin entry, and receipt.
 - Recurring work ends only through explicit completion, cancellation, failure, or expiry. The shell gate permits a wake; it never completes the work.
-- Watches belong to one live Pi session/process. `/reload` keeps both alive, so watches survive it by suspending to a session entry and restarting in the new extension instance.
+- Watches belong to one Pi session. `/reload` keeps the session and process alive, so watches survive it by suspending to a session entry and restarting in the new extension instance. A graceful quit hands the same entry to the next process that opens the same session file, and that process restores the watches without an operator command.
 - Agent wake and notification-only completion are supported for one-shot shell watches. Recurring watches always wake the agent.
 - Cancellation, completion, per-check timeout, overall expiry, pending delivery, settlement, and failure are explicit machine states.
 - One session arbiter serializes all `pi-until` follow-ups. It correlates dispatch acknowledgement by message ID and waits for the resulting agent turn to settle.
 - The extension does not become a daemon, durable scheduler, workflow engine, side-effect runner, or outward notification gateway.
-- The extension never claims durability across session replacement, process exit, or machine reboot. A suspension entry written by a dead process is a historical fact, not authority. An operator may turn that fact back into work with `/until-resume`; the extension never does it on its own.
+- The extension never claims durability across a crash, SIGKILL, session replacement, a new or forked session, or machine reboot. Only a quit entry that names this session and has not been consumed is authority for a restart. Any other suspension entry is a historical fact. An operator may turn it back into work with `/until-resume`. Once a process resumes an entry, it marks that entry consumed. A later start cannot replay it, so a watch the operator cancelled stays cancelled.
 - Usage telemetry stays local: a JSONL file under `~/.pi/agent/pi-until/`; only condition hashes are written, never command fragments, recurring instructions, quick references, or context pointers; no network.
 
 ## Taste

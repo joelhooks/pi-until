@@ -22,11 +22,11 @@ Node is `24.18.0`. Use npm `11.16.0`; never Bun. `devEngines` fails hard on any 
 - `src/packet.ts` owns recurring Markdown wake and expiry packets.
 - `src/check.ts` owns bounded shell execution and process-group termination.
 - `src/completion.ts` owns agent-wake versus notify-only routing.
-- `src/suspension.ts` owns the `pi-until-suspended` session entry: suspend a watch to a value, parse it back at the boundary, keep the timeout anchored.
+- `src/suspension.ts` owns the `pi-until-suspended` and `pi-until-resumed` session entries: suspend a watch to a value, parse it back at the boundary, keep the timeout anchored, and decide whether a starting process inherits quit work.
 - `src/telemetry.ts` owns local JSONL usage events, condition hashes, and `/until-stats` summaries.
-- `extensions/pi-until.ts` owns Pi integration, receipts, UI status, reload suspend/resume, and lifecycle cleanup.
+- `extensions/pi-until.ts` owns Pi integration, receipts, UI status, reload and restart suspend/resume, and lifecycle cleanup.
 - `tests/fake-pi.ts` is the typed Pi fake. Use it instead of `as unknown as ExtensionAPI` in new tests.
-- Tests must exercise transitions, retries, per-check timeout, cancellation, descendant termination, wake behavior, session-wide delivery serialization, dispatch acknowledgement, recurring coalescing, explicit completion, failure, expiry, and reload suspend/resume.
+- Tests must exercise transitions, retries, per-check timeout, cancellation, descendant termination, wake behavior, session-wide delivery serialization, dispatch acknowledgement, recurring coalescing, explicit completion, failure, expiry, reload suspend/resume, and quit-then-relaunch resume.
 
 ## Invariants
 
@@ -37,7 +37,10 @@ Node is `24.18.0`. Use npm `11.16.0`; never Bun. `devEngines` fails hard on any 
 - Cancellation aborts the active check and its descendants on macOS and Linux.
 - Condition stdout and stderr are discarded, never added to receipts or model context.
 - Session shutdown awaits process-tree cleanup before Pi may exit.
-- `session_shutdown { reason: "reload" }` and `{ reason: "quit" }` suspend watches to a session entry; session replacement writes nothing. Only `session_start { reason: "reload" }` resumes automatically. `/until-resume` is the one explicit path after a process restart: it reads the newest entry, skips expired and already-active watches, and is never run for the operator. Every reload and quit writes a suspension entry, even an empty one, so the newest entry always wins; run `/until-resume` before the first `/reload` in the new process.
+- `session_shutdown { reason: "reload" }` and `{ reason: "quit" }` suspend watches to a version 3 session entry that records the reason and owning session id. Session replacement writes nothing. A print or JSON run writes no quit entry. Every reload and long-lived quit writes an entry, even an empty one, so the newest entry always wins.
+- `session_start { reason: "reload" }` resumes the newest entry. `session_start` with reason `startup` or `resume` in a long-lived process resumes the newest entry only when it is an unconsumed quit entry that names this session. A version 2 entry counts only when it is newer than the session header and no message follows it. The resume skips expired, finished, duplicate, and already-active watches, then appends `pi-until-resumed` to consume the entry. `new`, `fork`, a forked copy of a quit entry, and a reload entry resume nothing on startup.
+- `/until-resume` is the manual path when automatic recovery did not apply. It uses the same skips and also consumes the entry.
+- No durability across a crash, SIGKILL, session replacement, or machine reboot.
 - Telemetry never writes condition text or command fragments and never touches the network. It must never throw into a watch.
 - Tool parameter schemas must have one `Type.Object` root. Root object unions make the OpenAI Codex bridge serialize arrays, booleans, and numbers as strings.
 - `prepareArguments` may repair only known bridge encodings before normal schema validation; malformed values must still fail validation.
@@ -55,7 +58,7 @@ Keep these surfaces aligned when behavior changes:
 - `src/packet.ts` owns the instructions delivered on wake and expiry.
 - `VISION.md` and `.brain/projects/pi-until-reload-survival.svx` hold the durable boundary and its reasons.
 
-Preserve four distinctions in every surface: a gate permits work but does not complete it; dispatch is not acknowledgement; an acknowledgement timeout is uncertain rather than rejected; `/reload` restores watches automatically, `/until-resume` restores them only when the operator asks, and a session replacement restores nothing.
+Preserve four distinctions in every surface: a gate permits work but does not complete it; dispatch is not acknowledgement; an acknowledgement timeout is uncertain rather than rejected; `/reload` and a graceful quit followed by reopening the same session restore watches automatically, a crash restores nothing unless the operator runs `/until-resume`, and a session replacement, new session, or fork restores nothing.
 
 ## Sources
 
