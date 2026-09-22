@@ -72,15 +72,41 @@ type SessionHandler = (
 export class FakeSession {
   readonly entries: SessionEntry[] = [];
   readonly id = `session-${Math.random().toString(36).slice(2, 8)}`;
+  readonly createdAt: string;
 
-  appendCustom(customType: string, data: CustomEntry["data"]): void {
+  constructor(createdAt = new Date(Date.now() - 60_000).toISOString()) {
+    this.createdAt = createdAt;
+  }
+
+  /** Copy every entry into a new session, as `pi --fork <file>` does. */
+  fork(): FakeSession {
+    const forked = new FakeSession(new Date().toISOString());
+    forked.entries.push(...this.entries);
+    return forked;
+  }
+
+  appendCustom(
+    customType: string,
+    data: CustomEntry["data"],
+    timestamp = new Date().toISOString()
+  ): void {
     this.entries.push({
       customType,
       data,
       id: `e${this.entries.length + 1}`,
       parentId: null,
-      timestamp: new Date().toISOString(),
+      timestamp,
       type: "custom",
+    });
+  }
+
+  appendUserMessage(text: string): void {
+    this.entries.push({
+      id: `e${this.entries.length + 1}`,
+      message: { content: text, role: "user", timestamp: Date.now() },
+      parentId: null,
+      timestamp: new Date().toISOString(),
+      type: "message",
     });
   }
 
@@ -99,13 +125,19 @@ export class FakeSession {
       mode: overrides.mode ?? "tui",
       sessionManager: {
         getBranch: () => [...this.entries],
+        getHeader: () => ({
+          cwd: process.cwd(),
+          id: this.id,
+          timestamp: this.createdAt,
+          type: "session",
+        }),
         getLeafId: () => this.entries.at(-1)?.id ?? "origin-entry",
         getSessionId: () => this.id,
       },
       ui: { notify, setWidget },
     };
     // SAFETY: the extension only touches cwd, mode, sessionManager.getBranch,
-    // sessionManager.getSessionId, ui.notify, and ui.setWidget. Test doubles
+    // getHeader, getLeafId, getSessionId, ui.notify, and ui.setWidget. Test doubles
     // for the rest of ExtensionContext would be dead weight.
     return { ctx: ctx as unknown as ExtensionContext, notify, setWidget };
   }
@@ -131,7 +163,10 @@ export interface FakeExtension {
     reason: StartReason,
     ctx: ExtensionContext
   ) => Promise<void>;
-  readonly shutdown: (reason: ShutdownReason) => Promise<void>;
+  readonly shutdown: (
+    reason: ShutdownReason,
+    ctx?: ExtensionContext
+  ) => Promise<void>;
   readonly telemetry: TelemetryEventInput[];
   readonly tool: UntilToolExecute;
 }
@@ -273,8 +308,8 @@ export const loadExtension = (
     messages,
     sendMessage,
     sessionStart: (reason, ctx) => emit({ reason, type: "session_start" }, ctx),
-    shutdown: (reason) =>
-      emit({ reason, type: "session_shutdown" }, shutdownContext),
+    shutdown: (reason, ctx) =>
+      emit({ reason, type: "session_shutdown" }, ctx ?? shutdownContext),
     telemetry,
     tool,
   };

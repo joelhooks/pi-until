@@ -11,13 +11,16 @@ import type {
   WatchContext,
 } from "../src/domain.ts";
 import {
+  RESUMED_ENTRY_TYPE,
   SUSPENDED_ENTRY_TYPE,
   SUSPENSION_VERSION,
   partitionResumable,
+  quitSuspensionFor,
   resumeInput,
   suspendWatch,
   suspendedWatchesFrom,
   suspensionData,
+  unfinishedWatches,
 } from "../src/suspension.ts";
 
 const untilDefinition: UntilDefinition = {
@@ -62,15 +65,29 @@ const context = (
 
 const custom = (
   customType: string,
-  data: CustomEntry["data"]
+  data: CustomEntry["data"],
+  timestamp = "2026-01-01T00:00:00.000Z"
 ): SessionEntry => ({
   customType,
   data,
   id: "x",
   parentId: null,
-  timestamp: "2026-01-01T00:00:00.000Z",
+  timestamp,
   type: "custom",
 });
+
+const userMessage: SessionEntry = {
+  id: "m",
+  message: { content: "later", role: "user", timestamp: 0 },
+  parentId: null,
+  timestamp: "2026-01-01T00:00:01.000Z",
+  type: "message",
+};
+
+const owner = {
+  sessionCreatedAt: "2025-12-31T00:00:00.000Z",
+  sessionId: "s1",
+};
 
 describe("suspension", () => {
   it("partitions suspended watches by absolute expiry for an explicit resume", () => {
@@ -109,9 +126,11 @@ describe("suspension", () => {
   it("takes only the newest versioned suspension entry on the branch", () => {
     const older = suspensionData(
       [suspendWatch(context(untilDefinition))],
-      5_000
+      5_000,
+      "reload",
+      "s1"
     );
-    const newer = suspensionData([], 6_000);
+    const newer = suspensionData([], 6_000, "quit", "s1");
     expect(newer.v).toBe(SUSPENSION_VERSION);
     expect(
       suspendedWatchesFrom([
@@ -128,7 +147,9 @@ describe("suspension", () => {
   it("rejects malformed newest data instead of trusting older facts", () => {
     const valid = suspensionData(
       [suspendWatch(context(untilDefinition))],
-      5_000
+      5_000,
+      "reload",
+      "s1"
     );
     expect(
       suspendedWatchesFrom([
@@ -177,6 +198,77 @@ describe("suspension", () => {
         reloads: 2,
         startedAt: 1_000,
       },
+    });
+  });
+
+  describe("quit hand-off", () => {
+    const watch = suspendWatch(context(untilDefinition));
+    const quit = custom(
+      SUSPENDED_ENTRY_TYPE,
+      suspensionData([watch], 5_000, "quit", "s1")
+    );
+
+    it("hands a quit entry to the next process of the same session", () => {
+      expect(quitSuspensionFor([quit], owner)?.watches).toEqual([watch]);
+      expect(quitSuspensionFor([quit, userMessage], owner)).toBeDefined();
+    });
+
+    it("refuses reload entries, other sessions, empty entries, and consumed entries", () => {
+      const reload = custom(
+        SUSPENDED_ENTRY_TYPE,
+        suspensionData([watch], 5_000, "reload", "s1")
+      );
+      const empty = custom(
+        SUSPENDED_ENTRY_TYPE,
+        suspensionData([], 5_000, "quit", "s1")
+      );
+      const consumed = custom(RESUMED_ENTRY_TYPE, {
+        from: "x",
+        resumed: 1,
+        resumedAt: "2026-01-01T00:00:02.000Z",
+        skippedExpired: 0,
+      });
+      expect(quitSuspensionFor([reload], owner)).toBeUndefined();
+      expect(
+        quitSuspensionFor([quit], { ...owner, sessionId: "fork" })
+      ).toBeUndefined();
+      expect(quitSuspensionFor([quit, empty], owner)).toBeUndefined();
+      expect(quitSuspensionFor([quit, consumed], owner)).toBeUndefined();
+      expect(quitSuspensionFor([], owner)).toBeUndefined();
+    });
+
+    it("treats an unattributed version 2 entry as a quit only at the tail of this session", () => {
+      const v2 = custom(SUSPENDED_ENTRY_TYPE, {
+        suspendedAt: "2026-01-01T00:00:00.000Z",
+        v: 2,
+        watches: [watch],
+      });
+      expect(quitSuspensionFor([v2], owner)?.watches).toEqual([watch]);
+      expect(quitSuspensionFor([v2, userMessage], owner)).toBeUndefined();
+      expect(
+        quitSuspensionFor([v2], {
+          ...owner,
+          sessionCreatedAt: "2026-02-01T00:00:00.000Z",
+        })
+      ).toBeUndefined();
+      expect(quitSuspensionFor([v2], { sessionId: "s1" })).toBeUndefined();
+    });
+
+    it("drops finished and repeated watch ids from a suspension record", () => {
+      const other = suspendWatch({
+        ...context(untilDefinition),
+        facts: { ...context(untilDefinition).facts, id: "other001" },
+      });
+      const entries = [
+        custom(
+          SUSPENDED_ENTRY_TYPE,
+          suspensionData([watch, watch, other], 5_000, "quit", "s1")
+        ),
+        custom("pi-until-finished", { id: "other001", status: "succeeded" }),
+      ];
+      const record = quitSuspensionFor(entries, owner);
+      if (record === undefined) throw new Error("expected a quit record");
+      expect(unfinishedWatches(record, entries)).toEqual([watch]);
     });
   });
 });

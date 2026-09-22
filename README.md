@@ -151,10 +151,12 @@ A watch belongs to one live Pi session/process.
 - It survives normal agent turns.
 - It does not block Pi.
 - It survives `/reload`. Pi keeps the process and session alive across a reload and only replaces the extension instance. On `session_shutdown { reason: "reload" }` the extension terminates the in-flight check and writes a versioned watch value to a `pi-until-suspended` session entry. The new instance restores it only on `session_start { reason: "reload" }`. Definitions, task snapshots, counts, the next due time, and the absolute expiry carry over.
-- It stops on session switch, fork, `/new`, or Pi shutdown. Graceful shutdown waits for process-tree cleanup before Pi exits. A suspension entry from an earlier process is never resurrected automatically on `resume`.
-- It can be resumed explicitly after a process restart. `/quit` writes the same `pi-until-suspended` entry that `/reload` does. Start Pi again against the same session file (`pi --session <file>`) and run `/until-resume` before any `/reload`: it reads the newest suspension entry, skips watches whose absolute expiry already passed, and skips watches that are already active. A recurring watch whose tick came due while no process owned it fires once on resume with `missedTicks` counted. Session replacement (`/new`, fork, switching sessions) still writes nothing.
-- It does not survive a machine reboot.
-- Print and JSON modes reject new watches because those processes are not durable owners.
+- It survives a graceful quit and relaunch of the same session. On `session_shutdown { reason: "quit" }` (Ctrl+D, `/quit`, SIGTERM, SIGHUP) the extension writes the same entry and records `reason: "quit"` and the owning session id. When a long-lived Pi process opens that session file again (`pi -c`, `pi --session <file>`, or `/resume` to it), `session_start` with reason `startup` or `resume` restores the watches with no command. Watches whose absolute expiry passed while Pi was closed, watches that later wrote a finished receipt, duplicate ids, and ids already active are skipped. A recurring watch whose tick came due while Pi was closed fires once with `missedTicks` counted and stays on its original cadence. The extension then appends a `pi-until-resumed` entry, so no later start can replay the same quit entry.
+- It stops on `/new`, fork, or switching away from the session. Session replacement writes no entry, and a new or forked session inherits nothing, including a fork that copied the parent's quit entry. Graceful shutdown waits for process-tree cleanup before Pi exits.
+- It does not survive a crash, a kill without SIGTERM, or a machine reboot. Those skip `session_shutdown`, so no quit entry exists. A reload entry is never treated as quit work.
+- `/until-resume` is the manual path when automatic recovery did not apply, for example after a crash that left only a reload entry. It reads the newest suspension entry with the same skips and marks it consumed.
+- Print and JSON modes reject new watches because those processes are not durable owners. A print or JSON run of a session neither restores its watches nor writes a quit entry, so it cannot bury a pending one.
+- Entries written by `0.5.0` carry no reason. A `0.5.0` quit entry is restored only when it is newer than the session header and no conversation message follows it.
 
 This boundary is intentional. `pi-until` is a session primitive, not another scheduler or daemon.
 
@@ -165,7 +167,7 @@ The extension appends one JSON line per event to `~/.pi/agent/pi-until/events.js
 - `PI_UNTIL_TELEMETRY=0` disables it.
 - `PI_UNTIL_TELEMETRY_FILE=/path/events.jsonl` moves it.
 - `/until-stats` prints counts by status and wake mode, median attempts and duration, and reload suspend/resume counts.
-- `/until-resume` resumes watches from the newest suspension entry after a process restart. It is explicit and never automatic.
+- `/until-resume` resumes watches from the newest suspension entry when automatic restart recovery did not apply.
 
 ## Safety
 

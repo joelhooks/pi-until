@@ -8,10 +8,15 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import { systemClock } from "../src/clock.ts";
+import type { UntilClock } from "../src/clock.ts";
 import {
+  RESUMED_ENTRY_TYPE,
   SUSPENDED_ENTRY_TYPE,
+  newestSuspension,
   suspendedWatchesFrom,
   suspensionData,
 } from "../src/suspension.ts";
@@ -54,45 +59,479 @@ const startFileWatch = async (
   return { ctx, details: receiptOf(result) };
 };
 
-describe("pi-until across a process restart", () => {
-  it("writes a suspension entry on quit, restores nothing on startup, and resumes on /until-resume", async () => {
+/** A system clock whose reading can jump ahead to simulate a long quit. */
+const offsetClock = () => {
+  const state = { offsetMs: 0 };
+  const clock: UntilClock = {
+    ...systemClock,
+    now: () => Date.now() + state.offsetMs,
+  };
+  return { clock, state };
+};
+
+const startRecurring = async (
+  extension: FakeExtension,
+  session: FakeSession,
+  extra: { timeoutSeconds?: number } = {}
+) => {
+  const { ctx } = session.context({ idle: true });
+  const result = await extension.tool(
+    "repeat",
+    {
+      action: "repeat",
+      instruction: "Run the hawk tick.",
+      intervalSeconds: 60,
+      quickRef: "hawk tick",
+      timeoutSeconds: 3_600,
+      ...extra,
+    },
+    new AbortController().signal,
+    undefined,
+    ctx
+  );
+  return receiptOf(result);
+};
+
+const statusOf = async (
+  extension: FakeExtension,
+  id: string,
+  ctx: ExtensionContext
+) =>
+  receiptOf(
+    await extension.tool(
+      "status",
+      { action: "status", id },
+      new AbortController().signal,
+      undefined,
+      ctx
+    )
+  );
+
+const listIds = async (extension: FakeExtension, ctx: ExtensionContext) => {
+  const list = await extension.tool(
+    "list",
+    { action: "list" },
+    new AbortController().signal,
+    undefined,
+    ctx
+  );
+  return list.details !== undefined && "watches" in list.details
+    ? list.details.watches.map((receipt) => receipt.id)
+    : [];
+};
+
+/** The raw newest suspension entry, for rewriting it into an older format. */
+const newestSuspensionEntry = (session: FakeSession) => {
+  const record = newestSuspension(session.entries);
+  const entry = session.entries[record?.index ?? -1];
+  if (entry?.type !== "custom") throw new Error("missing suspension entry");
+  return entry;
+};
+
+const resumedMarkers = (session: FakeSession) =>
+  session.entries.filter(
+    (entry) =>
+      entry.type === "custom" && entry.customType === RESUMED_ENTRY_TYPE
+  );
+
+describe("pi-until across a quit and relaunch", () => {
+  it("writes a quit entry that names its reason and session", async () => {
     const directory = mkdtempSync(join(tmpdir(), "pi-until-restart-"));
     tempDirectories.push(directory);
-    const readyFile = join(directory, "ready");
     const session = new FakeSession();
-
     const first = loadExtension(session);
-    live.push(first);
-    const { details } = await startFileWatch(first, session, readyFile, {
-      timeoutSeconds: 3_600,
-    });
-    await sleep(30);
-    await first.shutdown("quit");
-    live.pop();
-
-    const suspended = first.entries.find(
-      (entry) => entry.customType === SUSPENDED_ENTRY_TYPE
+    const { details } = await startFileWatch(
+      first,
+      session,
+      join(directory, "never"),
+      { timeoutSeconds: 3_600 }
     );
-    expect(suspended?.data).toMatchObject({
-      v: 2,
+    await first.shutdown("quit");
+
+    expect(newestSuspension(session.entries)).toMatchObject({
+      reason: "quit",
+      sessionId: session.id,
       watches: [
         expect.objectContaining({
-          facts: expect.objectContaining({ id: details.id }),
+          facts: expect.objectContaining({ id: details.id, reloads: 1 }),
         }),
       ],
     });
+    expect(first.telemetry).toContainEqual({ count: 1, event: "suspended" });
+  });
 
-    // A fresh process resuming the same session file restores nothing by itself.
+  it("restores one-shot and recurring watches on the next startup with deadlines and cadence intact", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "pi-until-restart-"));
+    tempDirectories.push(directory);
+    const readyFile = join(directory, "ready");
+    const { clock, state } = offsetClock();
+    const session = new FakeSession();
+
+    const first = loadExtension(session, { clock });
+    const { details: oneShot } = await startFileWatch(
+      first,
+      session,
+      readyFile,
+      { timeoutSeconds: 3_600 }
+    );
+    const recurring = await startRecurring(first, session);
+    await sleep(30);
+    await first.shutdown("quit");
+
+    // Two and a half recurring intervals pass while Pi is closed.
+    state.offsetMs = 150_000;
+    const second = loadExtension(session, { clock });
+    live.push(second);
+    const { ctx, notify } = session.context({ idle: true });
+    await second.sessionStart("startup", ctx);
+
+    expect(notify).toHaveBeenCalledWith(
+      "pi-until resumed 2 watches after Pi restarted this session",
+      "info"
+    );
+    expect(second.telemetry).toContainEqual({ count: 2, event: "resumed" });
+    expect(resumedMarkers(session)).toHaveLength(1);
+    expect(resumedMarkers(session)[0]).toMatchObject({
+      data: { resumed: 2, skippedExpired: 0 },
+    });
+
+    const restoredOneShot = await statusOf(second, oneShot.id, ctx);
+    expect(restoredOneShot).toMatchObject({
+      expiresAt: oneShot.expiresAt,
+      reloads: 1,
+      startedAt: oneShot.startedAt,
+      status: "running",
+    });
+
+    // The overdue tick fires once, counts the missed tick, and the next due
+    // time stays on the original one-minute grid.
+    await vi.waitFor(() => {
+      expect(
+        second.messages.filter(
+          (sent) => sent.message.customType === "pi-until-recurring"
+        )
+      ).toHaveLength(1);
+    });
+    expect(second.messages[0]?.message.content).toContain("Run the hawk tick.");
+    const restoredRecurring = await statusOf(second, recurring.id, ctx);
+    expect(restoredRecurring).toMatchObject({
+      deliveries: 1,
+      expiresAt: recurring.expiresAt,
+      missedTicks: 1,
+      startedAt: recurring.startedAt,
+      status: "running",
+    });
+    expect(
+      Date.parse(restoredRecurring.nextDueAt ?? "") -
+        Date.parse(recurring.startedAt)
+    ).toBe(180_000);
+
+    // The recurring turn settles before the arbiter sends anything else.
+    await second.agentSettled(ctx);
+    await second.tool(
+      "complete",
+      { action: "complete", id: recurring.id },
+      new AbortController().signal,
+      undefined,
+      ctx
+    );
+    // The one-shot checks once a second; give its next check room on slow CI.
+    writeFileSync(readyFile, "ready\n", "utf-8");
+    await vi.waitFor(
+      () => {
+        expect(
+          second.messages.filter(
+            (sent) => sent.message.customType === "pi-until"
+          )
+        ).toHaveLength(1);
+      },
+      { timeout: 3_000 }
+    );
+  });
+
+  it("skips watches whose deadline passed while Pi was closed", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "pi-until-restart-"));
+    tempDirectories.push(directory);
+    const { clock, state } = offsetClock();
+    const session = new FakeSession();
+    const first = loadExtension(session, { clock });
+    await startFileWatch(first, session, join(directory, "never"), {
+      timeoutSeconds: 60,
+    });
+    await first.shutdown("quit");
+
+    state.offsetMs = 120_000;
+    const second = loadExtension(session, { clock });
+    live.push(second);
+    const { ctx, notify } = session.context();
+    await second.sessionStart("startup", ctx);
+
+    expect(notify).toHaveBeenCalledWith("Skipped 1 expired watch", "warning");
+    expect(await listIds(second, ctx)).toEqual([]);
+    expect(resumedMarkers(session)[0]).toMatchObject({
+      data: { resumed: 0, skippedExpired: 1 },
+    });
+    expect(second.messages).toHaveLength(0);
+  });
+
+  it("does not duplicate a watch the same instance already runs", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "pi-until-restart-"));
+    tempDirectories.push(directory);
+    const session = new FakeSession();
+    const first = loadExtension(session);
+    const { details } = await startFileWatch(
+      first,
+      session,
+      join(directory, "never"),
+      { timeoutSeconds: 3_600 }
+    );
+    await first.shutdown("quit");
+
+    const second = loadExtension(session);
+    live.push(second);
+    const { ctx, notify } = session.context();
+    await second.sessionStart("startup", ctx);
+    expect(await listIds(second, ctx)).toEqual([details.id]);
+
+    // The operator reaches for the old command anyway.
+    notify.mockClear();
+    const resume = second.commands.get("until-resume");
+    if (!resume) throw new Error("until-resume command was not registered");
+    await resume("", ctx);
+    expect(notify).toHaveBeenCalledWith(
+      "No suspended pi-until watches to resume (already active)",
+      "warning"
+    );
+    expect(await listIds(second, ctx)).toEqual([details.id]);
+  });
+
+  it("drops duplicate ids inside one suspension entry", async () => {
+    const session = new FakeSession();
+    const watch: PersistedWatch = {
+      definition: {
+        expiresAt: Date.now() + 3_600_000,
+        gate: { checkTimeoutMs: 1_000, command: "false", cwd: process.cwd() },
+        intervalMs: 60_000,
+        kind: "until",
+        label: "twice",
+        wake: "agent",
+      },
+      facts: {
+        attempts: 1,
+        deliveries: 0,
+        deliveryPending: false,
+        id: "twice001",
+        missedTicks: 0,
+        nextDueAt: Date.now() + 60_000,
+        reloads: 1,
+        startedAt: Date.now() - 1_000,
+      },
+    };
+    session.appendCustom(
+      SUSPENDED_ENTRY_TYPE,
+      suspensionData([watch, watch], Date.now(), "quit", session.id)
+    );
+    const extension = loadExtension(session);
+    live.push(extension);
+    const { ctx, notify } = session.context();
+    await extension.sessionStart("startup", ctx);
+    expect(notify).toHaveBeenCalledWith(
+      "pi-until resumed 1 watch after Pi restarted this session",
+      "info"
+    );
+    expect(await listIds(extension, ctx)).toEqual(["twice001"]);
+  });
+
+  it("consumes the entry so a crash cannot resurrect a watch the operator cancelled", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "pi-until-restart-"));
+    tempDirectories.push(directory);
+    const session = new FakeSession();
+    const first = loadExtension(session);
+    const { details } = await startFileWatch(
+      first,
+      session,
+      join(directory, "never"),
+      { timeoutSeconds: 3_600 }
+    );
+    await first.shutdown("quit");
+
+    const second = loadExtension(session);
+    const { ctx } = session.context();
+    await second.sessionStart("startup", ctx);
+    await second.tool(
+      "cancel",
+      { action: "cancel", id: details.id },
+      new AbortController().signal,
+      undefined,
+      ctx
+    );
+    // The second process dies without session_shutdown: no new entry.
+
+    const third = loadExtension(session);
+    live.push(third);
+    const { ctx: thirdCtx, notify } = session.context();
+    await third.sessionStart("startup", thirdCtx);
+    expect(notify).not.toHaveBeenCalled();
+    expect(await listIds(third, thirdCtx)).toEqual([]);
+  });
+
+  it("keeps a pending quit entry through a print-mode run of the same session", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "pi-until-restart-"));
+    tempDirectories.push(directory);
+    const session = new FakeSession();
+    const first = loadExtension(session);
+    const { details } = await startFileWatch(
+      first,
+      session,
+      join(directory, "never"),
+      { timeoutSeconds: 3_600 }
+    );
+    await first.shutdown("quit");
+    const entriesAfterQuit = session.entries.length;
+
+    const printRun = loadExtension(session);
+    const { ctx: printCtx, notify: printNotify } = session.context({
+      mode: "print",
+    });
+    await printRun.sessionStart("startup", printCtx);
+    session.appendUserMessage("one-shot question");
+    await printRun.shutdown("quit", printCtx);
+    expect(printNotify).not.toHaveBeenCalled();
+    expect(
+      session.entries
+        .slice(entriesAfterQuit)
+        .filter((entry) => entry.type === "custom")
+    ).toEqual([]);
+
+    const interactive = loadExtension(session);
+    live.push(interactive);
+    const { ctx } = session.context();
+    await interactive.sessionStart("startup", ctx);
+    expect(await listIds(interactive, ctx)).toEqual([details.id]);
+  });
+
+  it.each(["new", "fork"] as const)(
+    "restores nothing on session_start %s",
+    async (reason) => {
+      const directory = mkdtempSync(join(tmpdir(), "pi-until-restart-"));
+      tempDirectories.push(directory);
+      const session = new FakeSession();
+      const first = loadExtension(session);
+      await startFileWatch(first, session, join(directory, "never"));
+      await first.shutdown("quit");
+
+      const next = loadExtension(session);
+      live.push(next);
+      const { ctx, notify } = session.context();
+      await next.sessionStart(reason, ctx);
+      expect(notify).not.toHaveBeenCalled();
+      expect(await listIds(next, ctx)).toEqual([]);
+      expect(resumedMarkers(session)).toHaveLength(0);
+    }
+  );
+
+  it("restores nothing in a fork that copied the quit entry", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "pi-until-restart-"));
+    tempDirectories.push(directory);
+    const parent = new FakeSession();
+    const first = loadExtension(parent);
+    await startFileWatch(first, parent, join(directory, "never"), {
+      timeoutSeconds: 3_600,
+    });
+    await first.shutdown("quit");
+
+    const forked = parent.fork();
+    const next = loadExtension(forked);
+    live.push(next);
+    const { ctx, notify } = forked.context();
+    await next.sessionStart("startup", ctx);
+    expect(notify).not.toHaveBeenCalled();
+    expect(await listIds(next, ctx)).toEqual([]);
+  });
+
+  it.each(["new", "resume", "fork"] as const)(
+    "writes no suspension entry when %s replaces the session",
+    async (reason) => {
+      const directory = mkdtempSync(join(tmpdir(), "pi-until-restart-"));
+      tempDirectories.push(directory);
+      const session = new FakeSession();
+      const first = loadExtension(session);
+      await startFileWatch(first, session, join(directory, "never"));
+      await first.shutdown(reason);
+      expect(newestSuspension(session.entries)).toBeUndefined();
+    }
+  );
+
+  it("restores a version 2 quit entry left by the previous release", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "pi-until-restart-"));
+    tempDirectories.push(directory);
+    const session = new FakeSession();
+    const first = loadExtension(session);
+    const { details } = await startFileWatch(
+      first,
+      session,
+      join(directory, "never"),
+      { timeoutSeconds: 3_600 }
+    );
+    await first.shutdown("quit");
+    // Rewrite the entry the way pi-until 56f644e wrote it on quit.
+    const entry = newestSuspensionEntry(session);
+    entry.data = {
+      suspendedAt: new Date().toISOString(),
+      v: 2,
+      watches: [...suspendedWatchesFrom(session.entries)],
+    };
+
+    const second = loadExtension(session);
+    live.push(second);
+    const { ctx } = session.context();
+    await second.sessionStart("startup", ctx);
+    expect(await listIds(second, ctx)).toEqual([details.id]);
+  });
+
+  it("leaves a version 2 entry alone once the conversation continued past it", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "pi-until-restart-"));
+    tempDirectories.push(directory);
+    const session = new FakeSession();
+    const first = loadExtension(session);
+    await startFileWatch(first, session, join(directory, "never"), {
+      timeoutSeconds: 3_600,
+    });
+    await first.shutdown("reload");
+    const entry = newestSuspensionEntry(session);
+    entry.data = {
+      suspendedAt: new Date().toISOString(),
+      v: 2,
+      watches: [...suspendedWatchesFrom(session.entries)],
+    };
+    session.appendUserMessage("work continued after the reload");
+
     const second = loadExtension(session);
     live.push(second);
     const { ctx, notify } = session.context();
     await second.sessionStart("startup", ctx);
     expect(notify).not.toHaveBeenCalled();
-    expect(
-      second.telemetry.filter((event) => event.event === "started")
-    ).toHaveLength(0);
+    expect(await listIds(second, ctx)).toEqual([]);
+  });
 
-    // The operator resumes explicitly.
+  it("still resumes explicitly with /until-resume when automatic recovery does not apply", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "pi-until-restart-"));
+    tempDirectories.push(directory);
+    const readyFile = join(directory, "ready");
+    const session = new FakeSession();
+    const first = loadExtension(session);
+    const { details } = await startFileWatch(first, session, readyFile, {
+      timeoutSeconds: 3_600,
+    });
+    // A reload entry, then the process died without a quit entry.
+    await first.shutdown("reload");
+
+    const second = loadExtension(session);
+    live.push(second);
+    const { ctx, notify } = session.context();
+    await second.sessionStart("startup", ctx);
+    expect(notify).not.toHaveBeenCalled();
+
     const resume = second.commands.get("until-resume");
     if (!resume) throw new Error("until-resume command was not registered");
     await resume("", ctx);
@@ -105,29 +544,7 @@ describe("pi-until across a process restart", () => {
       event: "action",
       source: "command",
     });
-    const status = await second.tool(
-      "status",
-      { action: "status", id: details.id },
-      new AbortController().signal,
-      undefined,
-      ctx
-    );
-    expect(status.details).toMatchObject({ id: details.id, status: "running" });
-    expect(second.telemetry).toContainEqual(
-      expect.objectContaining({
-        event: "started",
-        id: details.id,
-        resumed: true,
-      })
-    );
-
-    // Running it again is a no-op, not a duplicate watch.
-    notify.mockClear();
-    await resume("", ctx);
-    expect(notify).toHaveBeenCalledWith(
-      "No suspended pi-until watches to resume (already active)",
-      "warning"
-    );
+    expect(resumedMarkers(session)).toHaveLength(1);
 
     writeFileSync(readyFile, "ready\n", "utf-8");
     await vi.waitFor(
@@ -136,49 +553,7 @@ describe("pi-until across a process restart", () => {
       },
       { timeout: 2_000 }
     );
-  });
-
-  it("skips watches whose expiry passed while no process owned them", async () => {
-    const session = new FakeSession();
-    const expired: PersistedWatch = {
-      definition: {
-        expiresAt: Date.now() - 1_000,
-        gate: { checkTimeoutMs: 1_000, command: "true", cwd: process.cwd() },
-        intervalMs: 1_000,
-        kind: "until",
-        label: "stale",
-        wake: "agent",
-      },
-      facts: {
-        attempts: 3,
-        deliveries: 0,
-        deliveryPending: false,
-        id: "stale001",
-        missedTicks: 0,
-        nextDueAt: Date.now() - 500,
-        reloads: 0,
-        startedAt: Date.now() - 10_000,
-      },
-    };
-    session.appendCustom(
-      SUSPENDED_ENTRY_TYPE,
-      suspensionData([expired], Date.now() - 900)
-    );
-
-    const extension = loadExtension(session);
-    live.push(extension);
-    const { ctx, notify } = session.context();
-    await extension.sessionStart("startup", ctx);
-    const resume = extension.commands.get("until-resume");
-    if (!resume) throw new Error("until-resume command was not registered");
-    await resume("", ctx);
-    expect(notify).toHaveBeenCalledWith(
-      "No suspended pi-until watches to resume (1 expired)",
-      "warning"
-    );
-    expect(
-      extension.telemetry.filter((event) => event.event === "started")
-    ).toHaveLength(0);
+    expect(second.messages[0]?.message.content).toContain(details.id);
   });
 });
 
@@ -202,7 +577,9 @@ describe("pi-until across /reload", () => {
     );
     expect(suspended).toBeDefined();
     expect(suspended?.data).toMatchObject({
-      v: 2,
+      reason: "reload",
+      sessionId: session.id,
+      v: 3,
       watches: [
         expect.objectContaining({
           definition: expect.objectContaining({ wake: "agent" }),

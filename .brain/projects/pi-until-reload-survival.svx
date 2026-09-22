@@ -3,7 +3,7 @@ title: pi-until session lifecycle and delivery arbitration
 type: project
 status: active
 created: 2026-08-27
-updated: 2026-09-03
+updated: 2026-09-22
 tags: [pi-until, pi-extension, xstate, reload, recurrence, telemetry]
 ---
 
@@ -15,8 +15,10 @@ tags: [pi-until, pi-extension, xstate, reload, recurrence, telemetry]
 
 - A normal turn can settle without stopping watches.
 - `/reload` suspends active watch values to the session and restores them in the replacement extension instance before the original expiry.
-- `/new`, resume, fork, process exit, and reboot end ownership. Historical suspension entries have no authority there.
-- `/quit` still writes a suspension entry. After a process restart against the same session file, `/until-resume` lets the operator revive that entry explicitly. Expired and already-active watches are skipped. Added 2026-09-21 after two long-lived sessions had to be restarted to shed 500k junk entries and their watches had to be re-armed by hand from the entry.
+- A graceful quit (`session_shutdown { reason: "quit" }`) writes a version 3 suspension entry with `reason` and the owning `sessionId`. The next long-lived process that opens the same session file (`session_start` `startup` or `resume`) restores those watches with no command, then appends `pi-until-resumed` to consume the entry. Expired, finished, duplicate, and already-active watches are skipped. Deadlines and recurring cadence stay anchored to the original start.
+- `/new`, fork, a forked copy of a quit entry, a reload entry found at startup, a crash, SIGKILL, and reboot give no authority to restart. Print and JSON runs neither restore nor write a quit entry.
+- `/until-resume` remains the manual path when automatic recovery did not apply.
+- History: 2026-09-21 (`0.5.0`) made quit write an entry and added `/until-resume` as an explicit path. On 2026-09-22 Joel quit Pi for a runtime update. The drovr hawk session lost three watches because its process had loaded `cf28671` before `0.5.0` reached disk and never reloaded, so the reload-only handler ran at quit and wrote nothing. Even a written entry would have required a command nobody knew about. `0.6.0` makes quit-then-relaunch automatic. Version 2 quit entries left by `0.5.0` processes restore when they are newer than the session header and no message follows them.
 - Same-process session replacement creates a fresh session delivery arbiter. A stopped arbiter is never reused.
 - Session shutdown waits for shell process-tree cleanup.
 
@@ -67,4 +69,4 @@ The public contract lives across `README.md`, `src/command.ts`, the registered t
 
 ## Current receipt
 
-Version `0.4.0` passed 59 tests, `npm run check`, `npm run pack:dry`, a real Pi RPC recurrence, independent review, and GitHub Actions. The installed Git source is `git:github.com/joelhooks/pi-until@main`.
+Version `0.6.0` adds automatic quit-then-relaunch recovery; see the PR receipt in the pi-until repo history. Version `0.4.0` passed 59 tests, `npm run check`, `npm run pack:dry`, a real Pi RPC recurrence, independent review, and GitHub Actions. The installed Git source is `git:github.com/joelhooks/pi-until@main`.
