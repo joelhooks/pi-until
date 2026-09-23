@@ -225,3 +225,46 @@ export const createFollowUpMachine = (ports: FollowUpPorts) =>
       },
     },
   });
+
+/**
+ * Version 1 request from another extension to share this session's arbiter.
+ * The caller learns the outcome only through `accept()`: a synchronous call
+ * means the request is queued here and the caller must not deliver it itself.
+ */
+export interface ExternalFollowUpRequest {
+  readonly accept: () => void;
+  readonly content: string;
+  readonly customType: string;
+  readonly details: unknown;
+  readonly id: string;
+  readonly source: string;
+}
+
+const nonEmptyString = (value: unknown): value is string =>
+  typeof value === "string" && value.trim().length > 0;
+
+export const parseExternalFollowUpRequest = (
+  value: unknown
+): ExternalFollowUpRequest | undefined => {
+  if (typeof value !== "object" || value === null) return undefined;
+  const record = value as Record<string, unknown>;
+  if (
+    record.version !== 1 ||
+    typeof record.accept !== "function" ||
+    !nonEmptyString(record.content) ||
+    !nonEmptyString(record.customType) ||
+    !nonEmptyString(record.id) ||
+    !nonEmptyString(record.source)
+  ) {
+    return undefined;
+  }
+  const accept = record.accept as () => void;
+  return {
+    accept: () => accept(),
+    content: record.content,
+    customType: record.customType,
+    details: record.details,
+    id: record.id,
+    source: record.source,
+  };
+};

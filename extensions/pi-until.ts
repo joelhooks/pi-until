@@ -36,6 +36,7 @@ import type {
 } from "../src/domain.ts";
 import {
   createFollowUpMachine,
+  parseExternalFollowUpRequest,
   type FollowUpRequest,
 } from "../src/follow-up.ts";
 import { renderWatchIndicator, renderWatchPanel } from "../src/indicator.ts";
@@ -76,6 +77,11 @@ const MAX_ACTIVE_WATCHES = 32;
 const MAX_TERMINAL_RECEIPTS = 50;
 const WIDGET_KEY = "pi-until-watches";
 export const WATCHES_EVENT = "pi-until:watches";
+/**
+ * Other extensions emit a version 1 request here to share the session-wide
+ * follow-up arbiter. See `parseExternalFollowUpRequest`.
+ */
+export const FOLLOW_UP_REQUEST_EVENT = "pi-until:follow-up";
 const PANEL_PAGE_SIZE = 6;
 const INDICATOR_REFRESH_MS = 1_000;
 
@@ -1174,8 +1180,38 @@ export default function piUntil(
     });
   });
 
+  // Other extensions (Bellwether) route their agent wakes through this
+  // arbiter so only one follow-up is in flight for the whole session.
+  let stopExternalFollowUps: (() => void) | undefined;
+  const listenForExternalFollowUps = () => {
+    if (stopExternalFollowUps !== undefined) return;
+    const off = pi.events.on(FOLLOW_UP_REQUEST_EVENT, (payload) => {
+      if (shuttingDown || currentContext === undefined) return;
+      const request = parseExternalFollowUpRequest(payload);
+      if (request === undefined) return;
+      followUps.send({
+        request: {
+          content: request.content,
+          customType: request.customType,
+          dedupeKey: `external:${request.source}:${request.id}`,
+          details: request.details,
+          id: randomUUID(),
+          kind: "terminal",
+          watchId: `${request.source}:${request.id}`,
+        },
+        type: "ENQUEUE",
+      });
+      request.accept();
+    });
+    stopExternalFollowUps = () => {
+      off();
+      stopExternalFollowUps = undefined;
+    };
+  };
+
   pi.on("session_start", (event, ctx) => {
     currentContext = ctx;
+    listenForExternalFollowUps();
     if (shuttingDown) {
       shuttingDown = false;
       followUps = createSessionFollowUps(!ctx.isIdle());
@@ -1205,6 +1241,7 @@ export default function piUntil(
 
   pi.on("session_shutdown", async (event, ctx) => {
     shuttingDown = true;
+    stopExternalFollowUps?.();
     followUps.stop();
     const active = activeWatches();
     // `/reload` restores in the next extension instance. `quit` hands the

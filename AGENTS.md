@@ -32,7 +32,7 @@ Node is `24.18.0`. Use npm `11.16.0`; never Bun. `devEngines` fails hard on any 
 
 - Exit code 0 is the only success condition.
 - Checks must not overlap for one watch.
-- Only one `pi-until` follow-up may be submitted to or running in Pi at a time. Correlate it through `details.followUpId`.
+- Only one `pi-until` follow-up may be submitted to or running in Pi at a time. Correlate it through `details.followUpId`. Requests other extensions emit on `pi-until:follow-up` join the same queue as terminal follow-ups; `parseExternalFollowUpRequest` validates them, and `accept()` runs only after the request is queued. The extension listens only between `session_start` and `session_shutdown`.
 - Starting a watch returns immediately.
 - Cancellation aborts the active check and its descendants on macOS and Linux.
 - Condition stdout and stderr are discarded, never added to receipts or model context.
