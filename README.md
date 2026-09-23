@@ -131,6 +131,26 @@ pi.events.on("pi-until:watches", (watches) => {
 });
 ```
 
+## Sharing the follow-up queue
+
+Another extension can hand an agent wake to the same session arbiter, so only one follow-up from either extension is submitted or running at a time. Emit a version 1 request on `pi-until:follow-up`:
+
+```ts
+let accepted = false;
+pi.events.emit("pi-until:follow-up", {
+  version: 1,
+  source: "bellwether",       // non-empty; namespaces the dedupe key
+  id: "batch-7",              // non-empty and unique per request from this source
+  customType: "bellwether-wakes",
+  content: "2 Bellwether waits settled. ...",
+  details: { wakes: [...] },   // delivered as details.receipt
+  accept: () => { accepted = true; },
+});
+if (!accepted) pi.sendMessage(/* deliver it yourself */);
+```
+
+`accept()` runs synchronously when pi-until queued the request. The caller must then not deliver it again. pi-until does not accept before `session_start`, during or after `session_shutdown`, or when the request is malformed; the caller keeps ownership in those cases. Pi receives the message with `details: { followUpId, receipt: details }` and `triggerTurn: true`, and the arbiter waits for that turn to settle before the next follow-up. An acknowledgement timeout pauses the queue exactly as it does for pi-until's own follow-ups.
+
 ## Commands
 
 ```text

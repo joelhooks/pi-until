@@ -156,6 +156,8 @@ export interface FakeExtension {
     (args: string, ctx: ExtensionContext) => Promise<void>
   >;
   readonly emitted: EmittedEvent[];
+  /** Deliver an event to the extension's `pi.events.on` listeners. */
+  readonly emitToExtension: (channel: string, data: unknown) => void;
   readonly entries: { customType: string; data: CustomEntry["data"] }[];
   readonly messages: SentMessage[];
   readonly sendMessage: ReturnType<typeof vi.fn>;
@@ -222,12 +224,21 @@ export const loadExtension = (
   );
 
   const emitted: EmittedEvent[] = [];
+  const listeners = new Map<string, Set<(data: unknown) => void>>();
 
   const pi = {
     appendEntry,
     events: {
       emit: (channel: string, data: unknown) => {
         emitted.push({ channel, data });
+      },
+      on: (channel: string, listener: (data: unknown) => void) => {
+        const set = listeners.get(channel) ?? new Set();
+        set.add(listener);
+        listeners.set(channel, set);
+        return () => {
+          set.delete(listener);
+        };
       },
     },
     on: vi.fn((event: string, handler: SessionHandler) => {
@@ -258,7 +269,7 @@ export const loadExtension = (
     sendMessage,
   };
 
-  // SAFETY: the extension uses only appendEntry, events.emit, on,
+  // SAFETY: the extension uses only appendEntry, events.emit, events.on, on,
   // registerCommand, registerTool, and sendMessage from ExtensionAPI.
   piUntil(pi as unknown as ExtensionAPI, {
     clock: options.clock,
@@ -304,6 +315,9 @@ export const loadExtension = (
     appendEntry,
     commands,
     emitted,
+    emitToExtension: (channel, data) => {
+      for (const listener of listeners.get(channel) ?? []) listener(data);
+    },
     entries,
     messages,
     sendMessage,
