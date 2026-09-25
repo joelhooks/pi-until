@@ -111,6 +111,7 @@ interface WatchRecord {
 
 export interface PiUntilOptions {
   readonly clock?: UntilClock;
+  readonly compactionGraceMs?: number;
   readonly followUpDispatchAckMs?: number;
   readonly telemetry?: TelemetrySink;
 }
@@ -603,6 +604,7 @@ export default function piUntil(
   const createSessionFollowUps = (sessionBusy: boolean): FollowUpActor => {
     const actor = createActor(
       createFollowUpMachine({
+        compactionGraceMs: options.compactionGraceMs,
         dispatch: dispatchFollowUp,
         dispatchAckMs: options.followUpDispatchAckMs,
         failed: (request) => {
@@ -652,6 +654,18 @@ export default function piUntil(
   };
   followUps = createSessionFollowUps(true);
 
+  /**
+   * Tell the arbiter whether an agent run owns the session. Pi reports a
+   * compacting session as not idle although no run will settle it, so while
+   * compaction is in flight the compaction events own that fact.
+   */
+  const syncSessionActivity = (ctx: ExtensionContext) => {
+    if (followUps.getSnapshot().context.compacting) return;
+    followUps.send({
+      type: ctx.isIdle() ? "SESSION_SETTLED" : "SESSION_BUSY",
+    });
+  };
+
   const parseCommand = (
     params: UntilParameters,
     ctx: ExtensionContext
@@ -667,9 +681,7 @@ export default function piUntil(
     command: StartWatchCommand,
     ctx: ExtensionContext
   ): WatchRecord => {
-    followUps.send({
-      type: ctx.isIdle() ? "SESSION_SETTLED" : "SESSION_BUSY",
-    });
+    syncSessionActivity(ctx);
     if (isShortLived(ctx)) {
       throw new Error(
         "pi-until requires a long-lived interactive or RPC Pi process"
@@ -900,7 +912,7 @@ export default function piUntil(
 
   pi.registerTool({
     description:
-      "Start session-scoped shell-condition watches or recurring agent follow-ups. One session arbiter serializes every pi-until wake. Recurrences use fixed cadence, immutable task snapshots, and explicit completion. Watches come back after /reload or after Pi quits and reopens the same session.",
+      "Start session-scoped shell-condition watches or recurring agent follow-ups. One session arbiter serializes every pi-until wake and holds wakes while Pi compacts. Recurrences use fixed cadence, immutable task snapshots, and explicit completion. Watches come back after /reload or after Pi quits and reopens the same session.",
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       currentContext = ctx;
       const command = parseCommand(params, ctx);
@@ -1166,6 +1178,23 @@ export default function piUntil(
     followUps.send({ type: "SESSION_SETTLED" });
   });
 
+  // A wake dispatched while Pi compacts would start a turn on the
+  // uncompacted context beside the summarizer. Hold wakes until it ends.
+  pi.on("session_before_compact", (_event, ctx) => {
+    currentContext = ctx;
+    followUps.send({ type: "COMPACTION_STARTED" });
+  });
+
+  pi.on("session_compact", (_event, ctx) => {
+    currentContext = ctx;
+    followUps.send({ type: "COMPACTION_ENDED" });
+  });
+
+  pi.on("session_compact_failed", (_event, ctx) => {
+    currentContext = ctx;
+    followUps.send({ type: "COMPACTION_ENDED" });
+  });
+
   pi.on("message_start", (event, ctx) => {
     currentContext = ctx;
     if (
@@ -1216,9 +1245,7 @@ export default function piUntil(
       shuttingDown = false;
       followUps = createSessionFollowUps(!ctx.isIdle());
     } else {
-      followUps.send({
-        type: ctx.isIdle() ? "SESSION_SETTLED" : "SESSION_BUSY",
-      });
+      syncSessionActivity(ctx);
     }
     if (event.reason === "reload") {
       // A reload keeps the process and session; the entry was just written.

@@ -104,6 +104,8 @@ The extension snapshots `instruction`, `quickRef`, `contextRefs`, and the origin
 
 Cadence stays anchored to the original schedule. One session-wide arbiter sends only one `pi-until` follow-up into Pi at a time. It waits for Pi to start that exact message and for the resulting agent turn to settle before it sends another. Missed ticks increase `missedTicks` instead of stacking agent turns. If acknowledgement takes more than five seconds, the arbiter pauses and warns instead of guessing that Pi discarded an accepted message. A late `message_start` resumes the lifecycle safely. A synchronous dispatch rejection fails the recurring watch.
 
+The arbiter never sends a follow-up while Pi compacts the session outside an agent run, such as a manual `/compact`. Pi starts an extension-triggered turn even while it compacts, and that turn races the summarizer on the uncompacted context. Checks keep running during compaction; a wake that comes due waits. When compaction ends or fails, the arbiter waits five more seconds so a prompt queued behind compaction starts first, then delivers. Compaction inside an agent run needs no hold because the run already owns the session.
+
 ## Agent contract
 
 - Treat `contextRefs` as opaque pointers. Read a target only when the instruction requires it.
@@ -220,4 +222,4 @@ A second XState v5 machine owns the session delivery queue:
 ready -> queued -> awaiting message_start -> awaiting agent_settled -> ready
 ```
 
-`src/command.ts` parses the flat provider schema once into an internal command. The watch machine owns cadence, expiry, checks, delivery counts, missed ticks, and terminal state. The session queue owns cross-watch serialization, message correlation, deduplication, and dispatch acknowledgement. The extension only adapts these parts to Pi lifecycle events, receipts, and UI.
+`src/command.ts` parses the flat provider schema once into an internal command. The watch machine owns cadence, expiry, checks, delivery counts, missed ticks, and terminal state. The session queue owns cross-watch serialization, message correlation, deduplication, dispatch acknowledgement, and the compaction hold. The extension only adapts these parts to Pi lifecycle events, receipts, and UI.

@@ -115,6 +115,94 @@ describe("pi-until extension", () => {
     expect(started).not.toHaveProperty("conditionHead");
   });
 
+  it("holds a wake while Pi compacts and delivers it after compaction", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "pi-until-compaction-"));
+    const readyFile = join(directory, "ready");
+    tempDirectories.push(directory);
+    const session = new FakeSession();
+    const extension = loadExtension(session, { compactionGraceMs: 50 });
+    live.push(extension);
+    // Pi reports a compacting session as not idle, but no agent run starts.
+    const { ctx: compactingCtx } = session.context({ idle: false });
+    const { ctx } = session.context();
+
+    await extension.sessionStart("startup", ctx);
+    await extension.compactionStart(compactingCtx);
+    await extension.tool(
+      "tool-call",
+      {
+        action: "start",
+        condition: `test -f ${JSON.stringify(readyFile)}`,
+        intervalSeconds: 1,
+        label: "compaction test",
+        wake: "agent",
+      },
+      new AbortController().signal,
+      undefined,
+      compactingCtx
+    );
+    writeFileSync(readyFile, "ready\n", "utf-8");
+
+    await vi.waitFor(
+      () => {
+        expect(
+          extension.entries.some(
+            (entry) => entry.customType === "pi-until-finished"
+          )
+        ).toBe(true);
+      },
+      { timeout: 2_000 }
+    );
+    await sleep(100);
+    expect(extension.messages).toHaveLength(0);
+
+    await extension.compactionEnd(ctx);
+    expect(extension.messages).toHaveLength(0);
+    await vi.waitFor(
+      () => {
+        expect(extension.messages).toHaveLength(1);
+      },
+      { timeout: 1_000 }
+    );
+    expect(extension.messages[0]?.message.customType).toBe("pi-until");
+  });
+
+  it("releases a held wake when compaction fails", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "pi-until-compaction-"));
+    const readyFile = join(directory, "ready");
+    writeFileSync(readyFile, "ready\n", "utf-8");
+    tempDirectories.push(directory);
+    const session = new FakeSession();
+    const extension = loadExtension(session, { compactionGraceMs: 50 });
+    live.push(extension);
+    const { ctx } = session.context();
+
+    await extension.sessionStart("startup", ctx);
+    await extension.compactionStart(ctx, "threshold");
+    await extension.tool(
+      "tool-call",
+      {
+        action: "start",
+        condition: `test -f ${JSON.stringify(readyFile)}`,
+        intervalSeconds: 1,
+        label: "compaction failure test",
+      },
+      new AbortController().signal,
+      undefined,
+      ctx
+    );
+    await sleep(300);
+    expect(extension.messages).toHaveLength(0);
+
+    await extension.compactionEnd(ctx, { failed: true, reason: "threshold" });
+    await vi.waitFor(
+      () => {
+        expect(extension.messages).toHaveLength(1);
+      },
+      { timeout: 1_000 }
+    );
+  });
+
   it("supports notify-only completion without waking the agent", async () => {
     const session = new FakeSession();
     const extension = loadExtension(session);
