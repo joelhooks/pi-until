@@ -3,8 +3,8 @@ title: pi-until session lifecycle and delivery arbitration
 type: project
 status: active
 created: 2026-08-27
-updated: 2026-09-22
-tags: [pi-until, pi-extension, xstate, reload, recurrence, telemetry]
+updated: 2026-09-25
+tags: [pi-until, pi-extension, xstate, reload, recurrence, telemetry, compaction]
 ---
 
 ## Purpose
@@ -22,7 +22,7 @@ tags: [pi-until, pi-extension, xstate, reload, recurrence, telemetry]
 - Same-process session replacement creates a fresh session delivery arbiter. A stopped arbiter is never reused.
 - Session shutdown waits for shell process-tree cleanup.
 
-Pi `0.84.2` supports this boundary through `session_shutdown`, `session_start`, `agent_settled`, `message_start`, `ctx.isIdle()`, custom session entries, and follow-up messages.
+Pi `0.84.2` supports this boundary through `session_shutdown`, `session_start`, `agent_settled`, `message_start`, `ctx.isIdle()`, custom session entries, and follow-up messages. The compaction hold also needs `session_before_compact`, `session_compact`, and `session_compact_failed`. Pi added `session_compact_failed` in `0.85`, so the dev pins moved to `0.87.1`, the fleet runtime. On older Pi, a failed compaction holds wakes until the next `agent_settled`.
 
 ## Two machines
 
@@ -38,7 +38,14 @@ One session XState actor owns all `pi-until` delivery. It:
 - pauses in `startUncertain` when acknowledgement takes more than five seconds;
 - reconciles a late acknowledgement without changing the packet's cadence facts;
 - fails only on explicit dispatch rejection;
-- drops queued work whose watch is no longer live.
+- drops queued work whose watch is no longer live;
+- holds dispatch while Pi compacts outside an agent run, then waits a five-second grace window so a prompt queued behind compaction starts first.
+
+### Compaction hold
+
+On 2026-09-25 Joel reported that short-interval watches disturbed compaction in the drovr hawk session. Pi `0.87.1` `sendCustomMessage(..., { triggerTurn: true })` starts `_runAgentPrompt` whenever no agent run is active. `prompt()` refuses input during manual compaction, but that path has no guard. Manual compaction first aborts the run and then summarizes outside one, so the arbiter sat in `ready` and dispatched wakes into it. The hawk session has one compaction: extension-provided, at 751,810 tokens on a 1M-window model, far below the threshold, so manual. Wakes ran full tool turns during the summary. When it landed, the bridge tore down the in-flight query, the wake's turn ended as an empty `aborted` assistant, and the next wake started 120 ms later. A real Pi RPC run with a slow faux summarizer reproduced the turn inside `compaction_start`/`compaction_end`. With the hold, the wake arrived five seconds after `compaction_end`.
+
+Compaction inside an agent run needs no hold: threshold, overflow, and between-tool-step compaction happen while the arbiter is already busy. Checks keep running during a hold; only dispatch waits. `ctx.isIdle()` is false while Pi compacts, so starting a watch then must not mark the session busy, or the queue would wait for a turn that never comes. Pre-prompt compaction after an aborted run has the same shape as manual compaction and gets the same hold.
 
 An acknowledgement timeout is uncertainty, not proof that Pi rejected the message. Sending another follow-up at that point could stack agent turns.
 
@@ -66,6 +73,7 @@ The public contract lives across `README.md`, `src/command.ts`, the registered t
 - A daemon or reboot scheduler: violates session ownership.
 - Per-watch delivery decisions: cannot enforce session-wide serialization.
 - Treating acknowledgement timeout as rejection: the accepted message can still start after slow `before_agent_start` hooks.
+- Pausing checks during compaction: a check never touches the session, and paused checks would delay the wake without protecting anything.
 
 ## Current receipt
 

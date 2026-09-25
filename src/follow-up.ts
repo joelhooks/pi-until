@@ -24,6 +24,8 @@ export interface FollowUpMachineInput {
 
 export interface FollowUpContext {
   readonly active?: FollowUpRequest;
+  /** Pi is compacting the session. Only the idle states hold on it. */
+  readonly compacting: boolean;
   readonly queue: readonly FollowUpRequest[];
   readonly sessionBusy: boolean;
 }
@@ -33,10 +35,13 @@ export type FollowUpEvent =
   | { readonly dedupeKey: string; readonly type: "DROP" }
   | { readonly id: string; readonly type: "DISPATCH_FAILED" }
   | { readonly id: string; readonly type: "MESSAGE_STARTED" }
+  | { readonly type: "COMPACTION_STARTED" }
+  | { readonly type: "COMPACTION_ENDED" }
   | { readonly type: "SESSION_BUSY" }
   | { readonly type: "SESSION_SETTLED" };
 
 export interface FollowUpPorts {
+  readonly compactionGraceMs?: number;
   readonly dispatch: (request: FollowUpRequest) => void;
   readonly dispatchAckMs?: number;
   readonly failed?: (request: FollowUpRequest) => void;
@@ -48,6 +53,13 @@ export interface FollowUpPorts {
 }
 
 const DEFAULT_DISPATCH_ACK_MS = 5_000;
+/**
+ * After compaction outside an agent run, Pi usually starts the prompt that
+ * waited behind it: a queued operator message, or the prompt whose
+ * pre-flight check compacted after an aborted run. The grace window lets
+ * that run claim the session before a held wake starts its own.
+ */
+const DEFAULT_COMPACTION_GRACE_MS = 5_000;
 
 const contains = (
   context: FollowUpContext,
@@ -84,8 +96,10 @@ export const createFollowUpMachine = (ports: FollowUpPorts) =>
             ? context.queue
             : [...context.queue, event.request],
       }),
+      markCompacting: assign({ compacting: true }),
+      markCompactionEnded: assign({ compacting: false }),
       markSessionBusy: assign({ sessionBusy: true }),
-      markSessionIdle: assign({ sessionBusy: false }),
+      markSessionIdle: assign({ compacting: false, sessionBusy: false }),
       recordDispatchTime: assign({
         active: ({ context }) => {
           if (context.active?.kind !== "recurring" || ports.now === undefined) {
@@ -110,10 +124,12 @@ export const createFollowUpMachine = (ports: FollowUpPorts) =>
       },
     },
     delays: {
+      compactionGrace: ports.compactionGraceMs ?? DEFAULT_COMPACTION_GRACE_MS,
       dispatchAck: ports.dispatchAckMs ?? DEFAULT_DISPATCH_ACK_MS,
     },
     guards: {
       hasQueued: ({ context }) => context.queue.length > 0,
+      isCompacting: ({ context }) => context.compacting,
       isQueueHeadStale: ({ context }) => {
         const [head] = context.queue;
         return head !== undefined && !(ports.isLive?.(head) ?? true);
@@ -134,12 +150,17 @@ export const createFollowUpMachine = (ports: FollowUpPorts) =>
     },
   }).createMachine({
     context: ({ input }) => ({
+      compacting: false,
       queue: [],
       sessionBusy: input.sessionBusy,
     }),
     id: "sessionFollowUps",
     initial: "routing",
     on: {
+      // An agent run owns the session through its own compaction, so outside
+      // the idle states compaction is only a fact for the next routing pass.
+      COMPACTION_ENDED: { actions: "markCompactionEnded" },
+      COMPACTION_STARTED: { actions: "markCompacting" },
       DROP: { actions: "dropQueued" },
     },
     states: {
@@ -192,6 +213,39 @@ export const createFollowUpMachine = (ports: FollowUpPorts) =>
           SESSION_BUSY: { actions: "markSessionBusy" },
         },
       },
+      compacting: {
+        on: {
+          COMPACTION_ENDED: {
+            actions: "markCompactionEnded",
+            target: "compactionGrace",
+          },
+          ENQUEUE: { actions: "enqueue" },
+          SESSION_BUSY: { actions: "markSessionBusy", target: "busy" },
+          // Pi settles only after compaction finishes; a missed end event
+          // must not strand the queue.
+          SESSION_SETTLED: {
+            actions: "markSessionIdle",
+            target: "routing",
+          },
+        },
+      },
+      compactionGrace: {
+        after: {
+          compactionGrace: { target: "routing" },
+        },
+        on: {
+          COMPACTION_STARTED: {
+            actions: "markCompacting",
+            target: "compacting",
+          },
+          ENQUEUE: { actions: "enqueue" },
+          SESSION_BUSY: { actions: "markSessionBusy", target: "busy" },
+          SESSION_SETTLED: {
+            actions: "markSessionIdle",
+            target: "routing",
+          },
+        },
+      },
       busy: {
         on: {
           ENQUEUE: { actions: "enqueue" },
@@ -209,6 +263,7 @@ export const createFollowUpMachine = (ports: FollowUpPorts) =>
             target: "routing",
           },
           { guard: "isSessionBusy", target: "busy" },
+          { guard: "isCompacting", target: "compacting" },
           {
             actions: "activateNext",
             guard: "hasQueued",
@@ -219,6 +274,10 @@ export const createFollowUpMachine = (ports: FollowUpPorts) =>
       },
       ready: {
         on: {
+          COMPACTION_STARTED: {
+            actions: "markCompacting",
+            target: "compacting",
+          },
           ENQUEUE: { actions: "enqueue", target: "routing" },
           SESSION_BUSY: { actions: "markSessionBusy", target: "busy" },
         },

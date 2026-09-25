@@ -160,6 +160,109 @@ describe("session follow-up queue", () => {
     expect(dispatch).toHaveBeenLastCalledWith(request("second"));
   });
 
+  it("holds dispatch while compaction runs and releases after a grace window", () => {
+    const clock = new SimulatedClock();
+    const dispatch = vi.fn();
+    const actor = createActor(
+      createFollowUpMachine({
+        compactionGraceMs: 2_000,
+        dispatch: (item) => {
+          dispatch(item);
+        },
+        settled: () => {},
+        started: () => {},
+      }),
+      { clock, input: { sessionBusy: false } }
+    );
+    actor.start();
+
+    actor.send({ type: "COMPACTION_STARTED" });
+    actor.send({ request: request("held"), type: "ENQUEUE" });
+    clock.increment(60_000);
+    expect(dispatch).not.toHaveBeenCalled();
+
+    actor.send({ type: "COMPACTION_ENDED" });
+    expect(dispatch).not.toHaveBeenCalled();
+    clock.increment(1_999);
+    expect(dispatch).not.toHaveBeenCalled();
+    clock.increment(1);
+    expect(dispatch).toHaveBeenCalledOnce();
+    expect(dispatch).toHaveBeenCalledWith(request("held"));
+  });
+
+  it("lets a prompt queued behind compaction start before a held wake", () => {
+    const clock = new SimulatedClock();
+    const dispatch = vi.fn();
+    const actor = createActor(
+      createFollowUpMachine({
+        compactionGraceMs: 2_000,
+        dispatch: (item) => {
+          dispatch(item);
+        },
+        settled: () => {},
+        started: () => {},
+      }),
+      { clock, input: { sessionBusy: false } }
+    );
+    actor.start();
+
+    actor.send({ type: "COMPACTION_STARTED" });
+    actor.send({ request: request("held"), type: "ENQUEUE" });
+    actor.send({ type: "COMPACTION_ENDED" });
+    actor.send({ type: "SESSION_BUSY" });
+    clock.increment(10_000);
+    expect(dispatch).not.toHaveBeenCalled();
+
+    actor.send({ type: "SESSION_SETTLED" });
+    expect(dispatch).toHaveBeenCalledOnce();
+  });
+
+  it("treats a settled session as the end of a compaction it missed", () => {
+    const dispatch = vi.fn();
+    const actor = createActor(
+      createFollowUpMachine({
+        dispatch: (item) => {
+          dispatch(item);
+        },
+        settled: () => {},
+        started: () => {},
+      }),
+      { input: { sessionBusy: false } }
+    );
+    actor.start();
+
+    actor.send({ type: "COMPACTION_STARTED" });
+    actor.send({ request: request("held"), type: "ENQUEUE" });
+    expect(dispatch).not.toHaveBeenCalled();
+
+    actor.send({ type: "SESSION_SETTLED" });
+    expect(dispatch).toHaveBeenCalledOnce();
+    expect(actor.getSnapshot().context.compacting).toBe(false);
+  });
+
+  it("does not add a grace window after compaction inside an agent run", () => {
+    const dispatch = vi.fn();
+    const actor = createActor(
+      createFollowUpMachine({
+        dispatch: (item) => {
+          dispatch(item);
+        },
+        settled: () => {},
+        started: () => {},
+      }),
+      { input: { sessionBusy: true } }
+    );
+    actor.start();
+
+    actor.send({ request: request("queued"), type: "ENQUEUE" });
+    actor.send({ type: "COMPACTION_STARTED" });
+    actor.send({ type: "COMPACTION_ENDED" });
+    expect(dispatch).not.toHaveBeenCalled();
+
+    actor.send({ type: "SESSION_SETTLED" });
+    expect(dispatch).toHaveBeenCalledOnce();
+  });
+
   it("drops queued work whose owner is no longer live", () => {
     const dispatch = vi.fn();
     const actor = createActor(

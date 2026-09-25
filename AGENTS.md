@@ -26,13 +26,14 @@ Node is `24.18.0`. Use npm `11.16.0`; never Bun. `devEngines` fails hard on any 
 - `src/telemetry.ts` owns local JSONL usage events, condition hashes, and `/until-stats` summaries.
 - `extensions/pi-until.ts` owns Pi integration, receipts, UI status, reload and restart suspend/resume, and lifecycle cleanup.
 - `tests/fake-pi.ts` is the typed Pi fake. Use it instead of `as unknown as ExtensionAPI` in new tests.
-- Tests must exercise transitions, retries, per-check timeout, cancellation, descendant termination, wake behavior, session-wide delivery serialization, dispatch acknowledgement, recurring coalescing, explicit completion, failure, expiry, reload suspend/resume, and quit-then-relaunch resume.
+- Tests must exercise transitions, retries, per-check timeout, cancellation, descendant termination, wake behavior, session-wide delivery serialization, the compaction hold, dispatch acknowledgement, recurring coalescing, explicit completion, failure, expiry, reload suspend/resume, and quit-then-relaunch resume.
 
 ## Invariants
 
 - Exit code 0 is the only success condition.
 - Checks must not overlap for one watch.
 - Only one `pi-until` follow-up may be submitted to or running in Pi at a time. Correlate it through `details.followUpId`. Requests other extensions emit on `pi-until:follow-up` join the same queue as terminal follow-ups; `parseExternalFollowUpRequest` validates them, and `accept()` runs only after the request is queued. The extension listens only between `session_start` and `session_shutdown`.
+- No follow-up is dispatched between `session_before_compact` and the matching `session_compact` or `session_compact_failed`. After compaction outside an agent run, the arbiter waits a grace window before it dispatches. `agent_settled` also ends the hold, so a missed end event cannot strand the queue. `ctx.isIdle()` is false while Pi compacts, so it must not mark the session busy during a hold.
 - Starting a watch returns immediately.
 - Cancellation aborts the active check and its descendants on macOS and Linux.
 - Condition stdout and stderr are discarded, never added to receipts or model context.

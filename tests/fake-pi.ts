@@ -57,7 +57,11 @@ export type SessionEvent =
   | { type: "session_shutdown"; reason: ShutdownReason }
   | { type: "agent_start" }
   | { type: "agent_settled" }
+  | { type: "session_before_compact"; reason: CompactReason }
+  | { type: "session_compact"; reason: CompactReason }
+  | { type: "session_compact_failed"; reason: CompactReason }
   | MessageStartEvent;
+export type CompactReason = "manual" | "threshold" | "overflow";
 
 type SessionHandler = (
   event: SessionEvent,
@@ -151,6 +155,14 @@ export interface FakeExtension {
   readonly agentSettled: (ctx: ExtensionContext) => Promise<void>;
   readonly agentStart: (ctx: ExtensionContext) => Promise<void>;
   readonly appendEntry: ReturnType<typeof vi.fn>;
+  readonly compactionEnd: (
+    ctx: ExtensionContext,
+    options?: { failed?: boolean; reason?: CompactReason }
+  ) => Promise<void>;
+  readonly compactionStart: (
+    ctx: ExtensionContext,
+    reason?: CompactReason
+  ) => Promise<void>;
   readonly commands: Map<
     string,
     (args: string, ctx: ExtensionContext) => Promise<void>
@@ -273,6 +285,7 @@ export const loadExtension = (
   // registerCommand, registerTool, and sendMessage from ExtensionAPI.
   piUntil(pi as unknown as ExtensionAPI, {
     clock: options.clock,
+    compactionGraceMs: options.compactionGraceMs,
     followUpDispatchAckMs: options.followUpDispatchAckMs,
     telemetry: options.telemetry ?? {
       enabled: true,
@@ -314,6 +327,16 @@ export const loadExtension = (
     agentStart: (ctx) => emit({ type: "agent_start" }, ctx),
     appendEntry,
     commands,
+    compactionEnd: (ctx, { failed = false, reason = "manual" } = {}) =>
+      emit(
+        {
+          reason,
+          type: failed ? "session_compact_failed" : "session_compact",
+        },
+        ctx
+      ),
+    compactionStart: (ctx, reason = "manual") =>
+      emit({ reason, type: "session_before_compact" }, ctx),
     emitted,
     emitToExtension: (channel, data) => {
       for (const listener of listeners.get(channel) ?? []) listener(data);
