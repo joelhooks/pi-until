@@ -31,6 +31,7 @@ export type WatchEvent =
   | { readonly at: number; readonly type: "DELIVERY_STARTED" }
   | { readonly at: number; readonly type: "DELIVERY_SETTLED" }
   | { readonly failure: WatchFailure; readonly type: "DELIVERY_FAILED" }
+  | { readonly at: number; readonly type: "DELIVERY_SKIPPED" }
   | { readonly at: number; readonly type: "EXPIRE" };
 
 export type WatchTerminalState =
@@ -146,6 +147,21 @@ export function createWatchMachine(
             context,
             event.type === "DELIVERY_STARTED" ? event.at : now()
           ),
+      }),
+      // A recurring tick Pi never started counts as missed; the cadence goes on.
+      skipDelivery: assign({
+        facts: ({ context, event }) =>
+          context.definition.kind === "recurring"
+            ? advanceAfterTick(
+                {
+                  ...context.facts,
+                  deliveryPending: false,
+                  missedTicks: context.facts.missedTicks + 1,
+                },
+                context.definition.intervalMs,
+                event.type === "DELIVERY_SKIPPED" ? event.at : now()
+              )
+            : context.facts,
       }),
       settleDelivery: assign({
         facts: ({ context, event }) =>
@@ -305,6 +321,10 @@ export function createWatchMachine(
               DELIVERY_STARTED: {
                 actions: "startDelivery",
                 target: "awaitingSettlement",
+              },
+              DELIVERY_SKIPPED: {
+                actions: "skipDelivery",
+                target: "routing",
               },
             },
           },

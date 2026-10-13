@@ -13,6 +13,16 @@ const request = (name: string): FollowUpRequest => ({
   watchId: name,
 });
 
+const terminal = (name: string): FollowUpRequest => ({
+  content: `result ${name}`,
+  customType: "pi-until",
+  dedupeKey: `terminal:${name}`,
+  details: {},
+  id: `delivery:${name}`,
+  kind: "terminal",
+  watchId: name,
+});
+
 describe("session follow-up queue", () => {
   it("dispatches one follow-up at a time for the whole session", () => {
     const dispatch = vi.fn();
@@ -293,6 +303,7 @@ const harness = (sessionBusy: boolean) => {
     failed: vi.fn(),
     lost: vi.fn(),
     settled: vi.fn(),
+    skipped: vi.fn(),
     started: vi.fn(),
   };
   const actor = createActor(
@@ -309,6 +320,9 @@ const harness = (sessionBusy: boolean) => {
       },
       settled: (item) => {
         calls.settled(item);
+      },
+      skipped: (item) => {
+        calls.skipped(item);
       },
       started: (item) => {
         calls.started(item);
@@ -357,9 +371,9 @@ describe("a dispatch that never starts", () => {
     expect(calls.settled).toHaveBeenCalledTimes(2);
   });
 
-  it("fails a wake lost twice loudly and moves on", () => {
+  it("fails a one-shot wake lost twice loudly and moves on", () => {
     const { actor, calls, clock } = harness(false);
-    actor.send({ request: request("first"), type: "ENQUEUE" });
+    actor.send({ request: terminal("first"), type: "ENQUEUE" });
     actor.send({ request: request("second"), type: "ENQUEUE" });
     for (let attempt = 0; attempt < 2; attempt += 1) {
       clock.increment(5_000);
@@ -372,11 +386,26 @@ describe("a dispatch that never starts", () => {
       ["delivery:first", false],
     ]);
     expect(calls.failed).toHaveBeenCalledOnce();
+    expect(calls.skipped).not.toHaveBeenCalled();
     expect(dispatchedIds(calls.dispatch)).toEqual([
       "delivery:first",
       "delivery:first",
       "delivery:second",
     ]);
+  });
+
+  it("skips a recurring tick lost twice instead of failing its watch", () => {
+    const { actor, calls, clock } = harness(false);
+    actor.send({ request: request("first"), type: "ENQUEUE" });
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      clock.increment(5_000);
+      actor.send({ type: "SESSION_BUSY" });
+      actor.send({ type: "SESSION_SETTLED" });
+    }
+
+    expect(calls.skipped).toHaveBeenCalledOnce();
+    expect(calls.failed).not.toHaveBeenCalled();
+    expect(actor.getSnapshot().matches("ready")).toBe(true);
   });
 
   it("treats an unacknowledged wake on an idle session as lost after the cap", () => {

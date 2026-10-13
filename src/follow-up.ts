@@ -52,6 +52,8 @@ export interface FollowUpPorts {
   readonly lost?: (request: FollowUpRequest, retrying: boolean) => void;
   readonly now?: () => number;
   readonly settled: (request: FollowUpRequest) => void;
+  /** A recurring tick lost twice: skip it and keep the cadence. */
+  readonly skipped?: (request: FollowUpRequest) => void;
   readonly started: (request: FollowUpRequest) => void;
   readonly unacknowledged?: (request: FollowUpRequest) => void;
   readonly uncertainMaxMs?: number;
@@ -135,9 +137,16 @@ export const createFollowUpMachine = (ports: FollowUpPorts) =>
         if (active === undefined) return;
         const retrying = active.retried !== true;
         ports.lost?.(active, retrying);
-        if (!retrying) ports.failed?.(active);
+        if (retrying) return;
+        // A one-shot result has nowhere else to go, so its loss is a failure.
+        // A recurring tick is skipped: failing it would end the whole watch.
+        if (active.kind === "recurring") ports.skipped?.(active);
+        else ports.failed?.(active);
       },
-      // One retry at the head of the queue, then give up loudly.
+      // One retry at the head of the queue, then give up loudly. The retry
+      // keeps its request id. A late MESSAGE_STARTED for the lost copy can't
+      // match it, because Pi starts a queued follow-up before the run holding
+      // it settles, and only a settle (or the idle cap) declares it lost.
       requeueLost: assign(({ context }) => {
         const { active } = context;
         if (active === undefined || active.retried === true) {
@@ -231,6 +240,9 @@ export const createFollowUpMachine = (ports: FollowUpPorts) =>
         },
       },
       startUncertain: {
+        // The cap fires once. If the session is busy then, its run will
+        // settle (every run emits agent_settled), and SESSION_SETTLED below
+        // decides. Don't turn this into a polling loop.
         after: {
           uncertainMax: {
             actions: ["reportLost", "requeueLost"],

@@ -290,6 +290,15 @@ function listText(receipts: readonly WatchReceipt[]): string {
     .join("\n");
 }
 
+function lostFollowUpText(request: FollowUpRequest, retrying: boolean): string {
+  const subject = `pi-until follow-up ${request.id} for ${request.watchId}`;
+  if (retrying) return `${subject} never started; sending it again`;
+  if (request.kind === "recurring") {
+    return `${subject} was lost twice; skipping this tick`;
+  }
+  return `${subject} was lost twice; giving up on it`;
+}
+
 function receiptText(receipt: WatchReceipt): string {
   const lines = [
     `pi-until watch ${receipt.id}: ${receipt.status}`,
@@ -629,11 +638,14 @@ export default function piUntil(
           request.kind === "terminal" || watches.has(request.watchId),
         lost: (request, retrying) => {
           currentContext?.ui.notify(
-            retrying
-              ? `pi-until follow-up ${request.id} for ${request.watchId} never started; sending it again`
-              : `pi-until follow-up ${request.id} for ${request.watchId} was lost twice; giving up on it`,
+            lostFollowUpText(request, retrying),
             retrying ? "warning" : "error"
           );
+        },
+        skipped: (request) => {
+          watches
+            .get(request.watchId)
+            ?.actor.send({ at: clock.now(), type: "DELIVERY_SKIPPED" });
         },
         settled: (request) => {
           if (request.kind !== "recurring") return;
