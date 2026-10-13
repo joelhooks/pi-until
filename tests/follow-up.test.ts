@@ -285,3 +285,127 @@ describe("session follow-up queue", () => {
     expect(dispatch).toHaveBeenCalledWith(request("live"));
   });
 });
+
+const harness = (sessionBusy: boolean) => {
+  const clock = new SimulatedClock();
+  const calls = {
+    dispatch: vi.fn(),
+    failed: vi.fn(),
+    lost: vi.fn(),
+    settled: vi.fn(),
+    started: vi.fn(),
+  };
+  const actor = createActor(
+    createFollowUpMachine({
+      dispatch: (item) => {
+        calls.dispatch(item);
+      },
+      dispatchAckMs: 5_000,
+      failed: (item) => {
+        calls.failed(item);
+      },
+      lost: (item, retrying) => {
+        calls.lost(item.id, retrying);
+      },
+      settled: (item) => {
+        calls.settled(item);
+      },
+      started: (item) => {
+        calls.started(item);
+      },
+      uncertainMaxMs: 120_000,
+    }),
+    { clock, input: { sessionBusy } }
+  );
+  actor.start();
+  return { actor, calls, clock };
+};
+const dispatchedIds = (dispatch: ReturnType<typeof vi.fn>) =>
+  dispatch.mock.calls.map(([item]) => (item as FollowUpRequest).id);
+
+describe("a dispatch that never starts", () => {
+  it("retries a wake dispatched into a compaction, and later wakes still arrive", () => {
+    const { actor, calls, clock } = harness(false);
+    actor.send({ request: request("first"), type: "ENQUEUE" });
+    actor.send({ request: request("second"), type: "ENQUEUE" });
+    expect(dispatchedIds(calls.dispatch)).toEqual(["delivery:first"]);
+
+    // Pi compacts as the wake goes out, runs, and settles without starting it.
+    actor.send({ type: "COMPACTION_STARTED" });
+    clock.increment(5_000);
+    expect(actor.getSnapshot().matches("startUncertain")).toBe(true);
+    actor.send({ type: "SESSION_BUSY" });
+    actor.send({ type: "COMPACTION_ENDED" });
+    actor.send({ type: "SESSION_SETTLED" });
+
+    expect(calls.lost).toHaveBeenCalledWith("delivery:first", true);
+    expect(calls.failed).not.toHaveBeenCalled();
+    expect(dispatchedIds(calls.dispatch)).toEqual([
+      "delivery:first",
+      "delivery:first",
+    ]);
+
+    actor.send({ id: "delivery:first", type: "MESSAGE_STARTED" });
+    actor.send({ type: "SESSION_SETTLED" });
+    expect(dispatchedIds(calls.dispatch)).toEqual([
+      "delivery:first",
+      "delivery:first",
+      "delivery:second",
+    ]);
+    actor.send({ id: "delivery:second", type: "MESSAGE_STARTED" });
+    actor.send({ type: "SESSION_SETTLED" });
+    expect(calls.settled).toHaveBeenCalledTimes(2);
+  });
+
+  it("fails a wake lost twice loudly and moves on", () => {
+    const { actor, calls, clock } = harness(false);
+    actor.send({ request: request("first"), type: "ENQUEUE" });
+    actor.send({ request: request("second"), type: "ENQUEUE" });
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      clock.increment(5_000);
+      actor.send({ type: "SESSION_BUSY" });
+      actor.send({ type: "SESSION_SETTLED" });
+    }
+
+    expect(calls.lost.mock.calls).toEqual([
+      ["delivery:first", true],
+      ["delivery:first", false],
+    ]);
+    expect(calls.failed).toHaveBeenCalledOnce();
+    expect(dispatchedIds(calls.dispatch)).toEqual([
+      "delivery:first",
+      "delivery:first",
+      "delivery:second",
+    ]);
+  });
+
+  it("treats an unacknowledged wake on an idle session as lost after the cap", () => {
+    const { actor, calls, clock } = harness(false);
+    actor.send({ request: request("first"), type: "ENQUEUE" });
+    clock.increment(5_000);
+    clock.increment(119_999);
+    expect(calls.lost).not.toHaveBeenCalled();
+    clock.increment(1);
+
+    expect(calls.lost).toHaveBeenCalledWith("delivery:first", true);
+    expect(dispatchedIds(calls.dispatch)).toEqual([
+      "delivery:first",
+      "delivery:first",
+    ]);
+  });
+
+  it("keeps waiting while a run that may still start the wake is busy", () => {
+    const { actor, calls, clock } = harness(false);
+    actor.send({ request: request("first"), type: "ENQUEUE" });
+    clock.increment(5_000);
+    actor.send({ type: "SESSION_BUSY" });
+    clock.increment(600_000);
+    expect(calls.lost).not.toHaveBeenCalled();
+
+    // A late start inside that run is reconciled as before.
+    actor.send({ id: "delivery:first", type: "MESSAGE_STARTED" });
+    actor.send({ type: "SESSION_SETTLED" });
+    expect(calls.lost).not.toHaveBeenCalled();
+    expect(calls.settled).toHaveBeenCalledOnce();
+  });
+});
