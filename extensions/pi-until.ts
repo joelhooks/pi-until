@@ -290,6 +290,15 @@ function listText(receipts: readonly WatchReceipt[]): string {
     .join("\n");
 }
 
+function lostFollowUpText(request: FollowUpRequest, retrying: boolean): string {
+  const subject = `pi-until follow-up ${request.id} for ${request.watchId}`;
+  if (retrying) return `${subject} never started; sending it again`;
+  if (request.kind === "recurring") {
+    return `${subject} was lost twice; skipping this tick`;
+  }
+  return `${subject} was lost twice; giving up on it`;
+}
+
 function receiptText(receipt: WatchReceipt): string {
   const lines = [
     `pi-until watch ${receipt.id}: ${receipt.status}`,
@@ -331,6 +340,7 @@ export default function piUntil(
   let requestIndicatorRender: (() => void) | undefined;
   let shuttingDown = false;
   let followUps: FollowUpActor;
+  let arbiterState = { since: 0, value: "" };
 
   const clock = options.clock ?? systemClock;
   const shellRunner = createShellConditionRunner();
@@ -626,6 +636,17 @@ export default function piUntil(
         },
         isLive: (request) =>
           request.kind === "terminal" || watches.has(request.watchId),
+        lost: (request, retrying) => {
+          currentContext?.ui.notify(
+            lostFollowUpText(request, retrying),
+            retrying ? "warning" : "error"
+          );
+        },
+        skipped: (request) => {
+          watches
+            .get(request.watchId)
+            ?.actor.send({ at: clock.now(), type: "DELIVERY_SKIPPED" });
+        },
         settled: (request) => {
           if (request.kind !== "recurring") return;
           watches
@@ -649,10 +670,36 @@ export default function piUntil(
       }),
       { clock, input: { sessionBusy } }
     );
+    arbiterState = { since: clock.now(), value: "" };
+    actor.subscribe((snapshot) => {
+      const { value } = snapshot;
+      if (value !== arbiterState.value) {
+        arbiterState = { since: clock.now(), value };
+      }
+    });
     actor.start();
     return actor;
   };
   followUps = createSessionFollowUps(true);
+
+  /**
+   * One line on the session's follow-up arbiter, shown by `list` only when a
+   * wake is waiting or a dispatch is unacknowledged, so a stuck queue is
+   * visible without a debugger.
+   */
+  const arbiterLine = (): string | undefined => {
+    const snapshot = followUps.getSnapshot();
+    const queued = snapshot.context.queue.length;
+    const { value } = snapshot;
+    if (value !== "startUncertain" && queued === 0) return undefined;
+    const since = new Date(arbiterState.since).toISOString();
+    return `arbiter: ${value} since ${since}, ${queued} queued`;
+  };
+  const listWithArbiter = (receipts: readonly WatchReceipt[]): string => {
+    const line = arbiterLine();
+    const text = listText(receipts);
+    return line === undefined ? text : `${text}\n${line}`;
+  };
 
   /**
    * Tell the arbiter whether an agent run owns the session. Pi reports a
@@ -843,7 +890,7 @@ export default function piUntil(
 
   const showWatchPanel = async (ctx: ExtensionContext) => {
     if (ctx.mode !== "tui") {
-      ctx.ui.notify(listText(orderedReceipts()), "info");
+      ctx.ui.notify(listWithArbiter(orderedReceipts()), "info");
       return;
     }
 
@@ -943,7 +990,7 @@ export default function piUntil(
       if (command.action === "list") {
         const receipts = allReceipts();
         return {
-          content: [{ type: "text", text: listText(receipts) }],
+          content: [{ type: "text", text: listWithArbiter(receipts) }],
           details: { watches: receipts },
         };
       }

@@ -799,6 +799,76 @@ describe("pi-until extension", () => {
     );
   });
 
+  it("skips a recurring tick Pi drops twice and keeps the cadence", async () => {
+    const clock = new SimulatedClock();
+    const session = new FakeSession();
+    const extension = loadExtension(session, {
+      acknowledgeMessages: false,
+      clock,
+    });
+    live.push(extension);
+    const { ctx } = session.context({ idle: true });
+
+    const started = await extension.tool(
+      "repeat-lost",
+      {
+        action: "repeat",
+        immediate: true,
+        instruction: "Check again.",
+        intervalSeconds: 60,
+        quickRef: "lost tick test",
+        timeoutSeconds: 600,
+      },
+      new AbortController().signal,
+      undefined,
+      ctx
+    );
+    const { id } = receiptOf(started);
+    await extension.agentSettled(ctx);
+    clock.increment(0);
+    await vi.waitFor(() => {
+      expect(extension.messages).toHaveLength(1);
+    });
+
+    // Pi drops the dispatch: a run starts and settles without starting it.
+    const dropRun = async () => {
+      clock.increment(5_000);
+      await extension.agentStart(ctx);
+      await extension.agentSettled(ctx);
+      clock.increment(0);
+    };
+    await dropRun();
+    await vi.waitFor(() => {
+      expect(extension.messages).toHaveLength(2);
+    });
+    await dropRun();
+    expect(extension.messages).toHaveLength(2);
+
+    const status = await extension.tool(
+      "repeat-lost-status",
+      { action: "status", id },
+      new AbortController().signal,
+      undefined,
+      ctx
+    );
+    expect(receiptOf(status).status).toBe("running");
+    expect(receiptOf(status).deliveries).toBe(0);
+    expect(receiptOf(status).missedTicks).toBeGreaterThanOrEqual(1);
+
+    clock.increment(60_000);
+    await vi.waitFor(() => {
+      expect(extension.messages).toHaveLength(3);
+    });
+
+    await extension.tool(
+      "repeat-lost-complete",
+      { action: "complete", id },
+      new AbortController().signal,
+      undefined,
+      ctx
+    );
+  });
+
   it("uses an optional shell gate without treating it as the action", async () => {
     const clock = new SimulatedClock();
     const directory = mkdtempSync(join(tmpdir(), "pi-until-repeat-gate-"));

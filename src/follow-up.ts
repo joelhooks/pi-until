@@ -3,6 +3,8 @@ import { assign, setup } from "xstate";
 interface FollowUpRequestBase {
   readonly dedupeKey: string;
   readonly id: string;
+  /** Set when the first dispatch was lost and this is the one retry. */
+  readonly retried?: boolean;
   readonly watchId: string;
 }
 
@@ -46,13 +48,26 @@ export interface FollowUpPorts {
   readonly dispatchAckMs?: number;
   readonly failed?: (request: FollowUpRequest) => void;
   readonly isLive?: (request: FollowUpRequest) => boolean;
+  /** A dispatched follow-up never started; `retrying` says whether it goes again. */
+  readonly lost?: (request: FollowUpRequest, retrying: boolean) => void;
   readonly now?: () => number;
   readonly settled: (request: FollowUpRequest) => void;
+  /** A recurring tick lost twice: skip it and keep the cadence. */
+  readonly skipped?: (request: FollowUpRequest) => void;
   readonly started: (request: FollowUpRequest) => void;
   readonly unacknowledged?: (request: FollowUpRequest) => void;
+  readonly uncertainMaxMs?: number;
 }
 
 const DEFAULT_DISPATCH_ACK_MS = 5_000;
+/**
+ * Pi starts an accepted follow-up before the run that holds it settles. So a
+ * session that settles while a dispatch is still unacknowledged has dropped
+ * it, for example when the dispatch raced a compaction. An idle session may
+ * never settle again, so an unacknowledged dispatch on an idle session is
+ * also treated as lost after this long.
+ */
+const DEFAULT_UNCERTAIN_MAX_MS = 120_000;
 /**
  * After compaction outside an agent run, Pi usually starts the prompt that
  * waited behind it: a queued operator message, or the prompt whose
@@ -117,6 +132,31 @@ export const createFollowUpMachine = (ports: FollowUpPorts) =>
       reportStarted: ({ context }) => {
         if (context.active !== undefined) ports.started(context.active);
       },
+      reportLost: ({ context }) => {
+        const { active } = context;
+        if (active === undefined) return;
+        const retrying = active.retried !== true;
+        ports.lost?.(active, retrying);
+        if (retrying) return;
+        // A one-shot result has nowhere else to go, so its loss is a failure.
+        // A recurring tick is skipped: failing it would end the whole watch.
+        if (active.kind === "recurring") ports.skipped?.(active);
+        else ports.failed?.(active);
+      },
+      // One retry at the head of the queue, then give up loudly. The retry
+      // keeps its request id. A late MESSAGE_STARTED for the lost copy can't
+      // match it, because Pi starts a queued follow-up before the run holding
+      // it settles, and only a settle (or the idle cap) declares it lost.
+      requeueLost: assign(({ context }) => {
+        const { active } = context;
+        if (active === undefined || active.retried === true) {
+          return { active: undefined };
+        }
+        return {
+          active: undefined,
+          queue: [{ ...active, retried: true }, ...context.queue],
+        };
+      }),
       reportUnacknowledged: ({ context }) => {
         if (context.active !== undefined) {
           ports.unacknowledged?.(context.active);
@@ -126,6 +166,7 @@ export const createFollowUpMachine = (ports: FollowUpPorts) =>
     delays: {
       compactionGrace: ports.compactionGraceMs ?? DEFAULT_COMPACTION_GRACE_MS,
       dispatchAck: ports.dispatchAckMs ?? DEFAULT_DISPATCH_ACK_MS,
+      uncertainMax: ports.uncertainMaxMs ?? DEFAULT_UNCERTAIN_MAX_MS,
     },
     guards: {
       hasQueued: ({ context }) => context.queue.length > 0,
@@ -135,6 +176,7 @@ export const createFollowUpMachine = (ports: FollowUpPorts) =>
         return head !== undefined && !(ports.isLive?.(head) ?? true);
       },
       isSessionBusy: ({ context }) => context.sessionBusy,
+      isSessionIdle: ({ context }) => !context.sessionBusy,
       matchesActive: ({ context, event }) =>
         (event.type === "DISPATCH_FAILED" ||
           event.type === "MESSAGE_STARTED") &&
@@ -198,6 +240,16 @@ export const createFollowUpMachine = (ports: FollowUpPorts) =>
         },
       },
       startUncertain: {
+        // The cap fires once. If the session is busy then, its run will
+        // settle (every run emits agent_settled), and SESSION_SETTLED below
+        // decides. Don't turn this into a polling loop.
+        after: {
+          uncertainMax: {
+            actions: ["reportLost", "requeueLost"],
+            guard: "isSessionIdle",
+            target: "routing",
+          },
+        },
         on: {
           DISPATCH_FAILED: {
             actions: ["reportFailure", "clearActive"],
@@ -211,6 +263,10 @@ export const createFollowUpMachine = (ports: FollowUpPorts) =>
             target: "awaitingSettlement",
           },
           SESSION_BUSY: { actions: "markSessionBusy" },
+          SESSION_SETTLED: {
+            actions: ["markSessionIdle", "reportLost", "requeueLost"],
+            target: "routing",
+          },
         },
       },
       compacting: {
