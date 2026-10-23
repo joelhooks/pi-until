@@ -10,7 +10,7 @@ npm run check
 npm run pack:dry
 ```
 
-Node is `24.18.0`. Use npm `11.16.0`; never Bun. `devEngines` fails hard on any other npm; if the machine has a newer npm, run the binaries from `node_modules/.bin` directly (`tsc --noEmit`, `ultracite check`, `oxfmt --check`, `vitest run`) and say so. Dependencies are exact-pinned.
+Node is `24.18.0`. Development pins npm `11.16.0` via `packageManager`; `devEngines` enforces npm `^11.16.0`, so newer 11.x installs also work. Never Bun. Dependencies are exact-pinned.
 
 ## Architecture
 
