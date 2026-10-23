@@ -895,14 +895,33 @@ describe("pi-until extension", () => {
       ctx
     );
     const { id } = receiptOf(started);
-    await sleep(10);
+    // Wait for the immediate gate check to record its miss. Writing the file
+    // or advancing the clock while that shell is still running leaves two
+    // shell runs inside the delivery wait, which overruns it under load.
+    await vi.waitFor(
+      async () => {
+        const status = await extension.tool(
+          "repeat-gated-first-check",
+          { action: "status", id },
+          new AbortController().signal,
+          undefined,
+          ctx
+        );
+        expect(status.details).toMatchObject({ lastExitCode: 1 });
+      },
+      { timeout: 10_000 }
+    );
     expect(extension.messages).toHaveLength(0);
 
     writeFileSync(readyFile, "ready\n", "utf-8");
     clock.increment(1_000);
-    await vi.waitFor(() => {
-      expect(extension.messages).toHaveLength(1);
-    });
+    // A ceiling for one shell run plus delivery on a loaded host, not a delay.
+    await vi.waitFor(
+      () => {
+        expect(extension.messages).toHaveLength(1);
+      },
+      { timeout: 10_000 }
+    );
     expect(extension.messages[0]?.message.content).toContain(
       "Inspect the gated work."
     );
