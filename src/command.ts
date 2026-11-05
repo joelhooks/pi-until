@@ -62,6 +62,12 @@ export const untilParameters = Type.Object(
         description: "For repeat: wake after this turn before fixed cadence.",
       })
     ),
+    jitter: Type.Optional(
+      Type.Boolean({
+        description:
+          "Defaults to true: spread checks and ticks by ±10% of the interval, and give repeats a stable per-watch phase. Set false only when exact times matter.",
+      })
+    ),
     instruction: Type.Optional(
       Type.String({ minLength: 1, maxLength: 20_000 })
     ),
@@ -96,6 +102,7 @@ const bridgeArgumentsSchema = Type.Object(
       Type.Union([Type.Array(contextRefSchema), Type.String()])
     ),
     immediate: Type.Optional(Type.Union([Type.Boolean(), Type.String()])),
+    jitter: Type.Optional(Type.Union([Type.Boolean(), Type.String()])),
     intervalSeconds: Type.Optional(Type.Union([Type.Number(), Type.String()])),
     timeoutSeconds: Type.Optional(Type.Union([Type.Number(), Type.String()])),
   },
@@ -131,6 +138,8 @@ export const prepareUntilArguments: PrepareUntilArguments = (input) => {
   prepared.timeoutSeconds = coerceFiniteNumber(prepared.timeoutSeconds);
   if (prepared.immediate === "true") prepared.immediate = true;
   if (prepared.immediate === "false") prepared.immediate = false;
+  if (prepared.jitter === "true") prepared.jitter = true;
+  if (prepared.jitter === "false") prepared.jitter = false;
   if (Value.Check(stringSchema, prepared.contextRefs)) {
     try {
       const parsed: unknown = JSON.parse(prepared.contextRefs);
@@ -210,6 +219,10 @@ const idFrom = (params: UntilParameters): string => {
 const intervalFrom = (params: UntilParameters): number =>
   (params.intervalSeconds ?? DEFAULT_INTERVAL_SECONDS) * 1_000;
 
+/** Record only the opt-out, so a definition without the field means jittered. */
+const jitterFrom = (params: UntilParameters): { readonly jitter?: false } =>
+  params.jitter === false ? { jitter: false } : {};
+
 const startCommandFrom = (
   params: UntilParameters,
   context: CommandContext
@@ -221,6 +234,7 @@ const startCommandFrom = (
   const base: UntilDefinition = {
     gate,
     intervalMs: intervalFrom(params),
+    ...jitterFrom(params),
     kind: "until",
     label: params.label?.trim() || "condition",
     wake: params.wake ?? "agent",
@@ -283,6 +297,7 @@ const recurringCommandFrom = (
     first: params.immediate === true ? "now" : "afterInterval",
     gate: gateFrom(params, context, false),
     intervalMs: intervalFrom(params),
+    ...jitterFrom(params),
     kind: "recurring",
     label: params.label?.trim() || "recurring follow-up",
     snapshot,

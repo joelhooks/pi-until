@@ -72,6 +72,30 @@ describe("until tool parameters", () => {
     expect(Object.isFrozen(command.definition.snapshot.contextRefs)).toBe(true);
   });
 
+  it("records only the jitter opt-out on the definition", () => {
+    const optedOut = parseUntilCommand(
+      prepareUntilArguments({
+        action: "start",
+        condition: "test -f ready",
+        jitter: "false",
+      }),
+      context
+    );
+    expect(optedOut).toMatchObject({ definition: { jitter: false } });
+
+    const repeat = {
+      action: "repeat",
+      instruction: "Inspect the release.",
+      quickRef: "Release 42",
+      timeoutSeconds: 600,
+    } as const;
+    for (const params of [repeat, { ...repeat, jitter: true }]) {
+      const command = parseUntilCommand(params, context);
+      if (command.action !== "repeat") throw new Error("expected repeat");
+      expect("jitter" in command.definition).toBe(false);
+    }
+  });
+
   it("rejects values that bypass the public tool boundary", () => {
     expect(() =>
       parseUntilCommand(

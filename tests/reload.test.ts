@@ -72,7 +72,7 @@ const offsetClock = () => {
 const startRecurring = async (
   extension: FakeExtension,
   session: FakeSession,
-  extra: { timeoutSeconds?: number } = {}
+  extra: { jitter?: boolean; timeoutSeconds?: number } = {}
 ) => {
   const { ctx } = session.context({ idle: true });
   const result = await extension.tool(
@@ -174,7 +174,9 @@ describe("pi-until across a quit and relaunch", () => {
       readyFile,
       { timeoutSeconds: 3_600 }
     );
-    const recurring = await startRecurring(first, session);
+    const recurring = await startRecurring(first, session, {
+      jitter: false,
+    });
     await sleep(30);
     await first.shutdown("quit");
 
@@ -558,6 +560,30 @@ describe("pi-until across a quit and relaunch", () => {
 });
 
 describe("pi-until across /reload", () => {
+  it("keeps a jittered recurrence's due time across reload", async () => {
+    const session = new FakeSession();
+    const first = loadExtension(session);
+    live.push(first);
+    const started = await startRecurring(first, session);
+    const startedDue = Date.parse(started.nextDueAt ?? "");
+    const startedAt = Date.parse(started.startedAt);
+    // The first wake carries the watch's phase: up to 20% past one interval.
+    expect(startedDue - startedAt).toBeGreaterThanOrEqual(60_000);
+    expect(startedDue - startedAt).toBeLessThan(72_000);
+
+    await first.shutdown("reload");
+    live.pop();
+    const second = loadExtension(session);
+    live.push(second);
+    const { ctx } = session.context({ idle: true });
+    await second.sessionStart("reload", ctx);
+
+    expect(await statusOf(second, started.id, ctx)).toMatchObject({
+      nextDueAt: started.nextDueAt,
+      status: "running",
+    });
+  });
+
   it("suspends on reload, resumes in the new instance, and wakes the agent once", async () => {
     const directory = mkdtempSync(join(tmpdir(), "pi-until-reload-"));
     tempDirectories.push(directory);

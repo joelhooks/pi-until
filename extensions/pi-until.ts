@@ -26,6 +26,7 @@ import { planCompletion } from "../src/completion.ts";
 import {
   advanceAfterTick,
   gateOf,
+  dueAt,
   initialFacts,
   wakeOf,
 } from "../src/domain.ts";
@@ -41,6 +42,8 @@ import {
 } from "../src/follow-up.ts";
 import { renderWatchIndicator, renderWatchPanel } from "../src/indicator.ts";
 import type { WatchDisplay, WatchPhase } from "../src/indicator.ts";
+import { systemJitter } from "../src/jitter.ts";
+import type { UntilJitter } from "../src/jitter.ts";
 import { createWatchMachine } from "../src/machine.ts";
 import type { WatchTerminalState } from "../src/machine.ts";
 import {
@@ -113,6 +116,7 @@ export interface PiUntilOptions {
   readonly clock?: UntilClock;
   readonly compactionGraceMs?: number;
   readonly followUpDispatchAckMs?: number;
+  readonly jitter?: UntilJitter;
   readonly telemetry?: TelemetrySink;
 }
 
@@ -192,7 +196,7 @@ function defectFrom(snapshot: WatchSnapshot): string | undefined {
     : String(snapshot.error);
 }
 
-function toReceipt(record: WatchRecord): WatchReceipt {
+function toReceipt(record: WatchRecord, jitter: UntilJitter): WatchReceipt {
   const snapshot = record.actor.getSnapshot();
   const { definition, facts } = snapshot.context;
   const status = receiptStatus(record);
@@ -224,7 +228,7 @@ function toReceipt(record: WatchRecord): WatchReceipt {
     missedTicks: facts.missedTicks,
     nextDueAt:
       status === "running"
-        ? new Date(facts.nextDueAt).toISOString()
+        ? new Date(dueAt(definition, facts, jitter)).toISOString()
         : undefined,
     quickRef: recurring?.snapshot.quickRef,
     reloads: facts.reloads,
@@ -245,7 +249,10 @@ function watchPhase(record: WatchRecord): WatchPhase | undefined {
   return "sleeping";
 }
 
-function toWatchDisplay(record: WatchRecord): WatchDisplay {
+function toWatchDisplay(
+  record: WatchRecord,
+  jitter: UntilJitter
+): WatchDisplay {
   const { definition, facts } = record.actor.getSnapshot().context;
   return {
     attempts: facts.attempts,
@@ -255,7 +262,7 @@ function toWatchDisplay(record: WatchRecord): WatchDisplay {
     kind: definition.kind,
     label: definition.label,
     missedTicks: facts.missedTicks,
-    nextDueAt: facts.nextDueAt,
+    nextDueAt: dueAt(definition, facts, jitter),
     phase: watchPhase(record),
     startedAt: facts.startedAt,
     status: receiptStatus(record),
@@ -344,7 +351,8 @@ export default function piUntil(
 
   const clock = options.clock ?? systemClock;
   const shellRunner = createShellConditionRunner();
-  const machine = createWatchMachine(shellRunner.run, clock);
+  const jitter = options.jitter ?? systemJitter;
+  const machine = createWatchMachine(shellRunner.run, clock, jitter);
   const telemetry =
     options.telemetry ??
     createTelemetrySink({
@@ -357,7 +365,7 @@ export default function piUntil(
   const activeWatches = () => [...watches.values()];
 
   const allReceipts = () => [
-    ...activeWatches().map(toReceipt),
+    ...activeWatches().map((record) => toReceipt(record, jitter)),
     ...terminalReceipts,
   ];
 
@@ -376,7 +384,7 @@ export default function piUntil(
 
   const orderedWatchDisplays = () =>
     [
-      ...activeWatches().map(toWatchDisplay),
+      ...activeWatches().map((record) => toWatchDisplay(record, jitter)),
       ...terminalReceipts.map(displayFromReceipt),
     ].sort((left, right) => {
       const runningDifference =
@@ -389,7 +397,9 @@ export default function piUntil(
   // list actually differs from the last one emitted.
   let lastEmittedWatches: string | undefined;
   const emitWatches = () => {
-    const display = activeWatches().map(toWatchDisplay);
+    const display = activeWatches().map((record) =>
+      toWatchDisplay(record, jitter)
+    );
     const serialized = JSON.stringify(display);
     if (serialized === lastEmittedWatches) return;
     lastEmittedWatches = serialized;
@@ -427,7 +437,7 @@ export default function piUntil(
           },
           render(width: number) {
             return renderWatchIndicator(
-              activeWatches().map(toWatchDisplay),
+              activeWatches().map((record) => toWatchDisplay(record, jitter)),
               clock.now(),
               width,
               theme
@@ -467,7 +477,7 @@ export default function piUntil(
 
     const finishedAt = facts.finishedAt ?? clock.now();
     const receipt = {
-      ...toReceipt(record),
+      ...toReceipt(record, jitter),
       finishedAt: new Date(finishedAt).toISOString(),
     } satisfies WatchReceipt;
     watches.delete(facts.id);
@@ -582,12 +592,13 @@ export default function piUntil(
         definition.intervalMs,
         deliveredAt
       );
+      const plannedDueAt = dueAt(definition, plannedFacts, jitter);
       const receipt = {
-        ...toReceipt(record),
+        ...toReceipt(record, jitter),
         deliveries: plannedFacts.deliveries,
         deliveryPending: false,
         missedTicks: plannedFacts.missedTicks,
-        nextDueAt: new Date(plannedFacts.nextDueAt).toISOString(),
+        nextDueAt: new Date(plannedDueAt).toISOString(),
       } satisfies WatchReceipt;
       pi.sendMessage(
         {
@@ -597,7 +608,7 @@ export default function piUntil(
             expiresAt: definition.expiresAt,
             id: facts.id,
             missedTicks: plannedFacts.missedTicks,
-            nextDueAt: plannedFacts.nextDueAt,
+            nextDueAt: plannedDueAt,
             reloads: facts.reloads,
           }),
           customType: "pi-until-recurring",
@@ -744,10 +755,10 @@ export default function piUntil(
     const { definition, startedAt } = command;
     const input: WatchActorInput = {
       definition,
-      facts: initialFacts(definition, id, startedAt),
+      facts: initialFacts(definition, id, startedAt, jitter),
     };
     const record = runWatch(input);
-    const receipt = toReceipt(record);
+    const receipt = toReceipt(record, jitter);
     pi.appendEntry("pi-until-started", {
       receipt,
       snapshot:
@@ -959,7 +970,7 @@ export default function piUntil(
 
   pi.registerTool({
     description:
-      "Start session-scoped shell-condition watches or recurring agent follow-ups. One session arbiter serializes every pi-until wake and holds wakes while Pi compacts. Recurrences use fixed cadence, immutable task snapshots, and explicit completion. Watches come back after /reload or after Pi quits and reopens the same session. Reading a finished watch with status or cancel drops its queued wake, never an already dispatched wake.",
+      "Start session-scoped shell-condition watches or recurring agent follow-ups. One session arbiter serializes every pi-until wake and holds wakes while Pi compacts. Recurrences use fixed cadence with ±10% jitter and a stable per-watch phase, immutable task snapshots, and explicit completion. Watches come back after /reload or after Pi quits and reopens the same session. Reading a finished watch with status or cancel drops its queued wake, never an already dispatched wake.",
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       currentContext = ctx;
       const command = parseCommand(params, ctx);
@@ -970,12 +981,13 @@ export default function piUntil(
       });
       if (command.action === "start" || command.action === "repeat") {
         const record = startWatch(command, ctx);
-        const receipt = toReceipt(record);
+        const receipt = toReceipt(record, jitter);
         const { definition } = record.actor.getSnapshot().context;
+        const every = definition.jitter === false ? "every" : "about every";
         const timing =
           definition.kind === "until"
-            ? `It will check immediately, then every ${definition.intervalMs / 1_000}s.`
-            : `Its first wake is ${definition.first === "now" ? "after this turn" : receipt.nextDueAt}, then every ${definition.intervalMs / 1_000}s until ${receipt.expiresAt}.`;
+            ? `It will check immediately, then ${every} ${definition.intervalMs / 1_000}s.`
+            : `Its first wake is ${definition.first === "now" ? "after this turn" : receipt.nextDueAt}, then ${every} ${definition.intervalMs / 1_000}s until ${receipt.expiresAt}.`;
         return {
           content: [
             {
@@ -1021,7 +1033,7 @@ export default function piUntil(
         if (receiptStatus(record) === "running") {
           record.actor.send({ type: "COMPLETE" });
         }
-        const receipt = toReceipt(record);
+        const receipt = toReceipt(record, jitter);
         return {
           content: [{ type: "text", text: receiptText(receipt) }],
           details: receipt,
@@ -1032,14 +1044,14 @@ export default function piUntil(
         if (receiptStatus(record) === "running") {
           record.actor.send({ type: "CANCEL" });
         }
-        const receipt = toReceipt(record);
+        const receipt = toReceipt(record, jitter);
         return {
           content: [{ type: "text", text: receiptText(receipt) }],
           details: receipt,
         };
       }
 
-      const receipt = toReceipt(record);
+      const receipt = toReceipt(record, jitter);
       return {
         content: [{ type: "text", text: receiptText(receipt) }],
         details: receipt,
@@ -1053,7 +1065,7 @@ export default function piUntil(
       "Use until action=start when work should resume after a side-effect-free shell condition exits 0. Do not block bash with polling or sleep loops.",
       "Write conditions that fail closed: exit 0 must prove fresh, positive evidence from this run, such as grep -qx MARKER file, not the absence of a process or leftover output. Never arm a watch in the same tool batch that writes, moves, or resets what its condition reads; the first check runs immediately.",
       "Before re-arming a result watch, persist consumed item IDs or a source cursor and check that the new predicate rejects handled results. A delayed wake may be stale: act only on unhandled work, and do not replace a watch for a finished task.",
-      "Use until action=repeat when the same agent must do work on a fixed cadence. Supply timeoutSeconds, instruction, and quickRef.",
+      "Use until action=repeat when the same agent must do work on a fixed cadence with ±10% jitter and a stable per-watch phase. Supply timeoutSeconds, instruction, and quickRef. Pass jitter=false only when exact times matter.",
       "Treat contextRefs as opaque pointers. Read a target only when the recurring instruction requires it.",
       "Keep recurring snapshots short and secret-free. The instruction, quickRef, and contextRefs are immutable private session data.",
       "Call until action=complete only when the recurring goal is achieved. A finished agent turn is not completion.",
@@ -1087,7 +1099,7 @@ export default function piUntil(
         const command = parseCommand({ action: "start", condition: args }, ctx);
         if (command.action !== "start") return;
         const record = startWatch(command, ctx);
-        const receipt = toReceipt(record);
+        const receipt = toReceipt(record, jitter);
         ctx.ui.notify(`Watching ${receipt.label} as ${receipt.id}`, "info");
       } catch (error) {
         ctx.ui.notify(
