@@ -5,6 +5,7 @@ import type { UntilClock } from "./clock.ts";
 import {
   advanceAfterTick,
   coalescePastDue,
+  dueAt,
   expiresAtOf,
   gateOf,
 } from "./domain.ts";
@@ -16,6 +17,8 @@ import type {
   WatchFacts,
   WatchFailure,
 } from "./domain.ts";
+import { systemJitter } from "./jitter.ts";
+import type { UntilJitter } from "./jitter.ts";
 
 export interface UntilCheckInput {
   readonly command: string;
@@ -98,9 +101,12 @@ const afterDeliveryRequested = (
 
 export function createWatchMachine(
   runCheck: RunUntilCheck,
-  clock: UntilClock = systemClock
+  clock: UntilClock = systemClock,
+  jitter: UntilJitter = systemJitter
 ) {
   const now = () => clock.now();
+  const due = (context: WatchContext) =>
+    dueAt(context.definition, context.facts, jitter);
   return setup({
     actions: {
       coalesceAtExpiry: assign({
@@ -195,20 +201,19 @@ export function createWatchMachine(
       ),
     },
     delays: {
-      untilDue: ({ context }) => Math.max(0, context.facts.nextDueAt - now()),
+      untilDue: ({ context }) => Math.max(0, due(context) - now()),
     },
     guards: {
       dueWithoutGate: ({ context }) =>
         context.definition.kind === "recurring" &&
         gateOf(context.definition) === undefined &&
-        context.facts.nextDueAt <= now(),
+        due(context) <= now(),
       expired: ({ context }) => {
         const expiresAt = expiresAtOf(context.definition);
         return expiresAt !== undefined && expiresAt <= now();
       },
       hasDueGate: ({ context }) =>
-        gateOf(context.definition) !== undefined &&
-        context.facts.nextDueAt <= now(),
+        gateOf(context.definition) !== undefined && due(context) <= now(),
       isRecurring: ({ context }) => context.definition.kind === "recurring",
     },
     types: {

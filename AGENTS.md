@@ -15,8 +15,9 @@ Node is `24.18.0`. Use npm `11.16.0`; never Bun. `devEngines` fails hard on any 
 ## Architecture
 
 - `src/command.ts` owns the provider-compatible tool schema, bridge normalization, and one-time parsing into internal commands.
-- `src/domain.ts` owns immutable watch definitions, facts, failures, and fixed-cadence math.
+- `src/domain.ts` owns immutable watch definitions, facts, failures, fixed-cadence math, and the per-watch phase and per-tick jitter laid on top of the un-jittered `nextDueAt` anchor.
 - `src/clock.ts` owns the injectable clock port used by machines and tests.
+- `src/jitter.ts` owns the injectable jitter source. It maps a key to a stable value, so a resumed watch recomputes its due time without persisting it.
 - `src/machine.ts` owns the XState v5 shell and recurring watch lifecycle.
 - `src/follow-up.ts` owns the XState v5 session delivery queue, message acknowledgement, settlement, deduplication, and stale-work rejection.
 - `src/packet.ts` owns recurring Markdown wake and expiry packets.

@@ -23,7 +23,7 @@ into a session-owned watch that leaves Pi free for other work.
 | Need | Use |
 | --- | --- |
 | Resume when a cheap fact becomes true | `action: "start"` |
-| Ask the same agent to do work on a fixed cadence | `action: "repeat"` |
+| Ask the same agent to do work on a fixed cadence with ±10% jitter and a stable per-watch phase | `action: "repeat"` |
 | Survive Pi exit, session replacement, or reboot | Use a durable workload scheduler instead |
 
 A shell condition is a predicate, not a job. If the command changes the system, it does not belong in `pi-until`.
@@ -58,10 +58,11 @@ A `start` call accepts:
 - `condition` — side-effect-free shell command; exit 0 means true.
 - `label` — short safe name.
 - `cwd` — working directory; defaults to Pi's current directory.
-- `intervalSeconds` — polling interval; defaults to 30.
+- `intervalSeconds` — polling interval; defaults to 30. After the immediate first check, each check runs within ±10% of one interval after the last.
 - `checkTimeoutSeconds` — limit for one check; defaults to 30.
 - `timeoutSeconds` — optional overall deadline.
 - `wake` — `agent` or `notify`; defaults to `agent`.
+- `jitter` — `false` to check on exact intervals; defaults to `true`.
 
 Example intent:
 
@@ -89,9 +90,10 @@ A `repeat` call accepts:
 - `instruction` — the task given to the agent on every wake.
 - `quickRef` — a short human reference for the recurring task.
 - `contextRefs` — optional `{ label, target }` pointers. The extension passes them through without resolving them.
-- `intervalSeconds` — the fixed cadence.
+- `intervalSeconds` — the fixed cadence, with ±10% jitter and a stable per-watch phase.
 - `timeoutSeconds` — required absolute lifetime of the recurrence.
-- `immediate` — `true` to wake after the current agent turn; otherwise the first wake follows one interval.
+- `immediate` — `true` to wake after the current agent turn; otherwise the first wake follows one interval plus the watch's phase.
+- `jitter` — `false` for exact cadence with no phase or jitter; defaults to `true`.
 - `condition` — optional side-effect-free shell gate. Exit 0 permits that tick to wake the agent. It never completes the recurrence.
 - `label` — optional safe display and telemetry label. It defaults to `recurring follow-up`, never to task text.
 - `cwd` and `checkTimeoutSeconds` — settings for the optional gate.
@@ -111,7 +113,9 @@ until({
 
 The extension snapshots `instruction`, `quickRef`, `contextRefs`, and the origin session entry at start. Change the intent by completing or cancelling the old recurrence and starting another one.
 
-Cadence stays anchored to the original schedule. One session-wide arbiter sends only one `pi-until` follow-up into Pi at a time. It waits for Pi to start that exact message and for the resulting agent turn to settle before it sends another. Missed ticks increase `missedTicks` instead of stacking agent turns. If acknowledgement takes more than five seconds, the arbiter pauses and warns instead of guessing that Pi discarded an accepted message. A late `message_start` resumes the lifecycle safely. A synchronous dispatch rejection fails the recurring watch.
+Cadence stays anchored to the original schedule. Watches started together would otherwise stay aligned and fire on the same second, so the schedule spreads them two ways. Each recurrence gets a stable phase from its watch ID, between 0 and 20% of the interval, added to the first wake: `start + interval + phase`. Every later tick then moves by up to ±10% of the interval around its anchor. Jitter never accumulates: the anchor advances by exactly one interval, missed-tick counts use the anchor, and a resumed watch recomputes the same due time. `immediate: true` still wakes after the current turn. `jitter: false` restores exact times. Watches saved before jitter existed resume with jitter on.
+
+One session-wide arbiter sends only one `pi-until` follow-up into Pi at a time. It waits for Pi to start that exact message and for the resulting agent turn to settle before it sends another. Missed ticks increase `missedTicks` instead of stacking agent turns. If acknowledgement takes more than five seconds, the arbiter pauses and warns instead of guessing that Pi discarded an accepted message. A late `message_start` resumes the lifecycle safely. A synchronous dispatch rejection fails the recurring watch.
 
 The arbiter never sends a follow-up while Pi compacts the session outside an agent run, such as a manual `/compact`. Pi starts an extension-triggered turn even while it compacts, and that turn races the summarizer on the uncompacted context. Checks keep running during compaction; a wake that comes due waits. When compaction ends or fails, the arbiter waits five more seconds so a prompt queued behind compaction starts first, then delivers. Compaction inside an agent run needs no hold because the run already owns the session.
 

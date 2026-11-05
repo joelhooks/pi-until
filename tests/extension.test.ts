@@ -583,6 +583,7 @@ describe("pi-until extension", () => {
         immediate: true,
         instruction: "This delivery starts late.",
         intervalSeconds: 60,
+        jitter: false,
         quickRef: "delayed delivery",
         timeoutSeconds: 600,
       },
@@ -914,7 +915,8 @@ describe("pi-until extension", () => {
     expect(extension.messages).toHaveLength(0);
 
     writeFileSync(readyFile, "ready\n", "utf-8");
-    clock.increment(1_000);
+    // One interval plus the largest tick jitter.
+    clock.increment(1_100);
     // A ceiling for one shell run plus delivery on a loaded host, not a delay.
     await vi.waitFor(
       () => {

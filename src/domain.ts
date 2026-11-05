@@ -1,6 +1,9 @@
 import { Type } from "typebox";
 import type { Static } from "typebox";
 
+import { systemJitter } from "./jitter.ts";
+import type { UntilJitter } from "./jitter.ts";
+
 type DeepReadonly<Value> = Value extends readonly unknown[]
   ? readonly DeepReadonly<Value[number]>[]
   : Value extends object
@@ -33,6 +36,8 @@ const untilDefinitionSchema = Type.Object(
     expiresAt: Type.Optional(Type.Number()),
     gate: shellGateSchema,
     intervalMs: Type.Number({ minimum: 1 }),
+    /** Absent means jittered; watches saved before jitter existed resume jittered. */
+    jitter: Type.Optional(Type.Boolean()),
     kind: Type.Literal("until"),
     label: Type.String({ minLength: 1 }),
     wake: Type.Union([Type.Literal("agent"), Type.Literal("notify")]),
@@ -67,6 +72,8 @@ const recurringDefinitionSchema = Type.Object(
     first: Type.Union([Type.Literal("afterInterval"), Type.Literal("now")]),
     gate: Type.Optional(shellGateSchema),
     intervalMs: Type.Number({ minimum: 1 }),
+    /** Absent means jittered; watches saved before jitter existed resume jittered. */
+    jitter: Type.Optional(Type.Boolean()),
     kind: Type.Literal("recurring"),
     label: Type.String({ minLength: 1 }),
     snapshot: followUpSnapshotSchema,
@@ -153,20 +160,73 @@ export const wakeOf = (definition: WatchDefinition): "agent" | "notify" =>
 export const expiresAtOf = (definition: WatchDefinition): number | undefined =>
   definition.expiresAt;
 
+/** A recurring watch's stable phase: up to this share of its interval. */
+export const PHASE_SHARE = 0.2;
+/** Each due time moves by up to this share of the interval either way. */
+export const TICK_JITTER_SHARE = 0.1;
+
+const jittered = (definition: WatchDefinition): boolean =>
+  definition.jitter !== false;
+
+/** Stable per-watch offset in [0, 20%) of the interval, from the watch id. */
+export const phaseOffsetMs = (
+  definition: WatchDefinition,
+  id: string,
+  jitter: UntilJitter = systemJitter
+): number =>
+  jittered(definition)
+    ? Math.floor(
+        jitter.unit(`phase:${id}`) * PHASE_SHARE * definition.intervalMs
+      )
+    : 0;
+
+/** The first cadence anchor. Immediate starts and `until` checks run at once. */
+export const firstDueAt = (
+  definition: WatchDefinition,
+  id: string,
+  startedAt: number,
+  jitter: UntilJitter = systemJitter
+): number =>
+  definition.kind === "until" || definition.first === "now"
+    ? startedAt
+    : startedAt + definition.intervalMs + phaseOffsetMs(definition, id, jitter);
+
+/**
+ * When the watch actually runs next. `facts.nextDueAt` stays the un-jittered
+ * anchor, so cadence and missed-tick math never drift; jitter of up to ±10% of
+ * the interval sits on top of each anchor. The first anchor runs exactly.
+ */
+export const dueAt = (
+  definition: WatchDefinition,
+  facts: WatchFacts,
+  jitter: UntilJitter = systemJitter
+): number => {
+  if (!jittered(definition)) return facts.nextDueAt;
+  if (
+    facts.nextDueAt ===
+    firstDueAt(definition, facts.id, facts.startedAt, jitter)
+  ) {
+    return facts.nextDueAt;
+  }
+  const unit = jitter.unit(`tick:${facts.id}:${facts.nextDueAt}`);
+  return (
+    facts.nextDueAt +
+    Math.round((unit * 2 - 1) * TICK_JITTER_SHARE * definition.intervalMs)
+  );
+};
+
 export const initialFacts = (
   definition: WatchDefinition,
   id: string,
-  startedAt: number
+  startedAt: number,
+  jitter: UntilJitter = systemJitter
 ): WatchFacts => ({
   attempts: 0,
   deliveries: 0,
   deliveryPending: false,
   id,
   missedTicks: 0,
-  nextDueAt:
-    definition.kind === "until" || definition.first === "now"
-      ? startedAt
-      : startedAt + definition.intervalMs,
+  nextDueAt: firstDueAt(definition, id, startedAt, jitter),
   reloads: 0,
   startedAt,
 });
