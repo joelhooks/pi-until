@@ -40,6 +40,27 @@ import {
   parseExternalFollowUpRequest,
   type FollowUpRequest,
 } from "../src/follow-up.ts";
+import {
+  claimHandoff,
+  completeHandoff,
+  completeOwnHandoff,
+  consumeOwnHandoff,
+  DEFAULT_HANDOFF_WAIT_MS,
+  handoffOptionsFromEnv,
+  publishHandoff,
+  pruneHandoffs,
+  discardOwnMailbox,
+  MAILBOX_CLEARED_ENTRY_TYPE,
+  forkPointFrom,
+  staleClaimCount,
+  SUCCESSOR_ENTRY_TYPE,
+  successorBindingFrom,
+} from "../src/handoff.ts";
+import type {
+  Handoff,
+  SuccessorBinding,
+  HandoffOptions,
+} from "../src/handoff.ts";
 import { renderWatchIndicator, renderWatchPanel } from "../src/indicator.ts";
 import type { WatchDisplay, WatchPhase } from "../src/indicator.ts";
 import { systemJitter } from "../src/jitter.ts";
@@ -52,8 +73,14 @@ import {
 } from "../src/packet.ts";
 import {
   RESUMED_ENTRY_TYPE,
+  RESUME_INTENDED_ENTRY_TYPE,
   SUSPENDED_ENTRY_TYPE,
+  SUSPENSION_EXTRA_ENTRY_TYPE,
+  journalSuspensionData,
+  predecessorHandled,
   newestSuspension,
+  hasAdoptedTransfer,
+  carryRestoration,
   partitionResumable,
   quitSuspensionFor,
   resumeInput,
@@ -63,7 +90,11 @@ import {
   suspensionData,
   unfinishedWatches,
 } from "../src/suspension.ts";
-import type { PersistedWatch, SuspensionRecord } from "../src/suspension.ts";
+import type {
+  PendingPredecessor,
+  PersistedWatch,
+  SuspensionRecord,
+} from "../src/suspension.ts";
 import {
   createTelemetrySink,
   hashCondition,
@@ -112,11 +143,25 @@ interface WatchRecord {
   readonly actor: WatchActor;
 }
 
+interface SuccessorWait {
+  readonly controller: AbortController;
+  task: Promise<void>;
+  phase: "waiting" | "watching" | "finished";
+  predecessorId: string;
+  notBefore?: string;
+  depth: number;
+  claimed?: Handoff;
+  deadline: number;
+}
+
 export interface PiUntilOptions {
   readonly clock?: UntilClock;
+  /** Environment port for targeted handoff declarations. */
+  readonly environment?: NodeJS.ProcessEnv;
   readonly compactionGraceMs?: number;
   readonly followUpDispatchAckMs?: number;
   readonly jitter?: UntilJitter;
+  readonly handoff?: HandoffOptions | false;
   readonly telemetry?: TelemetrySink;
 }
 
@@ -347,6 +392,14 @@ export default function piUntil(
   let requestIndicatorRender: (() => void) | undefined;
   let shuttingDown = false;
   let followUps: FollowUpActor;
+  const environment = options.environment ?? process.env;
+  const handoff = options.handoff ?? handoffOptionsFromEnv(environment);
+  let oldClaims = 0;
+  let ownership: "local" | "transferred" = "local";
+  let lifecycle = 0;
+  let pendingRestoration: SuspensionRecord | undefined;
+  let restorationTask: Promise<void> | undefined;
+  let handoffWait: SuccessorWait | undefined;
   let arbiterState = { since: 0, value: "" };
 
   const clock = options.clock ?? systemClock;
@@ -707,9 +760,21 @@ export default function piUntil(
     return `arbiter: ${value} since ${since}, ${queued} queued`;
   };
   const listWithArbiter = (receipts: readonly WatchReceipt[]): string => {
-    const line = arbiterLine();
-    const text = listText(receipts);
-    return line === undefined ? text : `${text}\n${line}`;
+    const waiting =
+      handoffWait?.phase === "waiting"
+        ? `handoff: waiting for ${handoffWait.predecessorId} until ${new Date(handoffWait.deadline).toISOString()}`
+        : undefined;
+    const late =
+      handoffWait?.phase === "watching"
+        ? `handoff: watching for a late handoff from ${handoffWait.predecessorId}`
+        : undefined;
+    const claims =
+      oldClaims > 0
+        ? `claimed: ${oldClaims} older than 7 days; retained for inspection`
+        : undefined;
+    return [listText(receipts), arbiterLine(), waiting, late, claims]
+      .filter((line) => line !== undefined)
+      .join("\n");
   };
 
   /**
@@ -792,7 +857,7 @@ export default function piUntil(
   const resumeWatches = (
     suspended: readonly PersistedWatch[],
     ctx: ExtensionContext,
-    source: "reload" | "restart" | "command" = "reload"
+    source: "reload" | "restart" | "command" | "successor" = "reload"
   ): number => {
     let resumed = 0;
     for (const watch of suspended) {
@@ -824,6 +889,7 @@ export default function piUntil(
         command: "from the newest suspension entry",
         reload: "after reload",
         restart: "after Pi restarted this session",
+        successor: "from the declared predecessor session",
       }[source];
       ctx.ui.notify(
         `pi-until resumed ${resumed} watch${resumed === 1 ? "" : "es"} ${origin}`,
@@ -833,6 +899,55 @@ export default function piUntil(
     return resumed;
   };
 
+  const appendSuspension = (
+    data: ReturnType<typeof suspensionData>,
+    ctx: ExtensionContext,
+    pendingPredecessor?: PendingPredecessor
+  ) => {
+    const before = newestSuspension(ctx.sessionManager.getBranch())?.entryId;
+    pi.appendEntry(SUSPENDED_ENTRY_TYPE, journalSuspensionData(data));
+    const core = newestSuspension(ctx.sessionManager.getBranch());
+    if (core === undefined || core.entryId === before) return null;
+    if (
+      data.handoff !== undefined ||
+      (data.terminalFollowUps?.length ?? 0) > 0 ||
+      pendingPredecessor !== undefined
+    )
+      pi.appendEntry(SUSPENSION_EXTRA_ENTRY_TYPE, {
+        from: core.entryId,
+        ...(data.handoff === undefined ? {} : { handoff: data.handoff }),
+        ...(data.reason !== "quit" || data.terminalFollowUps === undefined
+          ? {}
+          : { terminalFollowUps: data.terminalFollowUps }),
+        ...(pendingPredecessor === undefined ? {} : { pendingPredecessor }),
+      });
+    return newestSuspension(ctx.sessionManager.getBranch()) ?? null;
+  };
+
+  const pendingTerminalRequests = (
+    record: SuspensionRecord,
+    ctx: ExtensionContext
+  ) => {
+    const handled = new Set<string>();
+    for (const entry of ctx.sessionManager.getBranch()) {
+      if (
+        entry.type === "custom" &&
+        entry.customType === "pi-until-wake-handled" &&
+        Value.Check(followUpMarkerSchema, entry.data)
+      )
+        handled.add(entry.data.followUpId);
+      if (
+        entry.type === "message" &&
+        entry.message.role === "custom" &&
+        Value.Check(followUpMarkerSchema, entry.message.details)
+      )
+        handled.add(entry.message.details.followUpId);
+    }
+    return (record.terminalFollowUps ?? []).filter(
+      (request) => !handled.has(request.id)
+    );
+  };
+
   /**
    * Resume one suspension entry in a process that did not write it, then
    * mark the entry consumed so no later start can replay it.
@@ -840,7 +955,8 @@ export default function piUntil(
   const resumeAcrossProcesses = (
     record: SuspensionRecord,
     ctx: ExtensionContext,
-    source: "restart" | "command"
+    source: "restart" | "command" | "successor",
+    transfer?: { predecessorId: string; transferId: string }
   ) => {
     const now = clock.now();
     const { expired, resumable } = partitionResumable(
@@ -848,11 +964,23 @@ export default function piUntil(
       now
     );
     const pending = resumable.filter((watch) => !watches.has(watch.facts.id));
+    // Journal consumption before actors can emit a follow-up. A transfer's
+    // private suspension was already appended to this session, never its parent.
+    pi.appendEntry(RESUME_INTENDED_ENTRY_TYPE, {
+      from: record.entryId,
+      intended: pending.length,
+      resumedAt: new Date(now).toISOString(),
+      ...transfer,
+    });
     const resumed = resumeWatches(pending, ctx, source);
-    pi.appendEntry(
-      RESUMED_ENTRY_TYPE,
-      resumedData(record.entryId, resumed, expired.length, now)
-    );
+    pi.appendEntry(RESUMED_ENTRY_TYPE, {
+      ...resumedData(record.entryId, resumed, expired.length, now),
+      intended: pending.length,
+      ...transfer,
+    });
+    for (const request of pendingTerminalRequests(record, ctx)) {
+      followUps.send({ request, type: "ENQUEUE" });
+    }
     if (expired.length > 0) {
       ctx.ui.notify(
         `Skipped ${expired.length} expired watch${expired.length === 1 ? "" : "es"}`,
@@ -1014,10 +1142,15 @@ export default function piUntil(
           throw new Error(`unknown pi-until watch: ${command.id}`);
         }
         if (command.action === "status" || command.action === "cancel") {
-          followUps.send({
-            dedupeKey: `terminal:${historical.id}:${historical.status}`,
-            type: "DROP",
-          });
+          const dedupeKey = `terminal:${historical.id}:${historical.status}`;
+          for (const request of followUps.getSnapshot().context.queue) {
+            if (request.dedupeKey === dedupeKey)
+              pi.appendEntry("pi-until-wake-handled", {
+                followUpId: request.id,
+                disposition: "consumed",
+              });
+          }
+          followUps.send({ dedupeKey, type: "DROP" });
         }
         return {
           content: [{ type: "text", text: receiptText(historical) }],
@@ -1221,7 +1354,11 @@ export default function piUntil(
         clock.now()
       );
       const pending = resumable.filter((watch) => !watches.has(watch.facts.id));
-      if (record === undefined || pending.length === 0) {
+      if (
+        record === undefined ||
+        (pending.length === 0 &&
+          pendingTerminalRequests(record, ctx).length === 0)
+      ) {
         let detail = "";
         if (expired.length > 0) detail = ` (${expired.length} expired)`;
         else if (resumable.length > 0) detail = " (already active)";
@@ -1271,6 +1408,16 @@ export default function piUntil(
     ) {
       return;
     }
+    const active = followUps.getSnapshot().context.active;
+    if (
+      active?.kind === "terminal" &&
+      active.id === event.message.details.followUpId &&
+      active.dedupeKey.startsWith("terminal:")
+    )
+      pi.appendEntry("pi-until-wake-handled", {
+        followUpId: active.id,
+        disposition: "delivered",
+      });
     followUps.send({
       id: event.message.details.followUpId,
       type: "MESSAGE_STARTED",
@@ -1306,8 +1453,404 @@ export default function piUntil(
     };
   };
 
-  pi.on("session_start", (event, ctx) => {
+  const adoptionErrorText = (
+    error: unknown,
+    waiting: SuccessorWait,
+    ctx: ExtensionContext
+  ) => {
+    const running = [...watches.keys()].sort();
+    const entries = ctx.sessionManager.getBranch();
+    const record = newestSuspension(entries);
+    const claimed = waiting.claimed;
+    const candidates =
+      record !== undefined &&
+      claimed !== undefined &&
+      record.handoff?.transferId === claimed.transferId
+        ? unfinishedWatches(record, entries)
+        : (claimed?.suspension.watches ?? []);
+    const finished = new Set(terminalReceipts.map((receipt) => receipt.id));
+    const now = clock.now();
+    const missing = candidates
+      .filter(
+        (watch) =>
+          !watches.has(watch.facts.id) &&
+          !finished.has(watch.facts.id) &&
+          (watch.definition.expiresAt === undefined ||
+            watch.definition.expiresAt > now)
+      )
+      .map((watch) => watch.facts.id)
+      .sort();
+    const needed =
+      claimed === undefined
+        ? "unknown until the claim is readable"
+        : missing.join(", ") || "none";
+    return `pi-until handoff failed: ${error instanceof Error ? error.message : String(error)}. Running watch ids: ${running.join(", ") || "none"}. Needs re-arming: ${needed}. Check handled work and inspect the retained claim before re-arming any other id.`;
+  };
+
+  const adoptSuccessor = (ctx: ExtensionContext, binding: SuccessorBinding) => {
+    if (
+      handoff === false ||
+      handoffWait !== undefined ||
+      binding.successorId !== sessionId(ctx) ||
+      predecessorHandled(ctx.sessionManager.getBranch(), binding.predecessorId)
+    )
+      return;
+    const generation = lifecycle;
+    const waitMs = handoff.waitMs ?? DEFAULT_HANDOFF_WAIT_MS;
+    const controller = new AbortController();
+    const waiting: SuccessorWait = {
+      controller,
+      task: Promise.resolve(),
+      phase: "waiting",
+      predecessorId: binding.predecessorId,
+      notBefore: binding.notBefore,
+      depth: binding.depth ?? 1,
+      deadline: clock.now() + waitMs,
+    };
+    handoffWait = waiting;
+    const adoptLink = async (
+      link: SuccessorBinding,
+      visited: readonly string[]
+    ): Promise<void> => {
+      // The depth bound and cycle check prevent unbounded transitive claims.
+      if ((link.depth ?? 1) > 3 || visited.includes(link.predecessorId)) {
+        ctx.ui.notify(
+          "pi-until predecessor chain limit or cycle; inspect pending work and re-arm manually",
+          "warning"
+        );
+        return;
+      }
+      waiting.predecessorId = link.predecessorId;
+      waiting.notBefore = link.notBefore;
+      waiting.depth = link.depth ?? 1;
+      waiting.claimed = undefined;
+      waiting.phase = "waiting";
+      waiting.deadline = clock.now() + waitMs;
+      ctx.ui.setStatus("pi-until-handoff", `waiting for ${link.predecessorId}`);
+      ctx.ui.notify(
+        `pi-until waiting up to ${waitMs / 1000}s for predecessor ${link.predecessorId}`,
+        "info"
+      );
+      const result = await claimHandoff({
+        ...handoff,
+        predecessorId: link.predecessorId,
+        successorId: sessionId(ctx),
+        notBefore: link.notBefore,
+        signal: controller.signal,
+        passive: true,
+        warn: (message) => ctx.ui.notify(message, "warning"),
+        onTimeout: (watching) => {
+          if (shuttingDown || lifecycle !== generation) return;
+          waiting.phase = watching ? "watching" : "finished";
+          ctx.ui.setStatus(
+            "pi-until-handoff",
+            watching
+              ? `watching for a late handoff from ${link.predecessorId}`
+              : undefined
+          );
+          ctx.ui.notify(
+            watching
+              ? "pi-until: nothing to adopt yet; watching for a late handoff"
+              : "pi-until: nothing to adopt; late filesystem watch unavailable",
+            "warning"
+          );
+        },
+      });
+      // Retain an interrupted claim for quit forwarding before the generation guard.
+      if (result.kind === "claimed") waiting.claimed = result.handoff;
+      if (shuttingDown || lifecycle !== generation || result.kind === "aborted")
+        return;
+      if (result.kind === "nothing") {
+        pi.appendEntry(RESUMED_ENTRY_TYPE, {
+          ...resumedData("handoff-empty", 0, 0, clock.now()),
+          predecessorId: link.predecessorId,
+          intended: 0,
+        });
+        ctx.ui.notify("pi-until: predecessor had nothing to hand off", "info");
+        return;
+      }
+      if (result.kind === "empty") return;
+      if (["watching"].includes(waiting.phase))
+        ctx.ui.notify("pi-until late handoff arrived; adopting now", "info");
+      const { suspension, transferId, pendingPredecessor } = result.handoff;
+      if (!hasAdoptedTransfer(ctx.sessionManager.getBranch(), transferId)) {
+        const record = appendSuspension(
+          {
+            ...suspension,
+            handoff: {
+              predecessorId: link.predecessorId,
+              transferId,
+              suspendedAt: suspension.suspendedAt,
+            },
+            sessionId: sessionId(ctx),
+          },
+          ctx,
+          pendingPredecessor
+        );
+        if (
+          record === null ||
+          !hasAdoptedTransfer(ctx.sessionManager.getBranch(), transferId)
+        )
+          throw new Error(
+            "could not read back the adopted suspension; claim retained for inspection"
+          );
+        resumeAcrossProcesses(record, ctx, "successor", {
+          predecessorId: link.predecessorId,
+          transferId,
+        });
+      }
+      await completeHandoff({
+        directory: handoff.directory,
+        predecessorId: link.predecessorId,
+        successorId: sessionId(ctx),
+        handoff: result.handoff,
+      });
+      if (
+        shuttingDown ||
+        lifecycle !== generation ||
+        pendingPredecessor === undefined
+      )
+        return;
+      const next = {
+        ...pendingPredecessor,
+        successorId: sessionId(ctx),
+        depth: waiting.depth + 1,
+      };
+      if (next.depth <= 3) pi.appendEntry(SUCCESSOR_ENTRY_TYPE, next);
+      await adoptLink(next, [...visited, link.predecessorId]);
+    };
+    waiting.task = (async () => {
+      try {
+        await adoptLink(binding, []);
+      } catch (error) {
+        ctx.ui.notify(adoptionErrorText(error, waiting, ctx), "error");
+      } finally {
+        waiting.phase = "finished";
+        ctx.ui.setStatus("pi-until-handoff", undefined);
+      }
+    })();
+  };
+
+  const markTransferred = (
+    record: SuspensionRecord,
+    ctx: ExtensionContext,
+    transferId: string | undefined
+  ) => {
+    const binding = successorBindingFrom(
+      ctx.sessionManager.getBranch(),
+      sessionId(ctx)
+    );
+    const predecessorId =
+      binding?.predecessorId ?? record.pendingPredecessor?.predecessorId;
+    pi.appendEntry(RESUMED_ENTRY_TYPE, {
+      ...resumedData(record.entryId, 0, 0, clock.now()),
+      intended: 0,
+      disposition: "transferred",
+      transferId,
+      ...(predecessorId === undefined ? {} : { predecessorId }),
+    });
+  };
+
+  const restoreOwnQuit = async (
+    record: SuspensionRecord,
+    ctx: ExtensionContext,
+    generation: number
+  ) => {
+    let ownsQuit = true;
+    let transferredId: string | undefined;
+    if (handoff !== false) {
+      try {
+        ownsQuit = await consumeOwnHandoff({
+          directory: handoff.directory,
+          sessionId: sessionId(ctx),
+          suspendedAt: record.suspendedAt,
+          onTransferred: (id) => {
+            transferredId = id;
+          },
+          warn: (message) => ctx.ui.notify(message, "warning"),
+        });
+      } catch (error) {
+        ctx.ui.notify(
+          `pi-until mailbox consume failed: ${String(error)}; restoring the original same-session quit`,
+          "warning"
+        );
+      }
+      if (!ownsQuit) {
+        pendingRestoration = undefined;
+        ownership = "transferred";
+      }
+      if (shuttingDown || lifecycle !== generation) return;
+    }
+    if (!ownsQuit) {
+      markTransferred(record, ctx, transferredId);
+      ctx.ui.notify(
+        "pi-until quit entry was already consumed or handed off; nothing to resume",
+        "warning"
+      );
+      return;
+    }
+    resumeAcrossProcesses(record, ctx, "restart", record.handoff);
+    pendingRestoration = undefined;
+    if (handoff !== false) {
+      try {
+        if (record.handoff !== undefined) {
+          const { predecessorId, transferId } = record.handoff;
+          await completeHandoff({
+            directory: handoff.directory,
+            predecessorId,
+            successorId: sessionId(ctx),
+            handoff: {
+              transferId,
+              suspension: {
+                ...suspensionData(
+                  record.watches,
+                  clock.now(),
+                  "quit",
+                  predecessorId,
+                  record.terminalFollowUps
+                ),
+                suspendedAt:
+                  record.handoff.suspendedAt ??
+                  record.suspendedAt ??
+                  record.timestamp,
+              },
+            },
+          });
+          if (shuttingDown || lifecycle !== generation) return;
+        }
+        await completeOwnHandoff(handoff.directory, sessionId(ctx));
+      } catch (error) {
+        ctx.ui.notify(
+          `pi-until claim cleanup failed: ${String(error)}; watches remain resumed`,
+          "warning"
+        );
+      }
+      // The session_start caller rechecks its generation immediately after
+      // awaiting this helper, before it can adopt or touch the indicator.
+    }
+  };
+
+  const bindSuccessor = (ctx: ExtensionContext, reason: string) => {
+    if (
+      handoff === false ||
+      ownership === "transferred" ||
+      isShortLived(ctx) ||
+      !["startup", "resume", "reload"].includes(reason)
+    )
+      return;
+    if (
+      handoff.successorId === sessionId(ctx) &&
+      handoff.predecessorId === undefined
+    ) {
+      ctx.ui.notify(
+        "pi-until target matches but no predecessor was named; nothing adopted",
+        "warning"
+      );
+      return;
+    }
+    const remembered = successorBindingFrom(
+      ctx.sessionManager.getBranch(),
+      sessionId(ctx)
+    );
+    if (remembered !== undefined) {
+      adoptSuccessor(ctx, remembered);
+      return;
+    }
+    if (
+      handoff.successorId !== sessionId(ctx) ||
+      handoff.predecessorId === undefined
+    )
+      return;
+    const binding = {
+      predecessorId: handoff.predecessorId,
+      successorId: sessionId(ctx),
+      notBefore: forkPointFrom(
+        ctx.sessionManager.getBranch(),
+        ctx.sessionManager.getHeader()?.timestamp
+      ),
+      depth: 1,
+    };
+    pi.appendEntry(SUCCESSOR_ENTRY_TYPE, binding);
+    adoptSuccessor(ctx, binding);
+  };
+
+  const pruneMailbox = async (ctx: ExtensionContext, generation: number) => {
+    if (handoff === false) return;
+    const warn = (message: string) => {
+      if (!shuttingDown && lifecycle === generation)
+        ctx.ui.notify(message, "warning");
+    };
+    try {
+      await pruneHandoffs({ ...handoff, now: clock.now(), warn });
+      const count = await staleClaimCount(handoff.directory, clock.now());
+      if (!shuttingDown && lifecycle === generation) oldClaims = count;
+    } catch {
+      warn("pi-until mailbox pruning failed; session recovery is unaffected");
+    }
+  };
+
+  const terminalRequestsForQuit = () => {
+    const delivery = followUps.getSnapshot();
+    const requests = [...delivery.context.queue];
+    if (
+      delivery.context.active !== undefined &&
+      !delivery.matches("awaitingSettlement")
+    )
+      requests.unshift(delivery.context.active);
+    return requests.filter(
+      (request): request is Extract<FollowUpRequest, { kind: "terminal" }> =>
+        request.kind === "terminal" && request.dedupeKey.startsWith("terminal:")
+    );
+  };
+
+  const restoreAtStart = async (
+    ctx: ExtensionContext,
+    generation: number,
+    reason: string
+  ) => {
+    if (isShortLived(ctx) || !["reload", "startup", "resume"].includes(reason))
+      return;
+    const record = quitSuspensionFor(ctx.sessionManager.getBranch(), {
+      sessionCreatedAt: ctx.sessionManager.getHeader()?.timestamp,
+      sessionId: sessionId(ctx),
+    });
+    if (record !== undefined) {
+      pendingRestoration = record;
+      await restoreOwnQuit(record, ctx, generation);
+    } else if (reason === "reload") {
+      // Only already-dispatched messages survive in Pi's own queue.
+      resumeWatches(suspendedWatchesFrom(ctx.sessionManager.getBranch()), ctx);
+    }
+    if (
+      shuttingDown ||
+      lifecycle !== generation ||
+      handoff === false ||
+      reason === "reload"
+    )
+      return;
+    try {
+      const cleared = await discardOwnMailbox(
+        handoff.directory,
+        sessionId(ctx)
+      );
+      if (cleared && !shuttingDown && lifecycle === generation)
+        pi.appendEntry(MAILBOX_CLEARED_ENTRY_TYPE, {
+          sessionId: sessionId(ctx),
+          clearedAt: new Date(clock.now()).toISOString(),
+        });
+    } catch {
+      ctx.ui.notify(
+        "pi-until could not clear its own stale mailbox",
+        "warning"
+      );
+    }
+  };
+
+  pi.on("session_start", async (event, ctx) => {
+    lifecycle += 1;
+    const generation = lifecycle;
     currentContext = ctx;
+    ownership = "local";
     listenForExternalFollowUps();
     if (shuttingDown) {
       shuttingDown = false;
@@ -1315,46 +1858,114 @@ export default function piUntil(
     } else {
       syncSessionActivity(ctx);
     }
-    if (event.reason === "reload") {
-      // A reload keeps the process and session; the entry was just written.
-      resumeWatches(suspendedWatchesFrom(ctx.sessionManager.getBranch()), ctx);
-    } else if (
-      (event.reason === "startup" || event.reason === "resume") &&
-      !isShortLived(ctx)
-    ) {
-      // A long-lived process opened a session file. If the process that
-      // owned it quit with watches, this process inherits them. new and fork
-      // create a different session and inherit nothing.
-      const record = quitSuspensionFor(ctx.sessionManager.getBranch(), {
-        sessionCreatedAt: ctx.sessionManager.getHeader()?.timestamp,
-        sessionId: sessionId(ctx),
-      });
-      if (record !== undefined) resumeAcrossProcesses(record, ctx, "restart");
-    }
+    pendingRestoration = undefined;
+    restorationTask = undefined;
+    restorationTask = restoreAtStart(ctx, generation, event.reason);
+    await restorationTask;
+    if (shuttingDown || lifecycle !== generation) return;
+    bindSuccessor(ctx, event.reason);
     refreshIndicator();
+    // Maintenance is independent of ownership restoration and never holds startup.
+    void pruneMailbox(ctx, generation);
   });
 
-  pi.on("session_shutdown", async (event, ctx) => {
-    shuttingDown = true;
-    stopExternalFollowUps?.();
-    followUps.stop();
-    const active = activeWatches();
+  const pendingHandoffAtQuit = (
+    ctx: ExtensionContext,
+    waiting: SuccessorWait | undefined,
+    takeClaim: boolean
+  ) => {
+    const entries = ctx.sessionManager.getBranch();
+    if (
+      takeClaim &&
+      waiting?.claimed !== undefined &&
+      !hasAdoptedTransfer(entries, waiting.claimed.transferId)
+    )
+      return {
+        captured: waiting.claimed,
+        identity: {
+          predecessorId: waiting.predecessorId,
+          transferId: waiting.claimed.transferId,
+          suspendedAt: waiting.claimed.suspension.suspendedAt,
+        },
+        pending: waiting.claimed.pendingPredecessor,
+      };
+    const binding = successorBindingFrom(entries, sessionId(ctx));
+    const pending =
+      binding !== undefined &&
+      !predecessorHandled(entries, binding.predecessorId)
+        ? {
+            predecessorId: binding.predecessorId,
+            notBefore: binding.notBefore ?? new Date(0).toISOString(),
+          }
+        : newestSuspension(entries)?.pendingPredecessor;
+    return { captured: undefined, identity: undefined, pending };
+  };
+
+  const writeShutdownSnapshot = (
+    reason: string,
+    ctx: ExtensionContext,
+    active: readonly WatchRecord[],
+    forwarding: ReturnType<typeof pendingHandoffAtQuit>,
+    pendingTerminal: ReturnType<typeof terminalRequestsForQuit>
+  ) => {
+    let quitData: ReturnType<typeof suspensionData> | undefined;
     // `/reload` restores in the next extension instance. `quit` hands the
     // same record to the next process that opens this session file. A print
     // or JSON run owns no watches, so its quit must not bury a pending entry.
     // Session replacement writes nothing.
     if (
-      event.reason === "reload" ||
-      (event.reason === "quit" && !isShortLived(ctx))
+      (reason === "reload" && pendingRestoration === undefined) ||
+      (reason === "quit" && !isShortLived(ctx))
     ) {
-      const suspended = active.map((record) =>
-        suspendWatch(record.actor.getSnapshot().context)
-      );
+      const suspended = [
+        ...new Map(
+          [
+            ...(forwarding.captured?.suspension.watches ?? []),
+            ...(pendingRestoration === undefined
+              ? []
+              : unfinishedWatches(
+                  pendingRestoration,
+                  ctx.sessionManager.getBranch()
+                )),
+            ...active.map((record) =>
+              suspendWatch(
+                record.actor.getSnapshot().context,
+                reason === "reload"
+              )
+            ),
+          ].map((watch) => [watch.facts.id, watch])
+        ).values(),
+      ];
       // Written even when empty so the newest entry always wins.
-      pi.appendEntry(
-        SUSPENDED_ENTRY_TYPE,
-        suspensionData(suspended, clock.now(), event.reason, sessionId(ctx))
+      const data = carryRestoration(
+        suspensionData(
+          suspended,
+          clock.now(),
+          reason,
+          sessionId(ctx),
+          reason === "quit"
+            ? [
+                ...new Map(
+                  [
+                    ...(pendingRestoration === undefined
+                      ? []
+                      : pendingTerminalRequests(pendingRestoration, ctx)),
+                    ...(forwarding.captured?.suspension.terminalFollowUps ??
+                      []),
+                    ...pendingTerminal,
+                  ].map((request) => [request.id, request])
+                ).values(),
+              ]
+            : []
+        ),
+        pendingRestoration
       );
+      const recorded =
+        forwarding.identity === undefined
+          ? data
+          : { ...data, handoff: forwarding.identity };
+      appendSuspension(recorded, ctx, forwarding.pending);
+      if (reason === "quit") quitData = data;
       if (suspended.length > 0) {
         void track(sessionId(currentContext), {
           count: suspended.length,
@@ -1362,12 +1973,75 @@ export default function piUntil(
         });
       }
     }
+    return quitData;
+  };
+
+  pi.on("session_shutdown", async (event, ctx) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    lifecycle += 1;
+    const closingWait = handoffWait;
+    closingWait?.controller.abort();
+    await closingWait?.task;
+    await restorationTask;
+    handoffWait = undefined;
+    stopExternalFollowUps?.();
+    // Started messages are consumed; queued and uncertain starts keep their ids.
+    const pendingTerminal = terminalRequestsForQuit();
+    followUps.stop();
+    const active = activeWatches();
+    const forwarding = pendingHandoffAtQuit(
+      ctx,
+      closingWait,
+      event.reason === "quit"
+    );
+    const quitData = writeShutdownSnapshot(
+      event.reason,
+      ctx,
+      active,
+      forwarding,
+      pendingTerminal
+    );
     for (const record of active) {
       record.actor.send({ type: "CANCEL" });
     }
     await shellRunner.drain();
     for (const record of active) {
       record.actor.stop();
+    }
+    if (
+      handoff !== false &&
+      forwarding.captured !== undefined &&
+      forwarding.identity !== undefined &&
+      hasAdoptedTransfer(
+        ctx.sessionManager.getBranch(),
+        forwarding.captured.transferId
+      )
+    ) {
+      try {
+        await completeHandoff({
+          directory: handoff.directory,
+          predecessorId: forwarding.identity.predecessorId,
+          successorId: sessionId(ctx),
+          handoff: forwarding.captured,
+        });
+      } catch {
+        ctx.ui.notify(
+          "pi-until interrupted claim was journalled but cleanup failed; retained for inspection",
+          "warning"
+        );
+      }
+    }
+    // Publish only after old checks and their descendants are gone.
+    if (quitData !== undefined && handoff !== false) {
+      try {
+        await publishHandoff(handoff.directory, quitData, forwarding.pending);
+      } catch (error) {
+        ctx.ui.notify(
+          `pi-until could not publish handoff: ${String(error)}; same-session quit recovery remains available`,
+          "error"
+        );
+      }
     }
     watches.clear();
     terminalReceipts.length = 0;

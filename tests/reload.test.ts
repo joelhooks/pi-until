@@ -9,7 +9,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { systemClock } from "../src/clock.ts";
 import type { UntilClock } from "../src/clock.ts";
@@ -21,7 +21,12 @@ import {
   suspensionData,
 } from "../src/suspension.ts";
 import type { PersistedWatch } from "../src/suspension.ts";
-import { FakeSession, loadExtension, receiptOf, sleep } from "./fake-pi.ts";
+import {
+  FakeSession,
+  loadExtension as loadPi,
+  receiptOf,
+  sleep,
+} from "./fake-pi.ts";
 import type { FakeExtension } from "./fake-pi.ts";
 
 const tempDirectories: string[] = [];
@@ -134,7 +139,31 @@ const resumedMarkers = (session: FakeSession) =>
       entry.type === "custom" && entry.customType === RESUMED_ENTRY_TYPE
   );
 
-describe("pi-until across a quit and relaunch", () => {
+const productionMailbox = (enabled: boolean) => {
+  let mailboxDirectory: string | undefined;
+  beforeEach(() => {
+    mailboxDirectory = enabled
+      ? mkdtempSync(join(tmpdir(), "until-legacy-mailbox-"))
+      : undefined;
+    if (mailboxDirectory !== undefined) tempDirectories.push(mailboxDirectory);
+  });
+  const loadExtension = (
+    session: FakeSession,
+    options: Parameters<typeof loadPi>[1] = {}
+  ) =>
+    loadPi(session, {
+      ...options,
+      handoff:
+        mailboxDirectory === undefined
+          ? false
+          : { directory: mailboxDirectory },
+    });
+
+  return loadExtension;
+};
+
+describe.each([false, true])("quit/relaunch mailbox=%s", (enabled) => {
+  const loadExtension = productionMailbox(enabled);
   it("writes a quit entry that names its reason and session", async () => {
     const directory = mkdtempSync(join(tmpdir(), "pi-until-restart-"));
     tempDirectories.push(directory);
@@ -153,11 +182,14 @@ describe("pi-until across a quit and relaunch", () => {
       sessionId: session.id,
       watches: [
         expect.objectContaining({
-          facts: expect.objectContaining({ id: details.id, reloads: 1 }),
+          facts: expect.objectContaining({ id: details.id, reloads: 0 }),
         }),
       ],
     });
-    expect(first.telemetry).toContainEqual({ count: 1, event: "suspended" });
+    expect(first.telemetry).toContainEqual({
+      count: 1,
+      event: "suspended",
+    });
   });
 
   it("restores one-shot and recurring watches on the next startup with deadlines and cadence intact", async () => {
@@ -200,7 +232,7 @@ describe("pi-until across a quit and relaunch", () => {
     const restoredOneShot = await statusOf(second, oneShot.id, ctx);
     expect(restoredOneShot).toMatchObject({
       expiresAt: oneShot.expiresAt,
-      reloads: 1,
+      reloads: 0,
       startedAt: oneShot.startedAt,
       status: "running",
     });
@@ -312,7 +344,11 @@ describe("pi-until across a quit and relaunch", () => {
     const watch: PersistedWatch = {
       definition: {
         expiresAt: Date.now() + 3_600_000,
-        gate: { checkTimeoutMs: 1_000, command: "false", cwd: process.cwd() },
+        gate: {
+          checkTimeoutMs: 1_000,
+          command: "false",
+          cwd: process.cwd(),
+        },
         intervalMs: 60_000,
         kind: "until",
         label: "twice",
@@ -559,7 +595,8 @@ describe("pi-until across a quit and relaunch", () => {
   });
 });
 
-describe("pi-until across /reload", () => {
+describe.each([false, true])("reload mailbox=%s", (enabled) => {
+  const loadExtension = productionMailbox(enabled);
   it("keeps a jittered recurrence's due time across reload", async () => {
     const session = new FakeSession();
     const first = loadExtension(session);
@@ -617,7 +654,10 @@ describe("pi-until across /reload", () => {
     const suspendedAttempts = suspendedWatches[0]?.facts.attempts ?? 0;
     expect(suspendedAttempts).toBeGreaterThan(0);
     expect(first.messages).toHaveLength(0);
-    expect(first.telemetry).toContainEqual({ count: 1, event: "suspended" });
+    expect(first.telemetry).toContainEqual({
+      count: 1,
+      event: "suspended",
+    });
 
     const second = loadExtension(session);
     live.push(second);

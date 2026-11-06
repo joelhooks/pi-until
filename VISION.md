@@ -20,6 +20,7 @@ The agent can release its turn, keep working on other requests, and wake with a 
 - Reading a finished watch with `status` or `cancel` drops only that watch's queued terminal wake; `list` does not consume wakes, and already dispatched wakes still settle normally.
 - The extension does not become a daemon, durable scheduler, workflow engine, side-effect runner, or outward notification gateway.
 - The extension never claims durability across a crash, SIGKILL, session replacement, a new or forked session, or machine reboot. Only a quit entry that names this session and has not been consumed is authority for a restart. Any other suspension entry is a historical fact. An operator may turn it back into work with `/until-resume`. Once a process resumes an entry, it marks that entry consumed. A later start cannot replay it, so a watch the operator cancelled stays cancelled.
+- Only an exactly targeted successor may take graceful-quit work; details live in `.brain/projects/pi-until-reload-survival.svx`.
 - Usage telemetry stays local: a JSONL file under `~/.pi/agent/pi-until/`; only condition hashes are written, never command fragments, recurring instructions, quick references, or context pointers; no network.
 
 ## Taste

@@ -123,6 +123,7 @@ export class FakeSession {
   ) {
     const notify = overrides.notify ?? vi.fn();
     const setWidget = vi.fn();
+    const setStatus = vi.fn();
     const ctx = {
       cwd: process.cwd(),
       isIdle: () => overrides.idle ?? true,
@@ -138,12 +139,17 @@ export class FakeSession {
         getLeafId: () => this.entries.at(-1)?.id ?? "origin-entry",
         getSessionId: () => this.id,
       },
-      ui: { notify, setWidget },
+      ui: { notify, setWidget, setStatus },
     };
     // SAFETY: the extension only touches cwd, mode, sessionManager.getBranch,
     // getHeader, getLeafId, getSessionId, ui.notify, and ui.setWidget. Test doubles
     // for the rest of ExtensionContext would be dead weight.
-    return { ctx: ctx as unknown as ExtensionContext, notify, setWidget };
+    return {
+      ctx: ctx as unknown as ExtensionContext,
+      notify,
+      setWidget,
+      setStatus,
+    };
   }
 }
 
@@ -154,7 +160,9 @@ export interface FakeExtension {
   ) => Promise<void>;
   readonly agentSettled: (ctx: ExtensionContext) => Promise<void>;
   readonly agentStart: (ctx: ExtensionContext) => Promise<void>;
-  readonly appendEntry: ReturnType<typeof vi.fn>;
+  readonly appendEntry: ReturnType<
+    typeof vi.fn<(customType: string, data: CustomEntry["data"]) => void>
+  >;
   readonly compactionEnd: (
     ctx: ExtensionContext,
     options?: { failed?: boolean; reason?: CompactReason }
@@ -285,6 +293,8 @@ export const loadExtension = (
   // registerCommand, registerTool, and sendMessage from ExtensionAPI.
   piUntil(pi as unknown as ExtensionAPI, {
     clock: options.clock,
+    environment: options.environment ?? {},
+    handoff: options.handoff ?? false,
     compactionGraceMs: options.compactionGraceMs,
     followUpDispatchAckMs: options.followUpDispatchAckMs,
     telemetry: options.telemetry ?? {

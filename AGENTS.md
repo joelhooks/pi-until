@@ -1,5 +1,7 @@
 # pi-until agent guide
 
+Owner: flowing-pi desk (Rat King `flowing-pi/flowing-pi-desk`). Bounce questions there.
+
 Read `VISION.md` before changing behavior.
 
 ## Commands
@@ -24,6 +26,7 @@ Node is `24.18.0`. Use npm `11.16.0`; never Bun. `devEngines` fails hard on any 
 - `src/check.ts` owns bounded shell execution and process-group termination.
 - `src/completion.ts` owns agent-wake versus notify-only routing.
 - `src/suspension.ts` owns the `pi-until-suspended` and `pi-until-resumed` session entries: suspend a watch to a value, parse it back at the boundary, keep the timeout anchored, and decide whether a starting process inherits quit work.
+- `src/handoff.ts` owns private graceful-quit mailboxes, atomic successor claims, bounded event-driven waits, and same-session claim consumption.
 - `src/telemetry.ts` owns local JSONL usage events, condition hashes, and `/until-stats` summaries.
 - `extensions/pi-until.ts` owns Pi integration, receipts, UI status, reload and restart suspend/resume, and lifecycle cleanup.
 - `tests/fake-pi.ts` is the typed Pi fake. Use it instead of `as unknown as ExtensionAPI` in new tests.
@@ -39,9 +42,10 @@ Node is `24.18.0`. Use npm `11.16.0`; never Bun. `devEngines` fails hard on any 
 - Cancellation aborts the active check and its descendants on macOS and Linux.
 - Condition stdout and stderr are discarded, never added to receipts or model context.
 - Session shutdown awaits process-tree cleanup before Pi may exit.
-- `session_shutdown { reason: "reload" }` and `{ reason: "quit" }` suspend watches to a version 3 session entry that records the reason and owning session id. Session replacement writes nothing. A print or JSON run writes no quit entry. Every reload and long-lived quit writes an entry, even an empty one, so the newest entry always wins.
+- `session_shutdown { reason: "reload" }` and `{ reason: "quit" }` suspend watches to a version 3 session entry that records the reason and owning session id. Session replacement writes nothing. A print or JSON run writes no quit entry. Normal reloads and long-lived quits write an entry even when empty, so the newest entry wins. A reload interrupting startup restoration retains the original quit entry; see the deferred edge in Brain.
 - `session_start { reason: "reload" }` resumes the newest entry. `session_start` with reason `startup` or `resume` in a long-lived process resumes the newest entry only when it is an unconsumed quit entry that names this session. A version 2 entry counts only when it is newer than the session header and no message follows it. The resume skips expired, finished, duplicate, and already-active watches, then appends `pi-until-resumed` to consume the entry. `new`, `fork`, a forked copy of a quit entry, and a reload entry resume nothing on startup.
 - `/until-resume` is the manual path when automatic recovery did not apply. It uses the same skips and also consumes the entry.
+- Targeted handoff contract and proofs: `.brain/projects/pi-until-reload-survival.svx`; keep prompt surfaces byte-identical to `1d7b250`.
 - No durability across a crash, SIGKILL, session replacement, or machine reboot.
 - Telemetry never writes condition text or command fragments and never touches the network. It must never throw into a watch.
 - Tool parameter schemas must have one `Type.Object` root. Root object unions make the OpenAI Codex bridge serialize arrays, booleans, and numbers as strings.
@@ -60,7 +64,7 @@ Keep these surfaces aligned when behavior changes:
 - `src/packet.ts` owns the instructions delivered on wake and expiry.
 - `VISION.md` and `.brain/projects/pi-until-reload-survival.svx` hold the durable boundary and its reasons.
 
-Preserve four distinctions in every surface: a gate permits work but does not complete it; dispatch is not acknowledgement; an acknowledgement timeout is uncertain rather than rejected; `/reload` and a graceful quit followed by reopening the same session restore watches automatically, a crash restores nothing unless the operator runs `/until-resume`, and a session replacement, new session, or fork restores nothing.
+Preserve four distinctions in every surface: a gate permits work but does not complete it; dispatch is not acknowledgement; an acknowledgement timeout is uncertain rather than rejected; `/reload` and a graceful quit followed by reopening the same session restore watches automatically, a crash restores nothing unless the operator runs `/until-resume`, and an undeclared session replacement, new session, or fork restores nothing.
 
 ## Sources
 
