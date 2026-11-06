@@ -403,6 +403,7 @@ export default function piUntil(
   let arbiterState = { since: 0, value: "" };
 
   const clock = options.clock ?? systemClock;
+  const showWidget = process.env.PI_UNTIL_WIDGET !== "0";
   const shellRunner = createShellConditionRunner();
   const jitter = options.jitter ?? systemJitter;
   const machine = createWatchMachine(shellRunner.run, clock, jitter);
@@ -462,7 +463,7 @@ export default function piUntil(
   const refreshIndicator = () => {
     emitWatches();
     const ctx = currentContext;
-    if (ctx?.mode !== "tui") return;
+    if (ctx?.mode !== "tui" || !showWidget) return;
 
     if (activeWatches().length === 0) {
       if (indicatorMounted) ctx.ui.setWidget(WIDGET_KEY, undefined);
