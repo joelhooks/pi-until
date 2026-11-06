@@ -14,6 +14,12 @@ import type {
 export const SUSPENDED_ENTRY_TYPE = "pi-until-suspended";
 export const RESUMED_ENTRY_TYPE = "pi-until-resumed";
 export const SUSPENSION_VERSION = 3;
+export const SUSPENSION_EXTRA_ENTRY_TYPE = "pi-until-suspension-extra";
+export const pendingPredecessorSchema = Type.Object(
+  { predecessorId: Type.String(), notBefore: Type.String() },
+  { additionalProperties: false }
+);
+export type PendingPredecessor = Static<typeof pendingPredecessorSchema>;
 
 /** The `session_shutdown` reasons that write a suspension entry. */
 export type SuspensionReason = "reload" | "quit";
@@ -26,13 +32,50 @@ const persistedWatchSchema = Type.Object(
   { additionalProperties: false }
 );
 
-const suspensionDataSchema = Type.Object(
+export const terminalFollowUpSchema = Type.Object(
   {
+    content: Type.String(),
+    customType: Type.String(),
+    dedupeKey: Type.String(),
+    details: Type.Unknown(),
+    id: Type.String(),
+    kind: Type.Literal("terminal"),
+    retried: Type.Optional(Type.Boolean()),
+    watchId: Type.String(),
+  },
+  { additionalProperties: false }
+);
+
+export type PersistedTerminalFollowUp = Static<typeof terminalFollowUpSchema>;
+
+const handoffIdentitySchema = Type.Object(
+  {
+    predecessorId: Type.String(),
+    transferId: Type.String(),
+    suspendedAt: Type.Optional(Type.String()),
+  },
+  { additionalProperties: false }
+);
+
+export const suspensionDataSchema = Type.Object(
+  {
+    handoff: Type.Optional(handoffIdentitySchema),
     reason: Type.Union([Type.Literal("reload"), Type.Literal("quit")]),
     sessionId: Type.String(),
     suspendedAt: Type.String(),
+    terminalFollowUps: Type.Optional(Type.Array(terminalFollowUpSchema)),
     v: Type.Literal(SUSPENSION_VERSION),
     watches: Type.Array(persistedWatchSchema),
+  },
+  { additionalProperties: false }
+);
+
+const suspensionExtraSchema = Type.Object(
+  {
+    from: Type.String(),
+    handoff: Type.Optional(handoffIdentitySchema),
+    terminalFollowUps: Type.Optional(Type.Array(terminalFollowUpSchema)),
+    pendingPredecessor: Type.Optional(pendingPredecessorSchema),
   },
   { additionalProperties: false }
 );
@@ -72,15 +115,19 @@ export interface PersistedWatch {
 }
 
 export interface SuspensionData {
+  readonly handoff?: Static<typeof handoffIdentitySchema>;
   readonly reason: SuspensionReason;
   readonly sessionId: string;
   readonly suspendedAt: string;
   readonly v: typeof SUSPENSION_VERSION;
+  readonly terminalFollowUps?: readonly PersistedTerminalFollowUp[];
   readonly watches: readonly PersistedWatch[];
 }
 
 /** Marks a suspension entry as consumed by a process that started later. */
 export interface ResumedData {
+  /** Selected candidates before actors started; absent from older receipts. */
+  readonly intended?: number;
   readonly from: string;
   readonly resumed: number;
   readonly resumedAt: string;
@@ -95,31 +142,75 @@ export interface SuspensionRecord {
   readonly reason?: SuspensionReason;
   readonly sessionId?: string;
   readonly timestamp: string;
+  readonly suspendedAt?: string;
+  readonly handoff?: SuspensionData["handoff"];
+  readonly pendingPredecessor?: PendingPredecessor;
+  readonly terminalFollowUps?: readonly PersistedTerminalFollowUp[];
   readonly watches: readonly PersistedWatch[];
 }
 
 type LegacyWatch = Static<typeof legacyWatchSchema>;
 
-export const suspendWatch = (context: WatchContext): PersistedWatch => ({
+export const suspendWatch = (
+  context: WatchContext,
+  reload = true
+): PersistedWatch => ({
   definition: context.definition,
   facts: {
     ...context.facts,
-    reloads: context.facts.reloads + 1,
+    reloads: context.facts.reloads + Number(reload),
   },
 });
+
+/** Serialize only the original strict v3 fields; extras have their own entry. */
+export const journalSuspensionData = (data: SuspensionData) => ({
+  reason: data.reason,
+  sessionId: data.sessionId,
+  suspendedAt: data.suspendedAt,
+  v: data.v,
+  watches: [...data.watches],
+});
+
+export const RESUME_INTENDED_ENTRY_TYPE = "pi-until-resume-intended";
 
 export const suspensionData = (
   watches: readonly PersistedWatch[],
   now: number,
   reason: SuspensionReason,
-  sessionId: string
+  sessionId: string,
+  terminalFollowUps: readonly PersistedTerminalFollowUp[] = []
 ): SuspensionData => ({
+  ...(reason === "quit" && terminalFollowUps.length > 0
+    ? { terminalFollowUps: [...terminalFollowUps] }
+    : {}),
   reason,
   sessionId,
   suspendedAt: new Date(now).toISOString(),
   v: SUSPENSION_VERSION,
   watches: [...watches],
 });
+
+/** A carried quit is fresh; preserve its predecessor's identity only in extras. */
+export const carryRestoration = (
+  data: SuspensionData,
+  record: SuspensionRecord | undefined
+): SuspensionData =>
+  record === undefined
+    ? data
+    : {
+        ...data,
+        ...(record.handoff === undefined
+          ? {}
+          : {
+              handoff: {
+                ...record.handoff,
+                suspendedAt:
+                  record.handoff.suspendedAt ??
+                  record.suspendedAt ??
+                  record.timestamp,
+              },
+            }),
+      };
 
 export const resumedData = (
   from: string,
@@ -196,13 +287,84 @@ export const newestSuspension = (
         ...base,
         reason: entry.data.reason,
         sessionId: entry.data.sessionId,
+        suspendedAt: entry.data.suspendedAt,
+        terminalFollowUps: entry.data.terminalFollowUps,
+        handoff: entry.data.handoff,
         watches: entry.data.watches,
+        ...extraFor(entries.slice(index + 1), entry.id),
       };
     }
     return { ...base, watches: watchesFromData(entry.data) };
   }
   return undefined;
 };
+
+const extraFor = (entries: readonly SessionEntry[], from: string) => {
+  let extra: Omit<Static<typeof suspensionExtraSchema>, "from"> = {};
+  for (const entry of entries)
+    if (
+      entry.type === "custom" &&
+      entry.customType === SUSPENSION_EXTRA_ENTRY_TYPE &&
+      Value.Check(suspensionExtraSchema, entry.data) &&
+      entry.data.from === from
+    ) {
+      const { from: _from, ...value } = entry.data;
+      extra = value;
+    }
+  return extra;
+};
+
+const validTransferExtras = (entries: readonly SessionEntry[]) => {
+  const transfers: Static<typeof handoffIdentitySchema>[] = [];
+  for (const entry of entries) {
+    if (
+      entry.type !== "custom" ||
+      entry.customType !== SUSPENSION_EXTRA_ENTRY_TYPE ||
+      !Value.Check(suspensionExtraSchema, entry.data)
+    )
+      continue;
+    const data = entry.data;
+    const source = entries.find((item) => item.id === data.from);
+    if (
+      source?.type === "custom" &&
+      source.customType === SUSPENDED_ENTRY_TYPE &&
+      Value.Check(suspensionDataSchema, source.data) &&
+      data.handoff !== undefined
+    )
+      transfers.push(data.handoff);
+  }
+  return transfers;
+};
+
+export const predecessorHandled = (
+  entries: readonly SessionEntry[],
+  predecessorId: string
+): boolean =>
+  validTransferExtras(entries).some(
+    (item) => item.predecessorId === predecessorId
+  ) ||
+  entries.some(
+    (entry) =>
+      entry.type === "custom" &&
+      entry.customType === RESUMED_ENTRY_TYPE &&
+      typeof entry.data === "object" &&
+      entry.data !== null &&
+      "predecessorId" in entry.data &&
+      entry.data.predecessorId === predecessorId
+  );
+
+export const hasAdoptedTransfer = (
+  entries: readonly SessionEntry[],
+  transferId: string
+): boolean =>
+  validTransferExtras(entries).some((item) => item.transferId === transferId) ||
+  entries.some(
+    (entry) =>
+      entry.type === "custom" &&
+      entry.customType === SUSPENDED_ENTRY_TYPE &&
+      Value.Check(suspensionDataSchema, entry.data) &&
+      entry.data.handoff?.transferId === transferId
+  );
 
 export const suspendedWatchesFrom = (
   entries: readonly SessionEntry[]
@@ -259,12 +421,20 @@ export const quitSuspensionFor = (
   owner: RestartOwner
 ): SuspensionRecord | undefined => {
   const record = newestSuspension(entries);
-  if (record === undefined || record.watches.length === 0) return undefined;
+  if (
+    record === undefined ||
+    (record.watches.length === 0 &&
+      (record.terminalFollowUps?.length ?? 0) === 0 &&
+      record.pendingPredecessor === undefined)
+  )
+    return undefined;
   const after = entries.slice(record.index + 1);
   if (
     after.some(
       (entry) =>
-        entry.type === "custom" && entry.customType === RESUMED_ENTRY_TYPE
+        entry.type === "custom" &&
+        (entry.customType === RESUMED_ENTRY_TYPE ||
+          entry.customType === RESUME_INTENDED_ENTRY_TYPE)
     )
   ) {
     return undefined;
