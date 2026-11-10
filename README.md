@@ -79,7 +79,7 @@ ssh host 'test -f ~/migration/verify.done'
 Write conditions that fail closed. Exit 0 must prove the thing happened, not that nothing went wrong. pi-until checks immediately, so a condition that exits 0 on missing input wakes the agent with a false success on check 1:
 
 - An empty or missing script can exit 0. Gate on the evidence it produces instead: `grep -qx READY out.txt`, `test -s result.json`.
-- A pipeline exits with its last command's status. `cat log | grep -c done` exits 0 when it counts zero; `grep -q done log` does not.
+- A pipeline exits with its last command's status, so a pipeline ending in a command that always succeeds proves nothing: `grep done log | wc -l` exits 0 even when it counts zero. Gate on the test itself: `grep -q done log`.
 - A negation such as `! pgrep -f job` is true before the job starts. Pair it with positive evidence that the job ran, such as its output file.
 - Prove the evidence is fresh. A previous run's `results.txt` or a dead process's pid file makes `test -s results.txt` or `! kill -0 $(cat pid)` true before this run does anything. Clear old output first, or check for a marker unique to this run.
 - Do not arm a watch in the same tool batch that writes, moves, or resets anything its condition reads. Parallel calls can run the first check before that call lands.
