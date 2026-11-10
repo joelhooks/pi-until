@@ -71,11 +71,6 @@
     }
   },
   "devEngines": {
-    "packageManager": {
-      "name": "npm",
-      "version": ">=11.16.0",
-      "onFail": "warn"
-    },
     "runtime": {
       "name": "node",
       "version": ">=24.18.0",
@@ -83,8 +78,7 @@
     }
   },
   "engines": {
-    "node": ">=24.18.0",
-    "npm": ">=11.16.0"
+    "node": ">=24.18.0"
   },
   "packageManager": "npm@11.16.0",
   "pi": {
