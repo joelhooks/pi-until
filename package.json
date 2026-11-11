@@ -38,12 +38,12 @@
     "pack:dry": "npm pack --dry-run"
   },
   "dependencies": {
-    "@earendil-works/pi-tui": "0.84.2",
     "xstate": "5.32.5"
   },
   "devDependencies": {
     "@earendil-works/pi-ai": "0.87.1",
     "@earendil-works/pi-coding-agent": "0.87.1",
+    "@earendil-works/pi-tui": "0.87.1",
     "@types/node": "24.13.3",
     "oxfmt": "0.59.0",
     "oxlint": "1.74.0",
@@ -57,6 +57,7 @@
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
     "typebox": "*"
   },
   "peerDependenciesMeta": {
@@ -64,6 +65,9 @@
       "optional": true
     },
     "@earendil-works/pi-coding-agent": {
+      "optional": true
+    },
+    "@earendil-works/pi-tui": {
       "optional": true
     },
     "typebox": {
