@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import { appendFileSync, mkdirSync } from "node:fs";
+import { join } from "node:path";
 
 import type {
   ExtensionAPI,
@@ -35,6 +37,7 @@ import type {
   WatchActorInput,
   WatchDefinition,
 } from "../src/domain.ts";
+import { registerExitPersistence } from "../src/exit-hooks.ts";
 import {
   createFollowUpMachine,
   parseExternalFollowUpRequest,
@@ -45,6 +48,9 @@ import {
   completeHandoff,
   completeOwnHandoff,
   consumeOwnHandoff,
+  claimedHandoffSync,
+  quitOwnershipSync,
+  prepareHandoff,
   DEFAULT_HANDOFF_WAIT_MS,
   handoffOptionsFromEnv,
   publishHandoffSync,
@@ -771,7 +777,7 @@ export default function piUntil(
       // fork snapshot only; the actual handoff remains the restoration authority.
       watches: pendingWatchSummaries(
         currentContext?.sessionManager.getBranch() ?? []
-      ),
+      ).filter((watch) => !watches.has(watch.id)),
     };
   };
   const listWithArbiter = (receipts: readonly WatchReceipt[]): string => {
@@ -1923,6 +1929,19 @@ export default function piUntil(
     const entries = ctx.sessionManager.getBranch();
     if (
       takeClaim &&
+      waiting !== undefined &&
+      waiting.claimed === undefined &&
+      handoff !== false
+    ) {
+      waiting.claimed = claimedHandoffSync(
+        handoff.directory,
+        waiting.predecessorId,
+        sessionId(ctx),
+        waiting.notBefore
+      );
+    }
+    if (
+      takeClaim &&
       waiting?.claimed !== undefined &&
       !hasAdoptedTransfer(entries, waiting.claimed.transferId)
     )
@@ -1950,7 +1969,7 @@ export default function piUntil(
   const writeShutdownSnapshot = (
     reason: string,
     ctx: ExtensionContext,
-    active: readonly WatchRecord[],
+    active: readonly PersistedWatch[],
     forwarding: ReturnType<typeof pendingHandoffAtQuit>,
     pendingTerminal: ReturnType<typeof terminalRequestsForQuit>
   ) => {
@@ -1973,12 +1992,7 @@ export default function piUntil(
                   pendingRestoration,
                   ctx.sessionManager.getBranch()
                 )),
-            ...active.map((record) =>
-              suspendWatch(
-                record.actor.getSnapshot().context,
-                reason === "reload"
-              )
-            ),
+            ...active,
           ].map((watch) => [watch.facts.id, watch])
         ).values(),
       ];
@@ -2024,40 +2038,72 @@ export default function piUntil(
 
   let shutdownState:
     | {
+        readonly reason: string;
         readonly active: readonly WatchRecord[];
+        readonly suspendedActive: readonly PersistedWatch[];
+        readonly pendingTerminal: ReturnType<typeof terminalRequestsForQuit>;
         readonly closingWait: SuccessorWait | undefined;
-        readonly forwarding: ReturnType<typeof pendingHandoffAtQuit>;
-        readonly quitData: ReturnType<typeof writeShutdownSnapshot>;
+        forwarding: ReturnType<typeof pendingHandoffAtQuit>;
+        quitData: ReturnType<typeof writeShutdownSnapshot>;
+        payload: ReturnType<typeof prepareHandoff> | undefined;
+        hadPendingRestoration: boolean;
         published: boolean;
       }
     | undefined;
   let removeProcessHooks: (() => void) | undefined;
+
+  const rejectTransferredRestoration = (ctx: ExtensionContext) => {
+    if (pendingRestoration === undefined || handoff === false) return;
+    const evidence = quitOwnershipSync({
+      directory: handoff.directory,
+      sessionId: sessionId(ctx),
+      suspendedAt: pendingRestoration.suspendedAt,
+    });
+    if (evidence.kind !== "transferred") return;
+    const record = pendingRestoration;
+    pendingRestoration = undefined;
+    ownership = "transferred";
+    markTransferred(record, ctx, evidence.transferId);
+  };
 
   const beginShutdown = (reason: string, ctx: ExtensionContext) => {
     if (shutdownState !== undefined) return shutdownState;
     shuttingDown = true;
     lifecycle += 1;
     const active = activeWatches();
+    const suspendedActive = active.map((record) =>
+      suspendWatch(record.actor.getSnapshot().context, reason === "reload")
+    );
     const closingWait = handoffWait;
+    if (reason === "quit") rejectTransferredRestoration(ctx);
     const forwarding = pendingHandoffAtQuit(
       ctx,
       closingWait,
       reason === "quit"
     );
-    // This is the first boundary: no await, UI write, or cancellation may
-    // precede the journal. A dead terminal can terminate Pi at the next yield.
+    const pendingTerminal = terminalRequestsForQuit();
+    // Persist before any cleanup await. Only positive foreign ownership
+    // evidence can exclude a pending restoration at this synchronous boundary.
     const quitData = writeShutdownSnapshot(
       reason,
       ctx,
-      active,
+      suspendedActive,
       forwarding,
-      terminalRequestsForQuit()
+      pendingTerminal
     );
     shutdownState = {
+      reason,
       active,
+      suspendedActive,
+      pendingTerminal,
       closingWait,
       forwarding,
       quitData,
+      payload:
+        quitData === undefined
+          ? undefined
+          : prepareHandoff(quitData, forwarding.pending),
+      hadPendingRestoration: pendingRestoration !== undefined,
       published: false,
     };
     closingWait?.controller.abort();
@@ -2067,67 +2113,106 @@ export default function piUntil(
     return shutdownState;
   };
 
-  const publishShutdown = (state: NonNullable<typeof shutdownState>) => {
-    if (state.published || state.quitData === undefined || handoff === false)
+  const reconcileShutdown = (
+    state: NonNullable<typeof shutdownState>,
+    ctx: ExtensionContext
+  ) => {
+    if (state.reason !== "quit" || state.published) return;
+    rejectTransferredRestoration(ctx);
+    const settled = pendingHandoffAtQuit(ctx, state.closingWait, true);
+    // Our first journal may itself mark the captured transfer as adopted.
+    // Absence after that journal must not erase watches already captured.
+    const forwarding =
+      settled.captured === undefined && state.forwarding.captured !== undefined
+        ? state.forwarding
+        : settled;
+    const transferred =
+      state.hadPendingRestoration && ownership === "transferred";
+    if (
+      !transferred &&
+      forwarding.captured?.transferId === state.forwarding.captured?.transferId
+    )
       return;
-    publishHandoffSync(
-      handoff.directory,
-      state.quitData,
-      state.forwarding.pending
+    // A rename/ownership check can settle after the first journal. Correct it
+    // before the one publication; the newest suspension is authoritative.
+    state.forwarding = forwarding;
+    state.quitData = writeShutdownSnapshot(
+      "quit",
+      ctx,
+      state.suspendedActive,
+      forwarding,
+      state.pendingTerminal
     );
-    state.published = true;
+    state.hadPendingRestoration = pendingRestoration !== undefined;
+    const transferId =
+      state.payload !== undefined && "transferId" in state.payload
+        ? state.payload.transferId
+        : undefined;
+    state.payload =
+      state.quitData === undefined
+        ? undefined
+        : prepareHandoff(state.quitData, forwarding.pending, transferId);
+  };
+
+  const publishShutdown = (state: NonNullable<typeof shutdownState>) => {
+    if (state.published || state.payload === undefined || handoff === false)
+      return;
+    publishHandoffSync(handoff.directory, state.payload, {
+      onPublished: () => {
+        state.published = true;
+      },
+    });
+  };
+
+  const logPersistenceFailure = (ctx: ExtensionContext, error: unknown) => {
+    if (handoff === false) return;
+    try {
+      mkdirSync(handoff.directory, { recursive: true, mode: 0o700 });
+      // Never persist error messages, commands, output, or watch definitions.
+      const code =
+        error instanceof Error &&
+        "code" in error &&
+        typeof error.code === "string"
+          ? error.code
+          : "PERSIST_FAILED";
+      appendFileSync(
+        join(handoff.directory, "persistence-errors.jsonl"),
+        `${JSON.stringify({ at: new Date(clock.now()).toISOString(), sessionId: sessionId(ctx), code })}\n`,
+        { mode: 0o600 }
+      );
+    } catch {
+      // The storage itself may be unavailable. Never write to a dead terminal.
+    }
   };
 
   const installProcessHooks = (ctx: ExtensionContext) => {
     removeProcessHooks?.();
-    const persistExit = () => {
-      // Pi's emergencyTerminalExit bypasses session_shutdown on EIO. Do not
-      // touch the terminal here. Kill our process groups before making work
-      // available to a successor, including TERM-resistant descendants.
+    const persist = (publish: boolean) => {
       try {
         const state = beginShutdown("quit", ctx);
+        // Only running checks remain tracked; kill their groups before exit.
         shellRunner.kill();
-        publishShutdown(state);
-      } catch {
-        // An exit hook must not turn a private persistence error into a crash.
+        if (publish) {
+          reconcileShutdown(state, ctx);
+          publishShutdown(state);
+        }
+      } catch (error) {
+        logPersistenceFailure(ctx, error);
       }
     };
-    const onExit = (code: number) => {
-      // Pi uses 129 for a dead terminal. An unrelated crash is not a quit
-      // authority; SIGKILL cannot run this hook at all.
-      if (code === 0 || code === 129 || code === 143) persistExit();
-    };
-    const onHangup = () => {
-      persistExit();
-      // Hosts without their own signal handler still retain normal signal exit.
-      if (process.listenerCount("SIGHUP") === 1) {
-        removeProcessHooks?.();
-        process.kill(process.pid, "SIGHUP");
-      }
-    };
-    const onTerminate = () => {
-      persistExit();
-      if (process.listenerCount("SIGTERM") === 1) {
-        removeProcessHooks?.();
-        process.kill(process.pid, "SIGTERM");
-      }
-    };
-    process.on("exit", onExit);
-    process.on("SIGHUP", onHangup);
-    process.on("SIGTERM", onTerminate);
-    removeProcessHooks = () => {
-      process.off("exit", onExit);
-      process.off("SIGHUP", onHangup);
-      process.off("SIGTERM", onTerminate);
-      removeProcessHooks = undefined;
-    };
+    removeProcessHooks = registerExitPersistence({
+      signal: () => persist(false),
+      exit: () => persist(true),
+    });
   };
 
   pi.on("session_shutdown", async (event, ctx) => {
     const state = beginShutdown(event.reason, ctx);
-    const { active, closingWait, forwarding } = state;
+    const { active, closingWait } = state;
     await closingWait?.task;
     await restorationTask;
+    reconcileShutdown(state, ctx);
+    const { forwarding } = state;
     handoffWait = undefined;
     await shellRunner.drain();
     for (const record of active) {
