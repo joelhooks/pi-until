@@ -18,6 +18,11 @@ afterEach(async () => {
   for (const directory of directories.splice(0))
     rmSync(directory, { recursive: true, force: true });
 });
+const processListeners = () => [
+  process.listeners("exit"),
+  process.listeners("SIGHUP"),
+  process.listeners("SIGTERM"),
+];
 const fixture = () => {
   const directory = mkdtempSync(join(tmpdir(), "until-exit-"));
   directories.push(directory);
@@ -98,7 +103,21 @@ it("journals on a caught signal but waits for host settlement to publish", async
       newestSuspension(session.entries)?.watches.map((watch) => watch.facts.id)
     ).toEqual([receipt.id]);
     expect(existsSync(join(directory, `${session.id}.json`))).toBe(false);
-    await vi.advanceTimersByTimeAsync(5_000);
+    const manager = ctx.sessionManager;
+    try {
+      Object.defineProperty(ctx, "sessionManager", {
+        configurable: true,
+        get: () => {
+          throw new Error("This extension ctx is stale");
+        },
+      });
+      await vi.advanceTimersByTimeAsync(5_000);
+    } finally {
+      Object.defineProperty(ctx, "sessionManager", {
+        configurable: true,
+        value: manager,
+      });
+    }
     expect(
       extension.telemetry.filter((event) => event.event === "signal-held")
     ).toEqual([{ event: "signal-held", signal: "SIGTERM", delayMs: 5_000 }]);
@@ -113,6 +132,20 @@ it("journals on a caught signal but waits for host settlement to publish", async
     process.off("SIGTERM", host);
     vi.useRealTimers();
   }
+});
+
+it("detaches process clients even when a non-quit shutdown journal fails", async () => {
+  const { session, extension, ctx } = fixture();
+  const before = processListeners();
+  await extension.sessionStart("startup", ctx);
+  await arm(extension, session);
+  extension.appendEntry.mockImplementationOnce(() => {
+    throw new Error("reload journal unavailable");
+  });
+  await expect(extension.shutdown("reload", ctx)).rejects.toThrow(
+    "reload journal unavailable"
+  );
+  expect(processListeners()).toEqual(before);
 });
 
 it("keeps an interrupted reload as reload work, not a quit handoff", async () => {

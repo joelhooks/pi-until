@@ -37,7 +37,7 @@ describe("telemetry", () => {
     const summary = summarizeTelemetry(events);
     expect(summary.heldSignals).toBe(1);
     expect(summaryText(summary, filePath)).toContain(
-      "watches stay stopped until reload"
+      "Signals held by a host for ≥5 s: 1."
     );
     const event = events[0];
     expect(event).toEqual({

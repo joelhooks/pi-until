@@ -349,7 +349,5 @@ export const summaryText = (
     `Actions: ${formatTally(summary.actions)}`,
     ...((summary.heldSignals ?? 0) === 0
       ? []
-      : [
-          `Signals held by a live host: ${summary.heldSignals}; watches stay stopped until reload.`,
-        ]),
+      : [`Signals held by a host for ≥5 s: ${summary.heldSignals}.`]),
   ].join("\n");

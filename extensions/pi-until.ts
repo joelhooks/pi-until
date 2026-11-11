@@ -2211,6 +2211,7 @@ export default function piUntil(
 
   const installProcessHooks = (ctx: ExtensionContext) => {
     removeProcessHooks?.();
+    const installedSessionId = sessionId(ctx);
     const persist = (publish: boolean) => {
       try {
         let state: NonNullable<typeof shutdownState>;
@@ -2232,60 +2233,68 @@ export default function piUntil(
       signal: () => persist(false),
       exit: () => persist(true),
       stillAlive: (signal, delayMs) => {
-        void track(sessionId(ctx), { event: "signal-held", signal, delayMs });
+        void track(installedSessionId, {
+          event: "signal-held",
+          signal,
+          delayMs,
+        });
       },
     });
   };
 
   pi.on("session_shutdown", async (event, ctx) => {
-    const state = beginShutdown(event.reason, ctx);
-    const { active, closingWait } = state;
-    await closingWait?.task;
-    await restorationTask;
-    reconcileShutdown(state, ctx);
-    const { forwarding } = state;
-    handoffWait = undefined;
-    await shellRunner.drain();
-    for (const record of active) {
-      record.actor.stop();
-    }
-    if (
-      handoff !== false &&
-      forwarding.captured !== undefined &&
-      forwarding.identity !== undefined &&
-      hasAdoptedTransfer(
-        ctx.sessionManager.getBranch(),
-        forwarding.captured.transferId
-      )
-    ) {
-      try {
-        await completeHandoff({
-          directory: handoff.directory,
-          predecessorId: forwarding.identity.predecessorId,
-          successorId: sessionId(ctx),
-          handoff: forwarding.captured,
-        });
-      } catch {
-        ctx.ui.notify(
-          "pi-until interrupted claim was journalled but cleanup failed; retained for inspection",
-          "warning"
-        );
+    try {
+      const state = beginShutdown(event.reason, ctx);
+      const { active, closingWait } = state;
+      await closingWait?.task;
+      await restorationTask;
+      reconcileShutdown(state, ctx);
+      const { forwarding } = state;
+      handoffWait = undefined;
+      await shellRunner.drain();
+      for (const record of active) {
+        record.actor.stop();
       }
-    }
-    // Publish only after old checks and their descendants are gone.
-    if (state.quitData !== undefined && handoff !== false) {
-      try {
-        publishShutdown(state);
-      } catch (error) {
-        ctx.ui.notify(
-          state.published
-            ? `pi-until handoff was published, but directory durability was not confirmed: ${String(error)}; publication will not be retried`
-            : `pi-until could not publish handoff: ${String(error)}; same-session quit recovery remains available`,
-          "error"
-        );
+      if (
+        handoff !== false &&
+        forwarding.captured !== undefined &&
+        forwarding.identity !== undefined &&
+        hasAdoptedTransfer(
+          ctx.sessionManager.getBranch(),
+          forwarding.captured.transferId
+        )
+      ) {
+        try {
+          await completeHandoff({
+            directory: handoff.directory,
+            predecessorId: forwarding.identity.predecessorId,
+            successorId: sessionId(ctx),
+            handoff: forwarding.captured,
+          });
+        } catch {
+          ctx.ui.notify(
+            "pi-until interrupted claim was journalled but cleanup failed; retained for inspection",
+            "warning"
+          );
+        }
       }
+      // Publish only after old checks and their descendants are gone.
+      if (state.quitData !== undefined && handoff !== false) {
+        try {
+          publishShutdown(state);
+        } catch (error) {
+          ctx.ui.notify(
+            state.published
+              ? `pi-until handoff was published, but directory durability was not confirmed: ${String(error)}; publication will not be retried`
+              : `pi-until could not publish handoff: ${String(error)}; same-session quit recovery remains available`,
+            "error"
+          );
+        }
+      }
+    } finally {
+      if (event.reason !== "quit") removeProcessHooks?.();
     }
-    removeProcessHooks?.();
+    if (event.reason === "quit") removeProcessHooks?.();
     watches.clear();
     terminalReceipts.length = 0;
     currentContext?.ui.setWidget(WIDGET_KEY, undefined);

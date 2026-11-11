@@ -23,6 +23,7 @@ const processGlobal = globalThis as typeof globalThis & {
 const signalExitListenerCount = (): number => {
   const emitters = new Set<unknown>([
     Reflect.get(process, "__signal_exit_emitter__"),
+    Reflect.get(globalThis, Symbol.for("signal-exit emitter")),
     Reflect.get(process, Symbol.for("signal-exit emitter")),
   ]);
   let count = 0;
@@ -65,7 +66,11 @@ const createRegistry = (): ExitRegistry => {
           for (const client of clients) {
             if (warned.has(client)) continue;
             warned.add(client);
-            client.stillAlive?.(signal, CAUGHT_SIGNAL_WARNING_MS);
+            try {
+              client.stillAlive?.(signal, CAUGHT_SIGNAL_WARNING_MS);
+            } catch {
+              // A stale client must not crash its host or skip live clients.
+            }
           }
         }, CAUGHT_SIGNAL_WARNING_MS);
         warningTimer.unref();

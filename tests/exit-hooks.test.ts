@@ -11,11 +11,16 @@ import {
 } from "../src/exit-hooks.ts";
 
 const installedModule = process.env.PI_UNTIL_SIGNAL_EXIT_MODULE;
+const companionModule = process.env.PI_UNTIL_SIGNAL_EXIT_COMPANION_MODULE;
 const modes = [
   "bare",
   "v3",
   "v4",
+  "v3+v4",
   ...(installedModule === undefined ? [] : ["installed"]),
+  ...(installedModule === undefined || companionModule === undefined
+    ? []
+    : ["installed-both"]),
 ];
 const cases = modes.flatMap((mode) =>
   [1, 2].flatMap((count) =>
@@ -43,21 +48,30 @@ it.each(cases)(
       const write = (event) => appendFileSync(${JSON.stringify(proof)}, JSON.stringify(event)+'\\n');
       const kill = process.kill.bind(process);
       process.kill = (pid, signal) => { write({kind:'kill', signal}); return kill(pid, signal); };
-      if (mode === 'installed') {
-        const loaded = createRequire(import.meta.url)(${JSON.stringify(installedModule)});
-        (loaded.onExit ?? loaded)((code, signal) => write({kind:'signal-exit', signal}));
+      if (mode.startsWith('installed')) {
+        const modules = [${JSON.stringify(installedModule)}];
+        if (mode === 'installed-both') modules.push(${JSON.stringify(companionModule)});
+        for (const path of modules) {
+          const loaded = createRequire(import.meta.url)(path);
+          (loaded.onExit ?? loaded)((code, signal) => write({kind:'signal-exit', signal}));
+        }
       } else if (mode !== 'bare') {
-        // Exact v3/v4 count ownership shape and v3's mutually waiting listener.
-        const emitter = { count: 1 };
-        process[mode === 'v3' ? '__signal_exit_emitter__' : Symbol.for('signal-exit emitter')] = emitter;
-        const listener = () => {
-          if (process.listeners(signal).length !== emitter.count) return;
-          process.off(signal, listener);
-          emitter.count -= 1;
-          write({kind:'signal-exit', signal});
-          process.kill(process.pid, signal);
+        const installObserver = (version) => {
+          const emitter = { count: 1 };
+          if (version === 'v3') process.__signal_exit_emitter__ = emitter;
+          else globalThis[Symbol.for('signal-exit emitter')] = emitter;
+          const listener = () => {
+            const v3count = version === 'v4' ? (process.__signal_exit_emitter__?.count ?? 0) : 0;
+            if (process.listeners(signal).length !== emitter.count + v3count) return;
+            process.off(signal, listener);
+            emitter.count -= 1;
+            write({kind:'signal-exit', signal});
+            process.kill(process.pid, signal);
+          };
+          process.on(signal, listener);
         };
-        process.on(signal, listener);
+        if (mode === 'v3+v4') { installObserver('v3'); installObserver('v4'); }
+        else installObserver(mode);
       }
       for (let index=0; index<${count}; index++) {
         const install = index === 0 ? registerExitPersistence : (await import(${JSON.stringify(new URL("../src/exit-hooks.ts?duplicate", import.meta.url).href)})).registerExitPersistence;
@@ -82,17 +96,20 @@ it.each(cases)(
           .trim()
           .split("\n")
           .map((line) => JSON.parse(line));
+      let observers = 1;
+      if (mode === "bare") observers = 0;
+      else if (mode === "v3+v4" || mode === "installed-both") observers = 2;
       expect(rows.find((row) => row.kind === "listeners")?.count).toBe(
-        mode === "bare" ? 1 : 2
+        1 + observers
       );
       expect(rows.filter((row) => row.kind === "journal")).toHaveLength(count);
       expect(rows.filter((row) => row.kind === "publish")).toHaveLength(count);
       expect(rows.filter((row) => row.kind === "kill")).toHaveLength(
-        mode === "bare" ? 2 : 3
+        2 + observers
       );
       expect(rows.filter((row) => row.kind === "still-alive")).toEqual([]);
       expect(rows.filter((row) => row.kind === "signal-exit")).toHaveLength(
-        mode === "bare" ? 0 : 1
+        observers
       );
     } finally {
       rmSync(directory, { recursive: true, force: true });
@@ -130,6 +147,44 @@ it("lets a once-only host finish settling before signal publication", () => {
     "publish",
   ]);
 });
+
+it("isolates a stale client's timer while a live host drains and publishes", () => {
+  const result = spawnSync(
+    process.execPath,
+    [
+      "--input-type=module",
+      "-e",
+      `
+    import { writeSync } from 'node:fs';
+    import { registerExitPersistence } from ${JSON.stringify(new URL("../src/exit-hooks.ts", import.meta.url).href)};
+    const events = [];
+    registerExitPersistence({ signal: () => {}, exit: () => {}, stillAlive: () => { throw new Error('This extension ctx is stale'); } });
+    registerExitPersistence({
+      signal: () => events.push('live journal'),
+      stillAlive: () => events.push('host held signal'),
+      exit: () => { events.push('live publish'); writeSync(1, JSON.stringify(events)); },
+    });
+    process.on('SIGTERM', () => {
+      events.push('host caught');
+      setTimeout(() => { events.push('host drained'); process.exit(0); }, 6000);
+    });
+    setTimeout(() => process.exit(97), 8000);
+    process.kill(process.pid, 'SIGTERM');
+  `,
+    ],
+    { encoding: "utf-8", timeout: 10_000 }
+  );
+  expect(result.error, result.stderr).toBeUndefined();
+  expect(result.signal).toBeNull();
+  expect(result.status, result.stderr).toBe(0);
+  expect(JSON.parse(result.stdout)).toEqual([
+    "live journal",
+    "host caught",
+    "host held signal",
+    "host drained",
+    "live publish",
+  ]);
+}, 12_000);
 
 afterEach(() => {
   vi.useRealTimers();
