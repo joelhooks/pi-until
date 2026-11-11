@@ -90,94 +90,117 @@ it.each([
   "before rename",
   "after rename",
   "before rename with journal failure",
-] as const)(
-  "forwards an interrupted claim %s to a third successor",
-  async (phase) => {
-    const { directory, parent, successor, next, receipt } = await setup();
-    const actual = await vi.importActual<typeof fs>("node:fs/promises");
-    const entered = deferred();
-    const release = deferred();
-    vi.mocked(fs.rename).mockImplementation(async (source, target) => {
-      if (String(source) !== join(directory, `${parent.id}.json`))
-        return actual.rename(source, target);
-      if (phase === "after rename") await actual.rename(source, target);
-      entered.resolve();
-      await release.promise;
-      if (phase !== "after rename") await actual.rename(source, target);
+] as const)("handles an interrupted claim %s", async (phase) => {
+  const { directory, parent, successor, next, receipt } = await setup();
+  const actual = await vi.importActual<typeof fs>("node:fs/promises");
+  const entered = deferred();
+  const release = deferred();
+  vi.mocked(fs.rename).mockImplementation(async (source, target) => {
+    if (String(source) !== join(directory, `${parent.id}.json`))
+      return actual.rename(source, target);
+    if (phase === "after rename") await actual.rename(source, target);
+    entered.resolve();
+    await release.promise;
+    if (phase !== "after rename") await actual.rename(source, target);
+  });
+  const beforeExit = new Set(process.listeners("exit"));
+  const startContext = successor.context().ctx;
+  await next.sessionStart("startup", startContext);
+  await entered.promise;
+  let stopping: Promise<void>;
+  if (phase === "after rename") {
+    // Only the file exists: the async claim result has not reached adoptLink.
+    expect(
+      handoff.claimedHandoffSync(directory, parent.id, successor.id)
+    ).toMatchObject({
+      suspension: { watches: [{ facts: { id: receipt.id } }] },
     });
-    const beforeExit = new Set(process.listeners("exit"));
-    await next.sessionStart("startup", successor.context().ctx);
-    await entered.promise;
-    let stopping: Promise<void>;
-    if (phase === "after rename") {
-      // Only the file exists: the async claim result has not reached adoptLink.
-      expect(
-        handoff.claimedHandoffSync(directory, parent.id, successor.id)
-      ).toMatchObject({
-        suspension: { watches: [{ facts: { id: receipt.id } }] },
-      });
-      const hook = process
-        .listeners("exit")
-        .find((listener) => !beforeExit.has(listener));
-      expect(hook).toBeDefined();
-      hook?.(129);
-      expect(
-        newestSuspension(successor.entries)?.watches.map(
-          (watch) => watch.facts.id
-        )
-      ).toEqual([receipt.id]);
-      stopping = next.shutdown("quit");
-    } else {
-      stopping = next.shutdown("quit");
-      expect(newestSuspension(successor.entries)?.watches).toEqual([]);
-      expect(existsSync(join(directory, `${successor.id}.json`))).toBe(false);
-    }
-    if (phase === "before rename with journal failure") {
-      const append = next.appendEntry.getMockImplementation();
-      if (append === undefined)
-        throw new Error("missing append implementation");
-      let fail = true;
-      next.appendEntry.mockImplementation((type, data) => {
-        if (type === SUSPENDED_ENTRY_TYPE && fail) {
-          fail = false;
-          throw new Error("corrective journal unavailable");
-        }
-        append(type, data);
-      });
-      release.resolve();
-      await expect(stopping).rejects.toThrow("corrective journal unavailable");
-      const hook = process
-        .listeners("exit")
-        .find((listener) => !beforeExit.has(listener));
-      expect(hook).toBeDefined();
-      hook?.(129);
-    } else {
-      release.resolve();
-      await stopping;
-    }
+    const hook = process
+      .listeners("exit")
+      .find((listener) => !beforeExit.has(listener));
+    expect(hook).toBeDefined();
+    hook?.(129);
     expect(
       newestSuspension(successor.entries)?.watches.map(
         (watch) => watch.facts.id
       )
     ).toEqual([receipt.id]);
-    expect(
-      next.entries.filter((entry) => entry.customType === SUSPENDED_ENTRY_TYPE)
-    ).toHaveLength(phase === "after rename" ? 1 : 2);
-    const third = successor.fork();
-    const last = loadExtension(third, {
-      handoff: {
-        directory,
-        predecessorId: successor.id,
-        successorId: third.id,
-      },
-    });
-    extensions.push(last);
-    await last.sessionStart("startup", third.context().ctx);
-    await vi.waitFor(async () =>
-      expect(await ids(last, third)).toEqual([receipt.id])
-    );
+    stopping = next.shutdown("quit");
+  } else {
+    stopping = next.shutdown("quit");
+    expect(newestSuspension(successor.entries)?.watches).toEqual([]);
+    expect(existsSync(join(directory, `${successor.id}.json`))).toBe(false);
   }
-);
+  if (phase === "before rename with journal failure") {
+    const append = next.appendEntry.getMockImplementation();
+    if (append === undefined) throw new Error("missing append implementation");
+    let fail = true;
+    next.appendEntry.mockImplementation((type, data) => {
+      if (type === SUSPENDED_ENTRY_TYPE && fail) {
+        fail = false;
+        throw new Error("corrective journal unavailable");
+      }
+      append(type, data);
+    });
+    release.resolve();
+    await expect(stopping).rejects.toThrow("corrective journal unavailable");
+    const hook = process
+      .listeners("exit")
+      .find((listener) => !beforeExit.has(listener));
+    expect(hook).toBeDefined();
+    const manager = startContext.sessionManager;
+    try {
+      Object.defineProperty(startContext, "sessionManager", {
+        configurable: true,
+        get: () => {
+          throw new Error("This extension ctx is stale");
+        },
+      });
+      hook?.(129);
+      const failures = readFileSync(
+        join(directory, handoff.PERSISTENCE_ERRORS_FILE),
+        "utf-8"
+      )
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line));
+      expect(failures).toEqual([
+        {
+          at: expect.any(String),
+          sessionId: successor.id,
+          code: "PERSIST_FAILED",
+        },
+      ]);
+    } finally {
+      Object.defineProperty(startContext, "sessionManager", {
+        configurable: true,
+        value: manager,
+      });
+    }
+    return;
+  }
+  release.resolve();
+  await stopping;
+  expect(
+    newestSuspension(successor.entries)?.watches.map((watch) => watch.facts.id)
+  ).toEqual([receipt.id]);
+  expect(
+    next.entries.filter((entry) => entry.customType === SUSPENDED_ENTRY_TYPE)
+  ).toHaveLength(phase === "after rename" ? 1 : 2);
+  const third = successor.fork();
+  const last = loadExtension(third, {
+    handoff: {
+      directory,
+      predecessorId: successor.id,
+      successorId: third.id,
+    },
+  });
+  extensions.push(last);
+  await last.sessionStart("startup", third.context().ctx);
+  await vi.waitFor(async () =>
+    expect(await ids(last, third)).toEqual([receipt.id])
+  );
+});
 
 it.each(["claim", "receipt"] as const)(
   "does not re-suspend a pending restoration transferred by %s",
@@ -197,6 +220,15 @@ it.each(["claim", "receipt"] as const)(
     );
     expect(await ids(next, successor)).toEqual([receipt.id]);
     if (evidence === "claim") {
+      // completeHandoff writes its receipt before unlinking the old claim.
+      // Wait for that unlink before planting synthetic claim-only evidence.
+      await vi.waitFor(() =>
+        expect(
+          existsSync(
+            join(directory, "claimed", `${parent.id}!${successor.id}.json`)
+          )
+        ).toBe(false)
+      );
       await fs.writeFile(
         join(directory, "claimed", `${parent.id}!${successor.id}.json`),
         originalPayload,

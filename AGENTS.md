@@ -12,7 +12,7 @@ npm run check
 npm run pack:dry
 ```
 
-Node is `24.18.0` or newer. Maintainers and CI use npm `11.16.0` (the `packageManager` field); any modern npm can install the package, so consumers get no npm pin. Never Bun. Dependencies are exact-pinned.
+Node is `24.18.0` or newer. Maintainers and CI use npm `11.16.0` (the `packageManager` field); any modern npm can install the package, so consumers get no npm pin. Never Bun. Dependencies are exact-pinned. `npm run check` discovers npm's bundled v4 and the repository's v3 for real mixed-observer tests; missing modules produce a loud coverage warning rather than a silent skip.
 
 ## Architecture
 
@@ -42,7 +42,7 @@ Node is `24.18.0` or newer. Maintainers and CI use npm `11.16.0` (the `packageMa
 - Starting a watch returns immediately.
 - Cancellation aborts the active check and its descendants on macOS and Linux.
 - Condition stdout and stderr are discarded, never added to receipts or model context.
-- Session shutdown marks its boundary before fallible journal I/O and cancels actors even if that I/O fails. Retries use frozen pre-cancellation values. It journals synchronously, then awaits claim/restoration settlement and process-tree cleanup before publishing once. A corrective suspension may supersede the initial journal when ownership settles. Emergency exit can probe completed claims but cannot wait for an in-flight filesystem rename. Mark publication committed at rename, not after directory fsync.
+- Session shutdown marks its boundary before fallible journal I/O and cancels actors even if that I/O fails. Retries while the context remains live use frozen pre-cancellation values. After a failed graceful quit, Pi invalidates the context before process exit; do not claim exit-time recovery. Inspect shutdown/publication notices and the private error log, then use `/until-resume` for any available saved suspension. It journals synchronously, then awaits claim/restoration settlement and process-tree cleanup before publishing once. A corrective suspension may supersede the initial journal when ownership settles. Emergency exit can probe completed claims but cannot wait for an in-flight filesystem rename. Mark publication committed at rename, not after directory fsync.
 - `session_shutdown { reason: "reload" }` and `{ reason: "quit" }` suspend watches to a version 3 session entry that records the reason and owning session id. Session replacement writes nothing. A print or JSON run writes no quit entry. Normal reloads and long-lived quits write an entry even when empty, so the newest entry wins. A reload interrupting startup restoration retains the original quit entry; see the deferred edge in Brain.
 - `session_start { reason: "reload" }` resumes the newest entry. `session_start` with reason `startup` or `resume` in a long-lived process resumes the newest entry only when it is an unconsumed quit entry that names this session. A version 2 entry counts only when it is newer than the session header and no message follows it. The resume skips expired, finished, duplicate, and already-active watches, then appends `pi-until-resumed` to consume the entry. `new`, `fork`, a forked copy of a quit entry, and a reload entry resume nothing on startup.
 - `/until-resume` is the manual path when automatic recovery did not apply. It uses the same skips and also consumes the entry.

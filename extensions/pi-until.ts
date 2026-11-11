@@ -2188,7 +2188,10 @@ export default function piUntil(
     });
   };
 
-  const logPersistenceFailure = (ctx: ExtensionContext, error: unknown) => {
+  const logPersistenceFailure = (
+    installedSessionId: string,
+    error: unknown
+  ) => {
     if (handoff === false) return;
     try {
       mkdirSync(handoff.directory, { recursive: true, mode: 0o700 });
@@ -2201,7 +2204,7 @@ export default function piUntil(
           : "PERSIST_FAILED";
       appendFileSync(
         join(handoff.directory, PERSISTENCE_ERRORS_FILE),
-        `${JSON.stringify({ at: new Date(clock.now()).toISOString(), sessionId: sessionId(ctx), code })}\n`,
+        `${JSON.stringify({ at: new Date(clock.now()).toISOString(), sessionId: installedSessionId, code })}\n`,
         { mode: 0o600 }
       );
     } catch {
@@ -2226,7 +2229,7 @@ export default function piUntil(
           publishShutdown(state);
         }
       } catch (error) {
-        logPersistenceFailure(ctx, error);
+        logPersistenceFailure(installedSessionId, error);
       }
     };
     removeProcessHooks = registerExitPersistence({
