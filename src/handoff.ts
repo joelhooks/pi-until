@@ -1,5 +1,14 @@
 import { randomUUID } from "node:crypto";
-import { watch } from "node:fs";
+import {
+  watch,
+  mkdirSync,
+  openSync,
+  writeFileSync,
+  fsyncSync,
+  closeSync,
+  renameSync,
+  unlinkSync,
+} from "node:fs";
 import {
   mkdir,
   open,
@@ -94,6 +103,62 @@ export const handoffOptionsFromEnv = (
   delete env.PI_UNTIL_SUCCEEDS;
   delete env.PI_UNTIL_SUCCESSOR_ID;
   return options;
+};
+
+const pendingReceiptSchema = Type.Object(
+  {
+    receipt: Type.Object(
+      {
+        id: Type.String(),
+        label: Type.String(),
+        expiresAt: Type.Optional(Type.String()),
+      },
+      { additionalProperties: true }
+    ),
+  },
+  { additionalProperties: true }
+);
+
+/** Advisory inventory from the fork snapshot, never authority to start work. */
+export const pendingWatchSummaries = (entries: readonly SessionEntry[]) => {
+  const candidates = new Map<
+    string,
+    { id: string; label: string; expiresAt?: string }
+  >();
+  for (const entry of entries) {
+    if (entry.type !== "custom") continue;
+    if (
+      entry.customType === "pi-until-started" &&
+      Value.Check(pendingReceiptSchema, entry.data)
+    ) {
+      const { id, label, expiresAt } = entry.data.receipt;
+      candidates.set(id, { id, label, expiresAt });
+    } else if (
+      entry.customType === SUSPENDED_ENTRY_TYPE &&
+      Value.Check(suspensionDataSchema, entry.data)
+    ) {
+      candidates.clear();
+      for (const { definition, facts } of entry.data.watches) {
+        candidates.set(facts.id, {
+          id: facts.id,
+          label: definition.label,
+          expiresAt:
+            definition.expiresAt === undefined
+              ? undefined
+              : new Date(definition.expiresAt).toISOString(),
+        });
+      }
+    } else if (
+      entry.customType === "pi-until-finished" &&
+      typeof entry.data === "object" &&
+      entry.data !== null &&
+      "id" in entry.data &&
+      typeof entry.data.id === "string"
+    ) {
+      candidates.delete(entry.data.id);
+    }
+  }
+  return [...candidates.values()];
 };
 
 export const SUCCESSOR_ENTRY_TYPE = "pi-until-successor";
@@ -291,32 +356,73 @@ const tombstoneSchema = Type.Object(
   { additionalProperties: false }
 );
 
-export const publishHandoff = async (
-  directory: string,
+const handoffPayload = (
   suspension: SuspensionData,
   pendingPredecessor?: PendingPredecessor
-): Promise<void> => {
+) => {
   if (suspension.reason !== "quit" || !validId(suspension.sessionId))
     throw new Error("A handoff requires a graceful quit and a safe session id");
   const empty =
     suspension.watches.length === 0 &&
     (suspension.terminalFollowUps?.length ?? 0) === 0 &&
     pendingPredecessor === undefined;
+  return empty
+    ? {
+        empty: true,
+        sessionId: suspension.sessionId,
+        suspendedAt: suspension.suspendedAt,
+      }
+    : {
+        suspension,
+        transferId: randomUUID(),
+        ...(pendingPredecessor === undefined ? {} : { pendingPredecessor }),
+      };
+};
+
+export const publishHandoff = async (
+  directory: string,
+  suspension: SuspensionData,
+  pendingPredecessor?: PendingPredecessor
+): Promise<void> => {
   await writeAtomic(
     directory,
     `${suspension.sessionId}.json`,
-    empty
-      ? {
-          empty: true,
-          sessionId: suspension.sessionId,
-          suspendedAt: suspension.suspendedAt,
-        }
-      : {
-          suspension,
-          transferId: randomUUID(),
-          ...(pendingPredecessor === undefined ? {} : { pendingPredecessor }),
-        }
+    handoffPayload(suspension, pendingPredecessor)
   );
+};
+
+/** Exit hooks cannot await filesystem promises. Publish the same private,
+ * atomic mailbox without yielding to a dead-terminal emergency exit. */
+export const publishHandoffSync = (
+  directory: string,
+  suspension: SuspensionData,
+  pendingPredecessor?: PendingPredecessor
+): void => {
+  const payload = handoffPayload(suspension, pendingPredecessor);
+  mkdirSync(directory, { recursive: true, mode: 0o700 });
+  const temporary = join(directory, `.${randomUUID()}.tmp`);
+  const file = openSync(temporary, "wx", 0o600);
+  try {
+    writeFileSync(file, JSON.stringify(payload));
+    fsyncSync(file);
+  } finally {
+    closeSync(file);
+  }
+  try {
+    renameSync(temporary, join(directory, `${suspension.sessionId}.json`));
+    const folder = openSync(directory, "r");
+    try {
+      fsyncSync(folder);
+    } finally {
+      closeSync(folder);
+    }
+  } finally {
+    try {
+      unlinkSync(temporary);
+    } catch {
+      // Rename already removed the temporary path. Preserve the write error.
+    }
+  }
 };
 
 const receiptSchema = Type.Object(

@@ -3,7 +3,7 @@ title: pi-until session lifecycle and delivery arbitration
 type: project
 status: active
 created: 2026-08-27
-updated: 2026-10-05
+updated: 2026-11-11
 tags: [pi-until, pi-extension, xstate, reload, recurrence, telemetry, compaction]
 ---
 
@@ -20,7 +20,9 @@ tags: [pi-until, pi-extension, xstate, reload, recurrence, telemetry, compaction
 - `/until-resume` remains the manual path when automatic recovery did not apply.
 - History: 2026-09-21 (`0.5.0`) made quit write an entry and added `/until-resume` as an explicit path. On 2026-09-22 Joel quit Pi for a runtime update. The drovr hawk session lost three watches because its process had loaded `cf28671` before `0.5.0` reached disk and never reloaded, so the reload-only handler ran at quit and wrote nothing. Even a written entry would have required a command nobody knew about. `0.6.0` makes quit-then-relaunch automatic. Version 2 quit entries left by `0.5.0` processes restore when they are newer than the session header and no message follows them.
 - Same-process session replacement creates a fresh session delivery arbiter. A stopped arbiter is never reused.
-- Session shutdown waits for shell process-tree cleanup.
+- Session shutdown writes its suspension synchronously before awaiting restoration, claim settlement, or shell cleanup. Normal shutdown still waits for shell process-tree cleanup before publication.
+- SIGHUP, SIGTERM, and Pi's dead-terminal exit codes 129/143 use the same once-only boundary. A synchronous `exit` hook covers emergency exits that skip extension teardown; unrelated crash exits do not create quit authority. The signal/exit path kills this extension's process groups before synchronous atomic publication. Repeated hooks preserve the same transfer id.
+- A waiting successor lists a separate pending inventory: ids, labels, watch expiry, predecessor, and handoff deadline. The fork snapshot is advisory, not permission to start actors. Unknown inventory stays visibly pending rather than inviting re-arming.
 
 Pi `0.84.2` supports this boundary through `session_shutdown`, `session_start`, `agent_settled`, `message_start`, `ctx.isIdle()`, custom session entries, and follow-up messages. The compaction hold also needs `session_before_compact`, `session_compact`, and `session_compact_failed`. Pi added `session_compact_failed` in `0.85`, so the dev pins moved to `0.87.1`, the fleet runtime. On older Pi, a failed compaction holds wakes until the next `agent_settled`.
 
@@ -76,6 +78,18 @@ The public contract lives across `README.md`, `src/command.ts`, the registered t
 - Per-watch delivery decisions: cannot enforce session-wide serialization.
 - Treating acknowledgement timeout as rejection: the accepted message can still start after slow `before_agent_start` hooks.
 - Pausing checks during compaction: a check never touches the session, and paused checks would delay the wake without protecting anything.
+
+## Terminal restart evidence (2026-11-11)
+
+A real interactive Pi 1.5.0-p10 under a private PTY reproduced the failure with one inert watch. `ctx.shutdown()` and SIGTERM with a live terminal each wrote one suspension and one mailbox. Closing the PTY master exited 129 without either write. A fixture observer registered after pi-until's shutdown handler was never reached; this does not prove that teardown never began.
+
+The installed interactive runtime handles SIGHUP/SIGTERM, but dead-terminal stream errors call `emergencyTerminalExit()`, which invokes `process.exit(129)` without extension cleanup. The extension runner awaits handlers in order, so an earlier handler or pi-until's own cleanup awaits can yield before the suspension is written. Moving only the session-shutdown write is insufficient; synchronous signal and exit hooks cover that gap.
+
+`tests/live-restart.py` exercises interactive quit, quit during a shell check, PTY-master close, SIGHUP, SIGTERM, and direct emergency exit. Two explicitly targeted successors compete for each handoff. The proof checks one parent suspension, one successor adoption, preserved watch identity/start/expiry, and zero model turns. `tests/restart-lifecycle.test.ts` covers synchronous writes with pending restoration and exactly-once publication across repeated hooks.
+
+### Handback when an adopted successor is discarded
+
+Do not equate `dropWatches` with handback. It does not say whether work was cancelled or relocated, and a running predecessor may still hold stale state. A safe handback needs an explicit ownership transfer from the current holder to one named recipient, a durable receipt consuming the current holder's work, and the same atomic claim protocol. Muster must name the recipient and distinguish discard from transfer before closing the pane. This is not a small extension-only change, so it remains deferred. Ordinary successor shutdown already forwards its owned watches and any pending predecessor chain.
 
 ## Current receipt
 
