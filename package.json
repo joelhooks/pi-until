@@ -34,7 +34,7 @@
     "lint": "ultracite check",
     "format": "oxfmt",
     "format:check": "oxfmt --check",
-    "check": "npm run typecheck && npm run lint && npm run format:check && npm test",
+    "check": "npm run typecheck && npm run lint && npm run format:check && node scripts/check-signals.mjs",
     "pack:dry": "npm pack --dry-run"
   },
   "dependencies": {

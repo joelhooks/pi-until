@@ -27,9 +27,10 @@ function signalProcessTree(
   }
 }
 
-const executeShellCondition: RunUntilCheck = async (
+const executeShellCondition = async (
   input: UntilCheckInput,
-  signal: AbortSignal
+  signal: AbortSignal,
+  pids: Set<number>
 ): Promise<UntilCheckResult> =>
   new Promise((resolve, reject) => {
     const child = spawn(input.command, [], {
@@ -40,6 +41,7 @@ const executeShellCondition: RunUntilCheck = async (
       stdio: "ignore",
     });
 
+    if (child.pid !== undefined) pids.add(child.pid);
     let killed = false;
     let settled = false;
     let forceKillTimer: ReturnType<typeof setTimeout> | undefined;
@@ -50,6 +52,7 @@ const executeShellCondition: RunUntilCheck = async (
         clearTimeout(forceKillTimer);
       }
       signal.removeEventListener("abort", terminate);
+      if (child.pid !== undefined) pids.delete(child.pid);
     }
 
     function settle(result: UntilCheckResult) {
@@ -101,15 +104,18 @@ const executeShellCondition: RunUntilCheck = async (
   });
 
 export interface ShellConditionRunner {
+  /** Last-resort synchronous termination before publishing from an exit hook. */
+  readonly kill: () => void;
   readonly drain: () => Promise<void>;
   readonly run: RunUntilCheck;
 }
 
 export const createShellConditionRunner = (): ShellConditionRunner => {
   const active = new Set<Promise<UntilCheckResult>>();
+  const pids = new Set<number>();
 
   const run: RunUntilCheck = (input, signal) => {
-    const task = executeShellCondition(input, signal);
+    const task = executeShellCondition(input, signal, pids);
     active.add(task);
     void (async () => {
       try {
@@ -127,7 +133,11 @@ export const createShellConditionRunner = (): ShellConditionRunner => {
     await Promise.allSettled(active);
   };
 
-  return { drain, run };
+  const kill = () => {
+    for (const pid of pids) signalProcessTree(pid, "SIGKILL");
+  };
+
+  return { drain, kill, run };
 };
 
 const defaultRunner = createShellConditionRunner();

@@ -100,12 +100,20 @@ const actionSchema = Type.Object({
   source: Type.Union([Type.Literal("tool"), Type.Literal("command")]),
 });
 
+const signalHeldSchema = Type.Object({
+  ...base,
+  event: Type.Literal("signal-held"),
+  signal: Type.Union([Type.Literal("SIGHUP"), Type.Literal("SIGTERM")]),
+  delayMs: Type.Number(),
+});
+
 const telemetryEventSchema = Type.Union([
   startedSchema,
   finishedSchema,
   suspendedSchema,
   resumedSchema,
   actionSchema,
+  signalHeldSchema,
 ]);
 
 export type TelemetryEvent = Static<typeof telemetryEventSchema>;
@@ -214,6 +222,7 @@ export interface TelemetrySummary {
   readonly sessions: number;
   readonly started: number;
   readonly suspendedWatches: number;
+  readonly heldSignals?: number;
 }
 
 const median = (values: readonly number[]): number | undefined => {
@@ -244,6 +253,7 @@ export const summarizeTelemetry = (
   let finished = 0;
   let suspendedWatches = 0;
   let resumedWatches = 0;
+  let heldSignals = 0;
 
   for (const event of events) {
     sessions.add(event.sessionId);
@@ -274,6 +284,10 @@ export const summarizeTelemetry = (
         count(actions, `${event.source}:${event.action}`);
         break;
       }
+      case "signal-held": {
+        heldSignals += 1;
+        break;
+      }
       default: {
         const exhaustive: never = event;
         throw new Error(`unhandled telemetry event ${String(exhaustive)}`);
@@ -292,6 +306,7 @@ export const summarizeTelemetry = (
     sessions: sessions.size,
     started,
     suspendedWatches,
+    ...(heldSignals === 0 ? {} : { heldSignals }),
   };
 };
 
@@ -332,4 +347,7 @@ export const summaryText = (
     `Median attempts: ${summary.medianAttempts ?? "n/a"}  median duration: ${formatDuration(summary.medianDurationMs)}`,
     `Reload suspended: ${summary.suspendedWatches}  resumed: ${summary.resumedWatches}`,
     `Actions: ${formatTally(summary.actions)}`,
+    ...((summary.heldSignals ?? 0) === 0
+      ? []
+      : [`Signals held by a host for ≥5 s: ${summary.heldSignals}.`]),
   ].join("\n");

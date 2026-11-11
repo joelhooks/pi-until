@@ -1,5 +1,16 @@
 import { randomUUID } from "node:crypto";
-import { watch } from "node:fs";
+import {
+  watch,
+  mkdirSync,
+  openSync,
+  writeFileSync,
+  fsyncSync,
+  closeSync,
+  renameSync,
+  unlinkSync,
+  readFileSync,
+  readdirSync,
+} from "node:fs";
 import {
   mkdir,
   open,
@@ -54,6 +65,17 @@ export const DEFAULT_HANDOFF_WAIT_MS = 30 * 60_000;
 export const DEFAULT_HANDOFF_RETENTION_MS = 7 * 24 * 60 * 60_000;
 export const DEFAULT_RECEIPT_RETENTION_MS = 180 * 24 * 60 * 60_000;
 const TEMP_RETENTION_MS = 24 * 60 * 60_000;
+export const PERSISTENCE_ERRORS_FILE = "persistence-errors.jsonl";
+const MAX_PERSISTENCE_ERROR_BYTES = 64 * 1024;
+const expiredErrorLog = (
+  name: string,
+  metadata: { mtimeMs: number; size: number },
+  now: number,
+  retentionMs: number
+): boolean =>
+  name === PERSISTENCE_ERRORS_FILE &&
+  (metadata.mtimeMs < now - retentionMs ||
+    metadata.size > MAX_PERSISTENCE_ERROR_BYTES);
 
 const positiveMilliseconds = (
   value: string | undefined,
@@ -94,6 +116,62 @@ export const handoffOptionsFromEnv = (
   delete env.PI_UNTIL_SUCCEEDS;
   delete env.PI_UNTIL_SUCCESSOR_ID;
   return options;
+};
+
+const pendingReceiptSchema = Type.Object(
+  {
+    receipt: Type.Object(
+      {
+        id: Type.String(),
+        label: Type.String(),
+        expiresAt: Type.Optional(Type.String()),
+      },
+      { additionalProperties: true }
+    ),
+  },
+  { additionalProperties: true }
+);
+
+/** Advisory inventory from the fork snapshot, never authority to start work. */
+export const pendingWatchSummaries = (entries: readonly SessionEntry[]) => {
+  const candidates = new Map<
+    string,
+    { id: string; label: string; expiresAt?: string }
+  >();
+  for (const entry of entries) {
+    if (entry.type !== "custom") continue;
+    if (
+      entry.customType === "pi-until-started" &&
+      Value.Check(pendingReceiptSchema, entry.data)
+    ) {
+      const { id, label, expiresAt } = entry.data.receipt;
+      candidates.set(id, { id, label, expiresAt });
+    } else if (
+      entry.customType === SUSPENDED_ENTRY_TYPE &&
+      Value.Check(suspensionDataSchema, entry.data)
+    ) {
+      candidates.clear();
+      for (const { definition, facts } of entry.data.watches) {
+        candidates.set(facts.id, {
+          id: facts.id,
+          label: definition.label,
+          expiresAt:
+            definition.expiresAt === undefined
+              ? undefined
+              : new Date(definition.expiresAt).toISOString(),
+        });
+      }
+    } else if (
+      entry.customType === "pi-until-finished" &&
+      typeof entry.data === "object" &&
+      entry.data !== null &&
+      "id" in entry.data &&
+      typeof entry.data.id === "string"
+    ) {
+      candidates.delete(entry.data.id);
+    }
+  }
+  return [...candidates.values()];
 };
 
 export const SUCCESSOR_ENTRY_TYPE = "pi-until-successor";
@@ -291,32 +369,91 @@ const tombstoneSchema = Type.Object(
   { additionalProperties: false }
 );
 
-export const publishHandoff = async (
-  directory: string,
+export type HandoffPayload =
+  | Handoff
+  | {
+      readonly empty: true;
+      readonly sessionId: string;
+      readonly suspendedAt: string;
+    };
+
+export const prepareHandoff = (
   suspension: SuspensionData,
-  pendingPredecessor?: PendingPredecessor
-): Promise<void> => {
+  pendingPredecessor?: PendingPredecessor,
+  transferId: string = randomUUID()
+): HandoffPayload => {
   if (suspension.reason !== "quit" || !validId(suspension.sessionId))
     throw new Error("A handoff requires a graceful quit and a safe session id");
   const empty =
     suspension.watches.length === 0 &&
     (suspension.terminalFollowUps?.length ?? 0) === 0 &&
     pendingPredecessor === undefined;
+  return empty
+    ? {
+        empty: true,
+        sessionId: suspension.sessionId,
+        suspendedAt: suspension.suspendedAt,
+      }
+    : {
+        suspension,
+        transferId,
+        ...(pendingPredecessor === undefined ? {} : { pendingPredecessor }),
+      };
+};
+
+export const publishHandoff = async (
+  directory: string,
+  suspension: SuspensionData,
+  pendingPredecessor?: PendingPredecessor
+): Promise<void> => {
   await writeAtomic(
     directory,
     `${suspension.sessionId}.json`,
-    empty
-      ? {
-          empty: true,
-          sessionId: suspension.sessionId,
-          suspendedAt: suspension.suspendedAt,
-        }
-      : {
-          suspension,
-          transferId: randomUUID(),
-          ...(pendingPredecessor === undefined ? {} : { pendingPredecessor }),
-        }
+    prepareHandoff(suspension, pendingPredecessor)
   );
+};
+
+/** Exit hooks cannot await filesystem promises. Publish the same private,
+ * atomic mailbox without yielding to a dead-terminal emergency exit. */
+export const publishHandoffSync = (
+  directory: string,
+  payload: ReturnType<typeof prepareHandoff>,
+  options: {
+    readonly onPublished?: () => void;
+    readonly syncDirectory?: (directory: string) => void;
+  } = {}
+): void => {
+  const sessionId =
+    "suspension" in payload ? payload.suspension.sessionId : payload.sessionId;
+  mkdirSync(directory, { recursive: true, mode: 0o700 });
+  const temporary = join(directory, `.${randomUUID()}.tmp`);
+  const file = openSync(temporary, "wx", 0o600);
+  try {
+    writeFileSync(file, JSON.stringify(payload));
+    fsyncSync(file);
+  } finally {
+    closeSync(file);
+  }
+  try {
+    renameSync(temporary, join(directory, `${sessionId}.json`));
+    // The payload is visible now, even if directory durability subsequently
+    // fails. Never publish it again after a successor could have claimed it.
+    options.onPublished?.();
+    if (options.syncDirectory === undefined) {
+      const folder = openSync(directory, "r");
+      try {
+        fsyncSync(folder);
+      } finally {
+        closeSync(folder);
+      }
+    } else options.syncDirectory(directory);
+  } finally {
+    try {
+      unlinkSync(temporary);
+    } catch {
+      // Rename already removed the temporary path. Preserve the write error.
+    }
+  }
 };
 
 const receiptSchema = Type.Object(
@@ -464,6 +601,11 @@ export const pruneHandoffs = async ({
                   await unlink(path);
               } else if (
                 folder === directory &&
+                expiredErrorLog(name, metadata, now, retentionMs)
+              ) {
+                await unlink(path);
+              } else if (
+                folder === directory &&
                 name.endsWith(".json") &&
                 validId(name.slice(0, -5))
               ) {
@@ -491,6 +633,108 @@ export const pruneHandoffs = async ({
       }
     )
   );
+};
+
+const readPrivateSync = (path: string): unknown => {
+  try {
+    return JSON.parse(readFileSync(path, "utf-8"));
+  } catch {
+    return undefined;
+  }
+};
+
+/** Exit-time recovery can read a completed rename, but cannot wait for a
+ * libuv rename that has not reached the filesystem before process.exit. */
+export const claimedHandoffSync = (
+  directory: string,
+  predecessorId: string,
+  successorId: string,
+  notBefore?: string
+): Handoff | undefined => {
+  if (!validId(predecessorId) || !validId(successorId))
+    throw new Error("Unsafe handoff claim ids");
+  for (const name of [
+    claimName(predecessorId, successorId),
+    legacyClaimName(predecessorId, successorId),
+  ]) {
+    const data = readPrivateSync(join(directory, "claimed", name));
+    if (
+      Value.Check(handoffSchema, data) &&
+      data.suspension.sessionId === predecessorId &&
+      (!Number.isFinite(Date.parse(notBefore ?? "")) ||
+        Date.parse(data.suspension.suspendedAt) >= Date.parse(notBefore ?? ""))
+    )
+      return data;
+  }
+  return undefined;
+};
+
+const matchesOwnQuit = (
+  data: unknown,
+  sessionId: string,
+  suspendedAt?: string
+): data is Handoff =>
+  Value.Check(handoffSchema, data) &&
+  data.suspension.sessionId === sessionId &&
+  data.suspension.suspendedAt === suspendedAt;
+
+export type QuitOwnership =
+  | { readonly kind: "own" | "unknown" }
+  | { readonly kind: "transferred"; readonly transferId: string };
+
+/** Read-only evidence scan for the synchronous shutdown boundary. A positive
+ * foreign claim/receipt forbids re-suspending the pending same-session quit.
+ * Inspect claims before receipts: completion writes the receipt before unlink. */
+export const quitOwnershipSync = (options: {
+  readonly directory: string;
+  readonly sessionId: string;
+  readonly suspendedAt?: string;
+}): QuitOwnership => {
+  const { directory, sessionId, suspendedAt } = options;
+  if (!validId(sessionId)) throw new Error("Unsafe session id");
+  for (const folder of ["claimed", "receipts"] as const) {
+    let names: string[];
+    try {
+      names = readdirSync(join(directory, folder));
+    } catch {
+      continue;
+    }
+    for (const name of names) {
+      if (
+        !name.startsWith(`${sessionId}!`) &&
+        !name.startsWith(`${sessionId}.`)
+      )
+        continue;
+      const data = readPrivateSync(join(directory, folder, name));
+      if (
+        folder === "claimed" &&
+        Value.Check(handoffSchema, data) &&
+        name !== claimName(sessionId, sessionId) &&
+        name !== legacyClaimName(sessionId, sessionId) &&
+        data.suspension.sessionId === sessionId &&
+        data.suspension.suspendedAt === suspendedAt
+      )
+        return { kind: "transferred", transferId: data.transferId };
+      if (
+        folder === "receipts" &&
+        Value.Check(receiptSchema, data) &&
+        data.predecessorId === sessionId &&
+        data.suspendedAt === suspendedAt
+      )
+        return { kind: "transferred", transferId: data.transferId };
+    }
+  }
+  for (const path of [
+    join(directory, `${sessionId}.json`),
+    join(directory, "claimed", claimName(sessionId, sessionId)),
+    join(directory, "claimed", legacyClaimName(sessionId, sessionId)),
+  ]) {
+    const data = readPrivateSync(path);
+    if (matchesOwnQuit(data, sessionId, suspendedAt)) return { kind: "own" };
+  }
+  // Legacy journals and unreadable evidence retain the previous fail-open
+  // recovery policy. Only positive ownership evidence can reject the quit.
+  return { kind: "unknown" };
 };
 
 /** A same-session restart competes for the same quit, not a second copy. */

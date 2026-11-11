@@ -3,7 +3,7 @@ title: pi-until session lifecycle and delivery arbitration
 type: project
 status: active
 created: 2026-08-27
-updated: 2026-10-05
+updated: 2026-11-11
 tags: [pi-until, pi-extension, xstate, reload, recurrence, telemetry, compaction]
 ---
 
@@ -20,7 +20,15 @@ tags: [pi-until, pi-extension, xstate, reload, recurrence, telemetry, compaction
 - `/until-resume` remains the manual path when automatic recovery did not apply.
 - History: 2026-09-21 (`0.5.0`) made quit write an entry and added `/until-resume` as an explicit path. On 2026-09-22 Joel quit Pi for a runtime update. The drovr hawk session lost three watches because its process had loaded `cf28671` before `0.5.0` reached disk and never reloaded, so the reload-only handler ran at quit and wrote nothing. Even a written entry would have required a command nobody knew about. `0.6.0` makes quit-then-relaunch automatic. Version 2 quit entries left by `0.5.0` processes restore when they are newer than the session header and no message follows them.
 - Same-process session replacement creates a fresh session delivery arbiter. A stopped arbiter is never reused.
-- Session shutdown waits for shell process-tree cleanup.
+- Session shutdown writes its suspension synchronously before awaiting restoration, claim settlement, or shell cleanup. Normal shutdown still waits for shell process-tree cleanup before publication.
+- SIGHUP and SIGTERM synchronously journal and kill this extension's running shell process groups. A host signal handler gets time to settle its pending claims and ownership checks before publication. Without a host handler, one process-wide registry publishes all instances before re-raising the signal. A synchronous `exit` hook covers the dead-terminal exit 129; 143 is an explicit TERM exit used by RPC/print hosts, not a dead-terminal code. Default signal delivery emits no `exit` event. Unrelated crash exits do not create quit authority.
+- After graceful settlement, a newly captured claim or confirmed foreign ownership can append a corrective suspension. The newest entry wins before the single publication. A payload keeps its transfer id across retries. Publication becomes committed as soon as its rename succeeds, even if the subsequent directory fsync fails.
+- Emergency exit probes completed claim files and foreign ownership evidence synchronously. A libuv rename still in flight at process exit remains an unrecoverable window. An interrupted reload retains reload authority only, not automatic quit authority. A host that catches a signal and keeps running leaves pi-until stopped until reload.
+- Exit persistence errors append only the time, session id and error code to a private log when storage permits. Commands, output, watch definitions and error messages are excluded. Startup maintenance removes the log after the handoff retention period or above 64 KiB.
+- The shared signal registry excludes signal-exit v3/v4 emitter counts from host-handler detection. V3 stores its emitter on `process.__signal_exit_emitter__`; v4 stores it on `globalThis[Symbol.for("signal-exit emitter")]`. Those observers wait for other listeners before re-raising; counting them as hosts would swallow signals indefinitely. The registry observes ordinary host handlers before they can remove themselves during disposal. Its shared key and shape are a backward-compatible protocol, not a package-version key.
+- A host still alive five seconds after a caught signal produces one local `signal-held` telemetry event per stopped session. `/until-stats` reports that the host held the signal for ≥5 s, not that it necessarily stayed alive indefinitely. Each delayed callback is guarded, and its session id is captured at installation rather than read from a potentially stale context. Teardown cancels the delayed observation; a failed non-quit shutdown still detaches its client.
+- The shutdown boundary is claimed before journal I/O. A failed write still cancels actors and kills running checks. Hooks retry from frozen pre-cancellation values only while the context remains live. After a graceful quit with a failed initial or corrective journal, Pi invalidates the context before exit. There is no exit-time recovery guarantee. Inspect shutdown/publication notices and the private error log, then use `/until-resume` for available saved work; no command can restore an unwritten suspension. The stale-context settlement test asserts the logged failure, not publication.
+- A waiting successor lists a separate pending inventory: ids, labels, watch expiry, predecessor, and handoff deadline. The fork snapshot is advisory, not permission to start actors. Unknown inventory stays visibly pending rather than inviting re-arming.
 
 Pi `0.84.2` supports this boundary through `session_shutdown`, `session_start`, `agent_settled`, `message_start`, `ctx.isIdle()`, custom session entries, and follow-up messages. The compaction hold also needs `session_before_compact`, `session_compact`, and `session_compact_failed`. Pi added `session_compact_failed` in `0.85`, so the dev pins moved to `0.87.1`, the fleet runtime. On older Pi, a failed compaction holds wakes until the next `agent_settled`.
 
@@ -76,6 +84,20 @@ The public contract lives across `README.md`, `src/command.ts`, the registered t
 - Per-watch delivery decisions: cannot enforce session-wide serialization.
 - Treating acknowledgement timeout as rejection: the accepted message can still start after slow `before_agent_start` hooks.
 - Pausing checks during compaction: a check never touches the session, and paused checks would delay the wake without protecting anything.
+
+## Terminal restart evidence (2026-11-11)
+
+A real interactive Pi 1.5.0-p10 under a private PTY reproduced the failure with one inert watch. `ctx.shutdown()` and SIGTERM with a live terminal each wrote one suspension and one mailbox. Closing the PTY master exited 129 without either write. A fixture observer registered after pi-until's shutdown handler was never reached; this does not prove that teardown never began.
+
+The installed interactive runtime handles SIGHUP/SIGTERM, but dead-terminal stream errors call `emergencyTerminalExit()`, which invokes `process.exit(129)` without extension cleanup. The extension runner awaits handlers in order, so an earlier handler or pi-until's own cleanup awaits can yield before the suspension is written. Moving only the session-shutdown write is insufficient; synchronous signal and exit hooks cover that gap.
+
+`tests/live-restart.py` exercises interactive quit, quit during a shell check, PTY-master close, SIGHUP, SIGTERM, and direct emergency exit. Two explicitly targeted successors compete for each handoff. The proof checks one parent suspension, one successor adoption, preserved watch identity/start/expiry, and zero model turns. These common-path cases do not prove settlement races.
+
+Review of the first packet found two settlement regressions: an in-flight claim could be stranded, and a transferred same-session quit could be re-suspended. `tests/restart-settlement.test.ts` holds claim renames before and after their filesystem effect, then checks third-successor adoption. It also covers a transferred reopen interrupted during ownership checking, and publication failure before or after rename. `tests/exit-hooks.test.ts` runs isolated Node processes to prove one signal hook and actual HUP/TERM termination for one or two module copies. It covers bare Node, signal-exit v3/v4 shapes, both shapes together, and the installed signal-exit module when `PI_UNTIL_SIGNAL_EXIT_MODULE` names it. Set `PI_UNTIL_SIGNAL_EXIT_COMPANION_MODULE` as well to cover real v3 and v4 together. `npm run check` now discovers npm's bundled v4 and the repository's v3 automatically; missing modules emit a loud coverage warning. A draining-host test keeps a stale client beside a live one through the five-second observation and successful publication. A watchdog exposes a swallowed real signal instead of allowing natural exit to hide it. A once-only host test proves settlement still precedes publication. Lifecycle tests cover caught signals and emergency exit during reload.
+
+### Handback when an adopted successor is discarded
+
+Do not equate `dropWatches` with handback. It does not say whether work was cancelled or relocated, and a running predecessor may still hold stale state. A safe handback needs an explicit ownership transfer from the current holder to one named recipient, a durable receipt consuming the current holder's work, and the same atomic claim protocol. Muster must name the recipient and distinguish discard from transfer before closing the pane. This is not a small extension-only change, so it remains deferred. Ordinary successor shutdown already forwards its owned watches and any pending predecessor chain.
 
 ## Current receipt
 
