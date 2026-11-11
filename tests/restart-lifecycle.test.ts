@@ -81,6 +81,7 @@ it.each(["exit", "SIGHUP", "SIGTERM"] as const)(
 it("journals on a caught signal but waits for host settlement to publish", async () => {
   const { session, extension, ctx, directory } = fixture();
   const host = vi.fn<() => void>();
+  vi.useFakeTimers();
   process.on("SIGTERM", host);
   try {
     const before = new Set(process.listeners("SIGTERM"));
@@ -97,10 +98,20 @@ it("journals on a caught signal but waits for host settlement to publish", async
       newestSuspension(session.entries)?.watches.map((watch) => watch.facts.id)
     ).toEqual([receipt.id]);
     expect(existsSync(join(directory, `${session.id}.json`))).toBe(false);
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(
+      extension.telemetry.filter((event) => event.event === "signal-held")
+    ).toEqual([{ event: "signal-held", signal: "SIGTERM", delayMs: 5_000 }]);
+    if (hook !== undefined) Reflect.apply(hook, process, []);
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(
+      extension.telemetry.filter((event) => event.event === "signal-held")
+    ).toHaveLength(1);
     await extension.shutdown("quit", ctx);
     expect(existsSync(join(directory, `${session.id}.json`))).toBe(true);
   } finally {
     process.off("SIGTERM", host);
+    vi.useRealTimers();
   }
 });
 
@@ -128,6 +139,55 @@ it("keeps an interrupted reload as reload work, not a quit handoff", async () =>
     ctx
   );
   expect(result.details).toMatchObject({ watches: [{ id: receipt.id }] });
+});
+
+it("cancels actors on journal failure and retries frozen values without restarting shutdown", async () => {
+  const { session, extension, ctx, directory } = fixture();
+  const before = new Set(process.listeners("exit"));
+  await extension.sessionStart("startup", ctx);
+  const receipt = await arm(extension, session);
+  const hook = process
+    .listeners("exit")
+    .find((listener) => !before.has(listener));
+  expect(hook).toBeDefined();
+  const append = extension.appendEntry.getMockImplementation();
+  if (append === undefined) throw new Error("missing append implementation");
+  let full = true;
+  let attempts = 0;
+  extension.appendEntry.mockImplementation((type, data) => {
+    if (type === SUSPENDED_ENTRY_TYPE) {
+      attempts += 1;
+      if (full)
+        throw Object.assign(new Error("private journal failure"), {
+          code: "ENOSPC",
+        });
+    }
+    append(type, data);
+  });
+  try {
+    hook?.(129);
+    const list = await extension.tool(
+      "list",
+      { action: "list" },
+      new AbortController().signal,
+      undefined,
+      ctx
+    );
+    expect(list.details).toMatchObject({
+      watches: [{ id: receipt.id, status: "cancelled" }],
+    });
+    hook?.(129);
+    expect(newestSuspension(session.entries)).toBeUndefined();
+    full = false;
+    hook?.(129);
+    expect(attempts).toBe(3);
+    expect(
+      newestSuspension(session.entries)?.watches.map((watch) => watch.facts.id)
+    ).toEqual([receipt.id]);
+    expect(existsSync(join(directory, `${session.id}.json`))).toBe(true);
+  } finally {
+    full = false;
+  }
 });
 
 it("does not create quit authority for an unrelated crash exit", async () => {

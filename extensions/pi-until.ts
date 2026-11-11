@@ -51,6 +51,7 @@ import {
   claimedHandoffSync,
   quitOwnershipSync,
   prepareHandoff,
+  PERSISTENCE_ERRORS_FILE,
   DEFAULT_HANDOFF_WAIT_MS,
   handoffOptionsFromEnv,
   publishHandoffSync,
@@ -2047,9 +2048,11 @@ export default function piUntil(
         quitData: ReturnType<typeof writeShutdownSnapshot>;
         payload: ReturnType<typeof prepareHandoff> | undefined;
         hadPendingRestoration: boolean;
+        journalled: boolean;
         published: boolean;
       }
     | undefined;
+  type ShutdownState = NonNullable<typeof shutdownState>;
   let removeProcessHooks: (() => void) | undefined;
 
   const rejectTransferredRestoration = (ctx: ExtensionContext) => {
@@ -2066,8 +2069,46 @@ export default function piUntil(
     markTransferred(record, ctx, evidence.transferId);
   };
 
+  const journalShutdown = (
+    state: NonNullable<typeof shutdownState>,
+    ctx: ExtensionContext
+  ) => {
+    state.journalled = false;
+    if (state.reason === "quit") rejectTransferredRestoration(ctx);
+    const settled = pendingHandoffAtQuit(
+      ctx,
+      state.closingWait,
+      state.reason === "quit"
+    );
+    if (
+      settled.captured !== undefined ||
+      state.forwarding.captured === undefined
+    )
+      state.forwarding = settled;
+    state.quitData = writeShutdownSnapshot(
+      state.reason,
+      ctx,
+      state.suspendedActive,
+      state.forwarding,
+      state.pendingTerminal
+    );
+    const transferId =
+      state.payload !== undefined && "transferId" in state.payload
+        ? state.payload.transferId
+        : undefined;
+    state.payload =
+      state.quitData === undefined
+        ? undefined
+        : prepareHandoff(state.quitData, state.forwarding.pending, transferId);
+    state.hadPendingRestoration = pendingRestoration !== undefined;
+    state.journalled = true;
+  };
+
   const beginShutdown = (reason: string, ctx: ExtensionContext) => {
-    if (shutdownState !== undefined) return shutdownState;
+    if (shutdownState !== undefined) {
+      if (!shutdownState.journalled) journalShutdown(shutdownState, ctx);
+      return shutdownState;
+    }
     shuttingDown = true;
     lifecycle += 1;
     const active = activeWatches();
@@ -2075,42 +2116,40 @@ export default function piUntil(
       suspendWatch(record.actor.getSnapshot().context, reason === "reload")
     );
     const closingWait = handoffWait;
-    if (reason === "quit") rejectTransferredRestoration(ctx);
-    const forwarding = pendingHandoffAtQuit(
-      ctx,
-      closingWait,
-      reason === "quit"
-    );
-    const pendingTerminal = terminalRequestsForQuit();
-    // Persist before any cleanup await. Only positive foreign ownership
-    // evidence can exclude a pending restoration at this synchronous boundary.
-    const quitData = writeShutdownSnapshot(
-      reason,
-      ctx,
-      suspendedActive,
-      forwarding,
-      pendingTerminal
-    );
-    shutdownState = {
+    // Claim the boundary before fallible probes or journal I/O. Failed writes
+    // retry from these frozen actor values, not from cancelled actor facts.
+    const state: ShutdownState = {
       reason,
       active,
       suspendedActive,
-      pendingTerminal,
+      pendingTerminal: terminalRequestsForQuit(),
       closingWait,
-      forwarding,
-      quitData,
-      payload:
-        quitData === undefined
-          ? undefined
-          : prepareHandoff(quitData, forwarding.pending),
+      forwarding: {
+        captured: undefined,
+        identity: undefined,
+        pending: undefined,
+      },
+      quitData: undefined,
+      payload: undefined,
       hadPendingRestoration: pendingRestoration !== undefined,
+      journalled: false,
       published: false,
     };
-    closingWait?.controller.abort();
-    stopExternalFollowUps?.();
-    followUps.stop();
-    for (const record of active) record.actor.send({ type: "CANCEL" });
-    return shutdownState;
+    shutdownState = state;
+    try {
+      // Persist before any cleanup await. Positive foreign ownership evidence
+      // can exclude a pending restoration at this synchronous boundary.
+      journalShutdown(state, ctx);
+    } finally {
+      try {
+        closingWait?.controller.abort();
+        stopExternalFollowUps?.();
+        followUps.stop();
+      } finally {
+        for (const record of active) record.actor.send({ type: "CANCEL" });
+      }
+    }
+    return state;
   };
 
   const reconcileShutdown = (
@@ -2136,22 +2175,7 @@ export default function piUntil(
     // A rename/ownership check can settle after the first journal. Correct it
     // before the one publication; the newest suspension is authoritative.
     state.forwarding = forwarding;
-    state.quitData = writeShutdownSnapshot(
-      "quit",
-      ctx,
-      state.suspendedActive,
-      forwarding,
-      state.pendingTerminal
-    );
-    state.hadPendingRestoration = pendingRestoration !== undefined;
-    const transferId =
-      state.payload !== undefined && "transferId" in state.payload
-        ? state.payload.transferId
-        : undefined;
-    state.payload =
-      state.quitData === undefined
-        ? undefined
-        : prepareHandoff(state.quitData, forwarding.pending, transferId);
+    journalShutdown(state, ctx);
   };
 
   const publishShutdown = (state: NonNullable<typeof shutdownState>) => {
@@ -2176,7 +2200,7 @@ export default function piUntil(
           ? error.code
           : "PERSIST_FAILED";
       appendFileSync(
-        join(handoff.directory, "persistence-errors.jsonl"),
+        join(handoff.directory, PERSISTENCE_ERRORS_FILE),
         `${JSON.stringify({ at: new Date(clock.now()).toISOString(), sessionId: sessionId(ctx), code })}\n`,
         { mode: 0o600 }
       );
@@ -2189,9 +2213,13 @@ export default function piUntil(
     removeProcessHooks?.();
     const persist = (publish: boolean) => {
       try {
-        const state = beginShutdown("quit", ctx);
-        // Only running checks remain tracked; kill their groups before exit.
-        shellRunner.kill();
+        let state: NonNullable<typeof shutdownState>;
+        try {
+          state = beginShutdown("quit", ctx);
+        } finally {
+          // Stop checks even if the synchronous journal failed.
+          shellRunner.kill();
+        }
         if (publish) {
           reconcileShutdown(state, ctx);
           publishShutdown(state);
@@ -2203,6 +2231,9 @@ export default function piUntil(
     removeProcessHooks = registerExitPersistence({
       signal: () => persist(false),
       exit: () => persist(true),
+      stillAlive: (signal, delayMs) => {
+        void track(sessionId(ctx), { event: "signal-held", signal, delayMs });
+      },
     });
   };
 
@@ -2247,7 +2278,9 @@ export default function piUntil(
         publishShutdown(state);
       } catch (error) {
         ctx.ui.notify(
-          `pi-until could not publish handoff: ${String(error)}; same-session quit recovery remains available`,
+          state.published
+            ? `pi-until handoff was published, but directory durability was not confirmed: ${String(error)}; publication will not be retried`
+            : `pi-until could not publish handoff: ${String(error)}; same-session quit recovery remains available`,
           "error"
         );
       }

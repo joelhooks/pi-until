@@ -22,6 +22,34 @@ afterEach(() => {
 });
 
 describe("telemetry", () => {
+  it("records and surfaces a caught signal without command or watch contents", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "until-held-signal-"));
+    tempDirectories.push(directory);
+    const filePath = join(directory, "events.jsonl");
+    const sink = createTelemetrySink({ filePath });
+    await sink.record("session", {
+      event: "signal-held",
+      signal: "SIGHUP",
+      delayMs: 5_000,
+    });
+    const events = await readTelemetry(filePath);
+    expect(events).toHaveLength(1);
+    const summary = summarizeTelemetry(events);
+    expect(summary.heldSignals).toBe(1);
+    expect(summaryText(summary, filePath)).toContain(
+      "watches stay stopped until reload"
+    );
+    const event = events[0];
+    expect(event).toEqual({
+      at: expect.any(String),
+      sessionId: "session",
+      v: 1,
+      event: "signal-held",
+      signal: "SIGHUP",
+      delayMs: 5_000,
+    });
+  });
+
   it("hashes a condition without retaining any command fragment", () => {
     const hash = hashCondition("  TOKEN=secret command --flag ");
     expect(hash).toHaveLength(12);

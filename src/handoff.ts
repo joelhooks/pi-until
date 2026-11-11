@@ -65,6 +65,17 @@ export const DEFAULT_HANDOFF_WAIT_MS = 30 * 60_000;
 export const DEFAULT_HANDOFF_RETENTION_MS = 7 * 24 * 60 * 60_000;
 export const DEFAULT_RECEIPT_RETENTION_MS = 180 * 24 * 60 * 60_000;
 const TEMP_RETENTION_MS = 24 * 60 * 60_000;
+export const PERSISTENCE_ERRORS_FILE = "persistence-errors.jsonl";
+const MAX_PERSISTENCE_ERROR_BYTES = 64 * 1024;
+const expiredErrorLog = (
+  name: string,
+  metadata: { mtimeMs: number; size: number },
+  now: number,
+  retentionMs: number
+): boolean =>
+  name === PERSISTENCE_ERRORS_FILE &&
+  (metadata.mtimeMs < now - retentionMs ||
+    metadata.size > MAX_PERSISTENCE_ERROR_BYTES);
 
 const positiveMilliseconds = (
   value: string | undefined,
@@ -588,6 +599,11 @@ export const pruneHandoffs = async ({
               if (name.startsWith(".") && name.endsWith(".tmp")) {
                 if (metadata.mtimeMs < now - TEMP_RETENTION_MS)
                   await unlink(path);
+              } else if (
+                folder === directory &&
+                expiredErrorLog(name, metadata, now, retentionMs)
+              ) {
+                await unlink(path);
               } else if (
                 folder === directory &&
                 name.endsWith(".json") &&

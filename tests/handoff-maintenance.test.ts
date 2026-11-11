@@ -30,6 +30,7 @@ import {
   handoffOptionsFromEnv,
   pruneHandoffs,
   publishHandoff,
+  PERSISTENCE_ERRORS_FILE,
 } from "../src/handoff.ts";
 import { suspensionData, newestSuspension } from "../src/suspension.ts";
 import { FakeSession, loadExtension } from "./fake-pi.ts";
@@ -47,6 +48,27 @@ const directoryFor = async () => {
   directories.push(path);
   return path;
 };
+it.each(["fresh", "old", "oversize"] as const)(
+  "bounds the private persistence error log: %s",
+  async (kind) => {
+    const directory = await directoryFor();
+    const file = join(directory, PERSISTENCE_ERRORS_FILE);
+    await writeFile(
+      file,
+      kind === "oversize" ? Buffer.alloc(65 * 1024) : '{"code":"EIO"}\n',
+      { mode: 0o600 }
+    );
+    await writeFile(join(directory, "unrelated.jsonl"), "keep");
+    if (kind === "old") await utimes(file, new Date(0), new Date(0));
+    await pruneHandoffs({ directory, now: Date.now(), retentionMs: 1_000 });
+    const files = await readdir(directory);
+    expect(files.includes(PERSISTENCE_ERRORS_FILE)).toBe(kind === "fresh");
+    expect(await readFile(join(directory, "unrelated.jsonl"), "utf-8")).toBe(
+      "keep"
+    );
+  }
+);
+
 const definition: WatchDefinition = {
   kind: "until",
   intervalMs: 60_000,

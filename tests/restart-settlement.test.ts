@@ -86,7 +86,11 @@ const setup = async () => {
   return { directory, parent, successor, next, receipt };
 };
 
-it.each(["before rename", "after rename"] as const)(
+it.each([
+  "before rename",
+  "after rename",
+  "before rename with journal failure",
+] as const)(
   "forwards an interrupted claim %s to a third successor",
   async (phase) => {
     const { directory, parent, successor, next, receipt } = await setup();
@@ -99,7 +103,7 @@ it.each(["before rename", "after rename"] as const)(
       if (phase === "after rename") await actual.rename(source, target);
       entered.resolve();
       await release.promise;
-      if (phase === "before rename") await actual.rename(source, target);
+      if (phase !== "after rename") await actual.rename(source, target);
     });
     const beforeExit = new Set(process.listeners("exit"));
     await next.sessionStart("startup", successor.context().ctx);
@@ -128,8 +132,29 @@ it.each(["before rename", "after rename"] as const)(
       expect(newestSuspension(successor.entries)?.watches).toEqual([]);
       expect(existsSync(join(directory, `${successor.id}.json`))).toBe(false);
     }
-    release.resolve();
-    await stopping;
+    if (phase === "before rename with journal failure") {
+      const append = next.appendEntry.getMockImplementation();
+      if (append === undefined)
+        throw new Error("missing append implementation");
+      let fail = true;
+      next.appendEntry.mockImplementation((type, data) => {
+        if (type === SUSPENDED_ENTRY_TYPE && fail) {
+          fail = false;
+          throw new Error("corrective journal unavailable");
+        }
+        append(type, data);
+      });
+      release.resolve();
+      await expect(stopping).rejects.toThrow("corrective journal unavailable");
+      const hook = process
+        .listeners("exit")
+        .find((listener) => !beforeExit.has(listener));
+      expect(hook).toBeDefined();
+      hook?.(129);
+    } else {
+      release.resolve();
+      await stopping;
+    }
     expect(
       newestSuspension(successor.entries)?.watches.map(
         (watch) => watch.facts.id
@@ -137,7 +162,7 @@ it.each(["before rename", "after rename"] as const)(
     ).toEqual([receipt.id]);
     expect(
       next.entries.filter((entry) => entry.customType === SUSPENDED_ENTRY_TYPE)
-    ).toHaveLength(phase === "before rename" ? 2 : 1);
+    ).toHaveLength(phase === "after rename" ? 1 : 2);
     const third = successor.fork();
     const last = loadExtension(third, {
       handoff: {
