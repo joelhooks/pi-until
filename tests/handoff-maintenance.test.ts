@@ -31,6 +31,7 @@ import {
   pruneHandoffs,
   publishHandoff,
   PERSISTENCE_ERRORS_FILE,
+  writeSessionLiveness,
 } from "../src/handoff.ts";
 import { suspensionData, newestSuspension } from "../src/suspension.ts";
 import { FakeSession, loadExtension } from "./fake-pi.ts";
@@ -133,8 +134,13 @@ describe("handoff storage and configuration", () => {
       "2026-11-06T12:00:00.000Z"
     );
   });
-  it("stops polling after the deadline but adopts through the passive filesystem watcher", async () => {
+  it("switches to identity monitoring after the deadline and adopts a late publication", async () => {
     const directory = await directoryFor();
+    const startTime = "2026-11-14T01:02:03.000Z";
+    await writeSessionLiveness(directory, "parent", async () => ({
+      kind: "present",
+      startTime,
+    }));
     const controller = new AbortController();
     const interval = vi.spyOn(globalThis, "setInterval");
     const cleared = vi.spyOn(globalThis, "clearInterval");
@@ -147,6 +153,7 @@ describe("handoff storage and configuration", () => {
         signal: controller.signal,
         waitMs: 10,
         passive: true,
+        processStart: async () => ({ kind: "present", startTime }),
         onTimeout: (watching) => {
           timeout(watching);
         },
@@ -157,6 +164,7 @@ describe("handoff storage and configuration", () => {
       )?.value;
       expect(poll).toBeDefined();
       expect(cleared).toHaveBeenCalledWith(poll);
+      expect(interval).toHaveBeenCalledWith(expect.any(Function), 1_000);
       await publishHandoff(directory, pending());
       expect(await pendingClaim).toMatchObject({ kind: "claimed" });
     } finally {

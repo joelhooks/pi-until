@@ -27,7 +27,19 @@ import type { SessionEntry } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import type { Static } from "typebox";
 import { Value } from "typebox/value";
+import { createActor } from "xstate";
 
+import { systemClock } from "./clock.ts";
+import {
+  createDeathGraceMachine,
+  DEFAULT_DEATH_GRACE_MS,
+  processStartTime,
+} from "./predecessor.ts";
+import type {
+  HandoffReleaseReason,
+  PredecessorLiveness,
+  ProcessStartProbe,
+} from "./predecessor.ts";
 import {
   suspensionDataSchema,
   pendingPredecessorSchema,
@@ -59,6 +71,9 @@ export interface HandoffOptions {
   readonly waitMs?: number;
   readonly retentionMs?: number;
   readonly receiptRetentionMs?: number;
+  /** Injectable process identity port; no argv scan can prove death. */
+  readonly processStart?: ProcessStartProbe;
+  readonly deathGraceMs?: number;
 }
 
 export const DEFAULT_HANDOFF_WAIT_MS = 30 * 60_000;
@@ -132,8 +147,24 @@ const pendingReceiptSchema = Type.Object(
   { additionalProperties: true }
 );
 
+const carriedInventorySchema = Type.Object(
+  { from: Type.String(), pendingPredecessor: pendingPredecessorSchema },
+  { additionalProperties: true }
+);
+
 /** Advisory inventory from the fork snapshot, never authority to start work. */
 export const pendingWatchSummaries = (entries: readonly SessionEntry[]) => {
+  // An adopted outer suspension can own no watches while still waiting on an
+  // ancestor. It must not erase that ancestor's advisory fork inventory.
+  const carried = new Set(
+    entries.flatMap((entry) =>
+      entry.type === "custom" &&
+      entry.customType === SUSPENSION_EXTRA_ENTRY_TYPE &&
+      Value.Check(carriedInventorySchema, entry.data)
+        ? [entry.data.from]
+        : []
+    )
+  );
   const candidates = new Map<
     string,
     { id: string; label: string; expiresAt?: string }
@@ -150,7 +181,7 @@ export const pendingWatchSummaries = (entries: readonly SessionEntry[]) => {
       entry.customType === SUSPENDED_ENTRY_TYPE &&
       Value.Check(suspensionDataSchema, entry.data)
     ) {
-      candidates.clear();
+      if (!carried.has(entry.id)) candidates.clear();
       for (const { definition, facts } of entry.data.watches) {
         candidates.set(facts.id, {
           id: facts.id,
@@ -360,6 +391,80 @@ const writeAtomic = async (
   }
 };
 
+const livenessSchema = Type.Object(
+  {
+    sessionId: Type.String(),
+    pid: Type.Integer({ minimum: 1, maximum: 2_147_483_647 }),
+    startTime: Type.String({
+      pattern: "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z$",
+    }),
+  },
+  { additionalProperties: false }
+);
+
+/** Identity metadata only; it never carries watch restoration authority. */
+export const writeSessionLiveness = async (
+  directory: string,
+  sessionId: string,
+  probe: ProcessStartProbe = processStartTime
+): Promise<boolean> => {
+  if (!validId(sessionId)) return false;
+  const identity = await probe(process.pid);
+  if (identity.kind !== "present") return false;
+  await writeAtomic(join(directory, "liveness"), `${sessionId}.json`, {
+    sessionId,
+    pid: process.pid,
+    startTime: identity.startTime,
+  });
+  return true;
+};
+
+export const predecessorLiveness = async (
+  directory: string,
+  sessionId: string,
+  probe: ProcessStartProbe = processStartTime
+): Promise<PredecessorLiveness> => {
+  if (!validId(sessionId)) return "unknown";
+  let data: unknown;
+  try {
+    data = JSON.parse(
+      await readFile(join(directory, "liveness", `${sessionId}.json`), "utf-8")
+    );
+  } catch (error) {
+    return missing(error) ? "unrecorded" : "unknown";
+  }
+  try {
+    if (
+      !Value.Check(livenessSchema, data) ||
+      data.sessionId !== sessionId ||
+      !Number.isFinite(Date.parse(data.startTime))
+    )
+      return "unknown";
+    const identity = await probe(data.pid);
+    if (identity.kind === "unknown") return "unknown";
+    return identity.kind === "missing" || identity.startTime !== data.startTime
+      ? "gone"
+      : "alive";
+  } catch {
+    return "unknown";
+  }
+};
+
+const clearOwnLiveness = (directory: string, sessionId: string): void => {
+  try {
+    const path = join(directory, "liveness", `${sessionId}.json`);
+    const data = readPrivateSync(path);
+    if (
+      Value.Check(livenessSchema, data) &&
+      data.sessionId === sessionId &&
+      data.pid === process.pid
+    )
+      unlinkSync(path);
+  } catch {
+    // A stale record is safe. Metadata cleanup cannot undo publication.
+  }
+};
+
 const tombstoneSchema = Type.Object(
   {
     empty: Type.Literal(true),
@@ -404,38 +509,43 @@ export const prepareHandoff = (
 export const publishHandoff = async (
   directory: string,
   suspension: SuspensionData,
-  pendingPredecessor?: PendingPredecessor
+  pendingPredecessor?: PendingPredecessor,
+  pendingDeadline?: number
 ): Promise<void> => {
-  await writeAtomic(
-    directory,
-    `${suspension.sessionId}.json`,
-    prepareHandoff(suspension, pendingPredecessor)
-  );
+  const payload = prepareHandoff(suspension, pendingPredecessor);
+  const deadline = deadlineSidecar(payload, pendingDeadline);
+  if (deadline !== undefined)
+    await writeAtomic(
+      join(directory, "deadlines"),
+      `${deadline.transferId}.json`,
+      deadline
+    );
+  await writeAtomic(directory, `${suspension.sessionId}.json`, payload);
+  clearOwnLiveness(directory, suspension.sessionId);
 };
 
 /** Exit hooks cannot await filesystem promises. Publish the same private,
  * atomic mailbox without yielding to a dead-terminal emergency exit. */
-export const publishHandoffSync = (
+const writeAtomicSync = (
   directory: string,
-  payload: ReturnType<typeof prepareHandoff>,
+  target: string,
+  data: unknown,
   options: {
     readonly onPublished?: () => void;
     readonly syncDirectory?: (directory: string) => void;
   } = {}
 ): void => {
-  const sessionId =
-    "suspension" in payload ? payload.suspension.sessionId : payload.sessionId;
   mkdirSync(directory, { recursive: true, mode: 0o700 });
   const temporary = join(directory, `.${randomUUID()}.tmp`);
   const file = openSync(temporary, "wx", 0o600);
   try {
-    writeFileSync(file, JSON.stringify(payload));
+    writeFileSync(file, JSON.stringify(data));
     fsyncSync(file);
   } finally {
     closeSync(file);
   }
   try {
-    renameSync(temporary, join(directory, `${sessionId}.json`));
+    renameSync(temporary, join(directory, target));
     // The payload is visible now, even if directory durability subsequently
     // fails. Never publish it again after a successor could have claimed it.
     options.onPublished?.();
@@ -454,6 +564,100 @@ export const publishHandoffSync = (
       // Rename already removed the temporary path. Preserve the write error.
     }
   }
+};
+
+const deadlineSchema = Type.Object(
+  {
+    transferId: Type.String(),
+    predecessorId: Type.String(),
+    deadline: Type.Number(),
+  },
+  { additionalProperties: false }
+);
+
+export const HANDOFF_DEADLINE_ENTRY_TYPE = "pi-until-handoff-deadline";
+const waitDeadlineSchema = Type.Object(
+  { predecessorId: Type.String(), deadline: Type.Number() },
+  { additionalProperties: false }
+);
+export const predecessorDeadlineFrom = (
+  entries: readonly SessionEntry[],
+  predecessorId: string
+): number | undefined => {
+  const deadlines = entries.flatMap((entry) =>
+    entry.type === "custom" &&
+    entry.customType === HANDOFF_DEADLINE_ENTRY_TYPE &&
+    Value.Check(waitDeadlineSchema, entry.data) &&
+    entry.data.predecessorId === predecessorId &&
+    Number.isFinite(entry.data.deadline)
+      ? [entry.data.deadline]
+      : []
+  );
+  return deadlines.length === 0 ? undefined : Math.min(...deadlines);
+};
+const deadlineSidecar = (
+  payload: HandoffPayload,
+  deadline: number | undefined
+) => {
+  const carriesDeadline =
+    "transferId" in payload &&
+    payload.pendingPredecessor !== undefined &&
+    deadline !== undefined &&
+    Number.isFinite(deadline);
+  if (carriesDeadline && !validId(payload.transferId))
+    throw new Error("Unsafe transfer id for handoff deadline metadata");
+  return carriesDeadline
+    ? {
+        transferId: payload.transferId,
+        predecessorId: payload.pendingPredecessor.predecessorId,
+        deadline,
+      }
+    : undefined;
+};
+
+/** Deadline metadata is separate so old strict mailbox readers still work. */
+export const handoffDeadlineSync = (
+  directory: string,
+  handoff: Handoff
+): number | undefined => {
+  if (!validId(handoff.transferId)) return undefined;
+  const data = readPrivateSync(
+    join(directory, "deadlines", `${handoff.transferId}.json`)
+  );
+  return Value.Check(deadlineSchema, data) &&
+    data.transferId === handoff.transferId &&
+    data.predecessorId === handoff.pendingPredecessor?.predecessorId &&
+    Number.isFinite(data.deadline)
+    ? data.deadline
+    : undefined;
+};
+
+/** Publish metadata before the canonical mailbox, retaining its exact wire shape. */
+export const publishHandoffSync = (
+  directory: string,
+  payload: HandoffPayload,
+  options: {
+    readonly onPublished?: () => void;
+    readonly syncDirectory?: (directory: string) => void;
+    readonly pendingDeadline?: number;
+  } = {}
+): void => {
+  const deadline = deadlineSidecar(payload, options.pendingDeadline);
+  if (deadline !== undefined)
+    writeAtomicSync(
+      join(directory, "deadlines"),
+      `${deadline.transferId}.json`,
+      deadline
+    );
+  const sessionId =
+    "suspension" in payload ? payload.suspension.sessionId : payload.sessionId;
+  writeAtomicSync(directory, `${sessionId}.json`, payload, {
+    ...options,
+    onPublished: () => {
+      options.onPublished?.();
+      clearOwnLiveness(directory, sessionId);
+    },
+  });
 };
 
 const receiptSchema = Type.Object(
@@ -811,10 +1015,15 @@ export const consumeOwnHandoff = async (options: {
 };
 
 type ClaimResult =
-  | { readonly kind: "claimed"; readonly handoff: Handoff }
+  | {
+      readonly kind: "claimed";
+      readonly handoff: Handoff;
+      readonly pendingDeadline?: number;
+    }
   | { readonly kind: "empty" }
   | { readonly kind: "nothing" }
-  | { readonly kind: "aborted" };
+  | { readonly kind: "aborted" }
+  | { readonly kind: "released"; readonly reason: HandoffReleaseReason };
 
 interface ClaimOptions {
   readonly directory: string;
@@ -827,6 +1036,8 @@ interface ClaimOptions {
   readonly notBefore?: string;
   readonly passive?: boolean;
   readonly onTimeout?: (watching: boolean) => void;
+  readonly processStart?: ProcessStartProbe;
+  readonly deathGraceMs?: number;
 }
 
 const missing = (error: unknown): boolean =>
@@ -942,15 +1153,91 @@ export const claimHandoff = async (
     let ending: "aborted" | "empty" | undefined;
     let watcher: ReturnType<typeof watch> | undefined;
     let passiveWatching = false;
+    let deadlineElapsed = false;
     const finish = (result: ClaimResult | Error) => {
       if (done) return;
       done = true;
       clearInterval(poll);
       clearTimeout(deadline);
+      grace.stop();
       watcher?.close();
       signal.removeEventListener("abort", abort);
       if (result instanceof Error) reject(result);
       else resolve(result);
+    };
+    const finishClaim = (handoff: Handoff) => {
+      const pendingDeadline = handoffDeadlineSync(directory, handoff);
+      finish({
+        handoff,
+        kind: "claimed",
+        ...(pendingDeadline === undefined ? {} : { pendingDeadline }),
+      });
+    };
+    const hasForeignPublication = async () => {
+      // Another consumer's publication evidence forbids duplicate re-arming.
+      const evidence = await Promise.all(
+        ["claimed", "receipts"].map(async (folder) => {
+          const names = await filesIn(join(directory, folder));
+          return Promise.all(
+            names
+              .filter(
+                (name) =>
+                  name.startsWith(`${predecessorId}!`) ||
+                  name.startsWith(`${predecessorId}.`)
+              )
+              .map(async (name) => {
+                const data = await readPrivate(join(directory, folder, name));
+                if (data === undefined) return true;
+                if (
+                  Value.Check(handoffSchema, data) &&
+                  data.suspension.sessionId === predecessorId &&
+                  fresh(data)
+                )
+                  return true;
+                if (
+                  Value.Check(receiptSchema, data) &&
+                  data.predecessorId === predecessorId
+                ) {
+                  const floor = Date.parse(options.notBefore ?? "");
+                  return (
+                    !Number.isFinite(floor) ||
+                    Date.parse(data.suspendedAt) >= floor
+                  );
+                }
+                return false;
+              })
+          );
+        })
+      );
+      return evidence.some((folder) => folder.some(Boolean));
+    };
+    const enterWatching = () => {
+      if (passiveWatching) return;
+      passiveWatching = true;
+      clearInterval(poll);
+      poll = setInterval(() => {
+        void check();
+      }, 1_000);
+      options.onTimeout?.(true);
+    };
+    const release = async (reason: HandoffReleaseReason) => {
+      if (await hasForeignPublication()) {
+        grace.send({ type: "OBSERVED", state: "unknown" });
+        if (deadlineElapsed) enterWatching();
+        return;
+      }
+      // Last read after identity verification: publication always wins.
+      const late = await attempt();
+      if (late === "nothing") finish({ kind: "nothing" });
+      else if (late !== undefined) finishClaim(late);
+      else if (ending === undefined) finish({ kind: "released", reason });
+    };
+    const afterDeadline = async (identity: PredecessorLiveness) => {
+      if (options.passive !== true) {
+        options.onTimeout?.(false);
+        ending = "empty";
+      } else if (identity === "unrecorded") await release("deadline-no-record");
+      else enterWatching();
     };
     const check = async () => {
       if (done) return;
@@ -962,7 +1249,24 @@ export const claimHandoff = async (
       try {
         const handoff = await attempt();
         if (handoff === "nothing") finish({ kind: "nothing" });
-        else if (handoff !== undefined) finish({ handoff, kind: "claimed" });
+        else if (handoff !== undefined) finishClaim(handoff);
+        else if (
+          (deadlineElapsed && !passiveWatching) ||
+          grace.getSnapshot().matches("verify") ||
+          Date.now() >= nextProbeAt
+        ) {
+          nextProbeAt = Date.now() + 1_000;
+          const identity = await predecessorLiveness(
+            directory,
+            predecessorId,
+            options.processStart
+          );
+          if (done || ending !== undefined) return;
+          grace.send({ type: "OBSERVED", state: identity });
+          if (identity === "gone" && grace.getSnapshot().matches("verify")) {
+            await release("predecessor-gone");
+          } else if (deadlineElapsed) await afterDeadline(identity);
+        }
       } catch (error) {
         finish(error instanceof Error ? error : new Error(String(error)));
       } finally {
@@ -979,19 +1283,23 @@ export const claimHandoff = async (
       ending = "aborted";
       if (!checking) finish({ kind: "aborted" });
     };
-    const poll = setInterval(() => {
+    let nextProbeAt = 0;
+    const grace = createActor(
+      createDeathGraceMachine(
+        options.deathGraceMs ?? DEFAULT_DEATH_GRACE_MS,
+        () => {
+          void check();
+        }
+      ),
+      { clock: systemClock }
+    ).start();
+    let poll = setInterval(() => {
       void check();
     }, 250);
     const deadline = setTimeout(() => {
+      deadlineElapsed = true;
       clearInterval(poll);
-      const watching = options.passive === true && watcher !== undefined;
-      options.onTimeout?.(watching);
-      if (watching) {
-        passiveWatching = true;
-        return;
-      }
-      ending = "empty";
-      if (!checking) finish({ kind: "empty" });
+      void check();
     }, options.waitMs ?? DEFAULT_HANDOFF_WAIT_MS);
     signal.addEventListener("abort", abort, { once: true });
     try {
@@ -999,14 +1307,15 @@ export const claimHandoff = async (
         void check();
       });
       watcher.on("error", () => {
+        if (done) return;
         watcher?.close();
         watcher = undefined;
-        if (passiveWatching) {
+        // The polling fallback still checks identity and late publications.
+        // Native watcher failure cannot authorize re-arming a live owner.
+        if (passiveWatching)
           options.warn?.(
-            "pi-until late filesystem watcher failed; reload or re-arm manually"
+            "pi-until late filesystem watcher failed; continuing identity checks"
           );
-          finish({ kind: "empty" });
-        }
       });
     } catch {
       // Poll fallback remains bounded if native watching is unavailable.

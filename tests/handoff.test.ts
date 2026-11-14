@@ -360,7 +360,7 @@ describe("successor extension", () => {
     }
   );
 
-  it("reports nothing to adopt after a bounded wait for a crashed predecessor", async () => {
+  it("releases an unrecorded legacy predecessor after the bounded wait", async () => {
     const directory = await mailbox();
     const child = new FakeSession();
     const second = loadExtension(child, {
@@ -371,7 +371,7 @@ describe("successor extension", () => {
     await second.sessionStart("startup", ctx);
     await vi.waitFor(() =>
       expect(notify).toHaveBeenCalledWith(
-        expect.stringContaining("nothing to adopt"),
+        expect.stringContaining("never handed off before the deadline"),
         "warning"
       )
     );
@@ -573,7 +573,7 @@ describe("successor extension", () => {
     await successor.sessionStart("startup", ctx);
     await vi.waitFor(() =>
       expect(notify).toHaveBeenCalledWith(
-        expect.stringContaining("nothing to adopt"),
+        expect.stringContaining("may still arrive"),
         "warning"
       )
     );

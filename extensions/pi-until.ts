@@ -63,6 +63,10 @@ import {
   staleClaimCount,
   SUCCESSOR_ENTRY_TYPE,
   successorBindingFrom,
+  writeSessionLiveness,
+  HANDOFF_DEADLINE_ENTRY_TYPE,
+  predecessorDeadlineFrom,
+  handoffDeadlineSync,
 } from "../src/handoff.ts";
 import type {
   Handoff,
@@ -78,7 +82,9 @@ import type { WatchTerminalState } from "../src/machine.ts";
 import {
   renderRecurringExpiredPacket,
   renderRecurringWakePacket,
+  renderHandoffReleasePacket,
 } from "../src/packet.ts";
+import type { HandoffReleaseReason } from "../src/predecessor.ts";
 import {
   RESUMED_ENTRY_TYPE,
   RESUME_INTENDED_ENTRY_TYPE,
@@ -142,6 +148,20 @@ type WatchSnapshot = SnapshotFrom<WatchMachine>;
 type FollowUpMachine = ReturnType<typeof createFollowUpMachine>;
 type FollowUpActor = ActorFromLogic<FollowUpMachine>;
 
+const releaseReceiptSchema = Type.Object(
+  {
+    from: Type.Literal("handoff-released"),
+    predecessorId: Type.String(),
+    inventoryIds: Type.Array(Type.String()),
+    resumedAt: Type.String(),
+    releaseReason: Type.Union([
+      Type.Literal("predecessor-gone"),
+      Type.Literal("deadline-no-record"),
+    ]),
+  },
+  { additionalProperties: true }
+);
+
 const followUpMarkerSchema = Type.Object(
   { followUpId: Type.String({ minLength: 1 }) },
   { additionalProperties: true }
@@ -203,6 +223,19 @@ const sessionId = (ctx: ExtensionContext | undefined) =>
 /** Print and JSON runs exit after one prompt, so they never own watches. */
 const isShortLived = (ctx: ExtensionContext | undefined) =>
   ctx?.mode === "print" || ctx?.mode === "json";
+
+const unhandledPending = (
+  ctx: ExtensionContext,
+  pending: PendingPredecessor | undefined
+) =>
+  pending !== undefined &&
+  predecessorHandled(ctx.sessionManager.getBranch(), pending.predecessorId)
+    ? undefined
+    : pending;
+const invalidSuccessorLink = (
+  link: SuccessorBinding,
+  visited: readonly string[]
+) => (link.depth ?? 1) > 3 || visited.includes(link.predecessorId);
 
 function terminalState(
   snapshot: WatchSnapshot
@@ -408,6 +441,7 @@ export default function piUntil(
   let pendingRestoration: SuspensionRecord | undefined;
   let restorationTask: Promise<void> | undefined;
   let handoffWait: SuccessorWait | undefined;
+  let livenessTask: Promise<void> | undefined;
   let arbiterState = { since: 0, value: "" };
 
   const clock = options.clock ?? systemClock;
@@ -781,6 +815,25 @@ export default function piUntil(
       ).filter((watch) => !watches.has(watch.id)),
     };
   };
+  const releasedHandoffView = () => {
+    const entries = currentContext?.sessionManager.getBranch() ?? [];
+    for (let index = entries.length - 1; index >= 0; index -= 1) {
+      const entry = entries[index];
+      if (
+        entry?.type === "custom" &&
+        entry.customType === RESUMED_ENTRY_TYPE &&
+        Value.Check(releaseReceiptSchema, entry.data)
+      ) {
+        return {
+          predecessorId: entry.data.predecessorId,
+          inventoryIds: entry.data.inventoryIds,
+          releasedAt: entry.data.resumedAt,
+          reason: entry.data.releaseReason,
+        };
+      }
+    }
+    return null;
+  };
   const listWithArbiter = (receipts: readonly WatchReceipt[]): string => {
     const waiting =
       handoffWait?.phase === "waiting"
@@ -795,11 +848,14 @@ export default function piUntil(
         ? `claimed: ${oldClaims} older than 7 days; retained for inspection`
         : undefined;
     const pending = pendingHandoffView();
+    const released = releasedHandoffView();
     const inventory =
       pending === null
         ? undefined
         : [
-            "Handoff pending; do not re-arm these watches. Snapshot inventory (not active here):",
+            pending.phase === "watching"
+              ? `A late handoff from ${pending.predecessorId} may still arrive; re-arm only if ${pending.predecessorId} is gone. Snapshot inventory (not active here):`
+              : "Handoff pending; do not re-arm these watches. Snapshot inventory (not active here):",
             ...pending.watches.map(
               (watch) =>
                 `- ${watch.id} (${watch.label}); watch deadline ${watch.expiresAt ?? "none"}; handoff deadline ${pending.deadline}`
@@ -818,6 +874,13 @@ export default function piUntil(
       waiting,
       late,
       inventory,
+      released === null
+        ? undefined
+        : renderHandoffReleasePacket(
+            released.predecessorId,
+            released.inventoryIds,
+            released.reason
+          ),
       claims,
     ]
       .filter((line) => line !== undefined)
@@ -1145,7 +1208,7 @@ export default function piUntil(
 
   pi.registerTool({
     description:
-      "Start session-scoped shell-condition watches or recurring agent follow-ups. One session arbiter serializes every pi-until wake and holds wakes while Pi compacts. Recurrences use fixed cadence with ±10% jitter and a stable per-watch phase, immutable task snapshots, and explicit completion. Watches come back after /reload or after Pi quits and reopens the same session, including terminal hangup. list shows handoff-pending inventory separately; do not re-arm it. Reading a finished watch with status or cancel drops its queued wake, never an already dispatched wake.",
+      "Start session-scoped shell-condition watches or recurring agent follow-ups. One session arbiter serializes every pi-until wake and holds wakes while Pi compacts. Recurrences use fixed cadence with ±10% jitter and a stable per-watch phase, immutable task snapshots, and explicit completion. Watches come back after /reload or after Pi quits and reopens the same session, including terminal hangup. list shows handoff-pending inventory separately; do not re-arm it unless explicitly released. Reading a finished watch with status or cancel drops its queued wake, never an already dispatched wake.",
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       currentContext = ctx;
       const command = parseCommand(params, ctx);
@@ -1182,6 +1245,9 @@ export default function piUntil(
           details: {
             watches: receipts,
             ...(pending === null ? {} : { handoffPending: pending }),
+            ...(releasedHandoffView() === null
+              ? {}
+              : { handoffReleased: releasedHandoffView() }),
           },
         };
       }
@@ -1255,7 +1321,7 @@ export default function piUntil(
       "Call until action=complete only when the recurring goal is achieved. A finished agent turn is not completion.",
       "Call until action=cancel when recurring work should stop without success. Do not continue an expired or failed recurrence unless the user asks.",
       "Reading a finished watch with status or cancel drops only that watch's queued terminal wake. list does not consume wakes, and already dispatched wakes still settle normally.",
-      "After Pi restarts, run until action=list before re-arming anything. Watches from a graceful quit or terminal hangup come back on their own when the same session reopens. A targeted successor lists handoff-pending ids separately; wait for adoption instead of re-arming them by hand and creating duplicates.",
+      "After Pi restarts, run until action=list before re-arming anything. Watches from a graceful quit or terminal hangup come back on their own when the same session reopens. A targeted successor lists handoff-pending ids separately; wait for adoption or an explicit release instead of re-arming them by hand and creating duplicates.",
       "Use a durable workload scheduler instead when work must survive a crash, session replacement, a new or forked session, or reboot.",
     ],
     promptSnippet:
@@ -1538,6 +1604,76 @@ export default function piUntil(
     return `pi-until handoff failed: ${error instanceof Error ? error.message : String(error)}. Running watch ids: ${running.join(", ") || "none"}. Needs re-arming: ${needed}. Check handled work and inspect the retained claim before re-arming any other id.`;
   };
 
+  const rememberWaitDeadline = (
+    ctx: ExtensionContext,
+    predecessorId: string,
+    waitMs: number,
+    carried?: number
+  ) => {
+    const stored = predecessorDeadlineFrom(
+      ctx.sessionManager.getBranch(),
+      predecessorId
+    );
+    const deadline = Math.min(
+      Date.now() + waitMs,
+      stored ?? Infinity,
+      carried ?? Infinity
+    );
+    if (stored !== deadline)
+      pi.appendEntry(HANDOFF_DEADLINE_ENTRY_TYPE, { predecessorId, deadline });
+    return deadline;
+  };
+  const rememberClaimDeadline = (
+    ctx: ExtensionContext,
+    claimed: Handoff,
+    deadline: number | undefined
+  ) => {
+    if (claimed.pendingPredecessor !== undefined && deadline !== undefined)
+      rememberWaitDeadline(
+        ctx,
+        claimed.pendingPredecessor.predecessorId,
+        Infinity,
+        deadline
+      );
+  };
+
+  const releasePendingHandoff = (
+    ctx: ExtensionContext,
+    waiting: SuccessorWait,
+    reason: HandoffReleaseReason
+  ) => {
+    const inventoryIds = pendingWatchSummaries(ctx.sessionManager.getBranch())
+      .filter((watch) => !watches.has(watch.id))
+      .map((watch) => watch.id)
+      .sort();
+    // Consume before inviting re-arming, so reload cannot claim a late
+    // publication and duplicate work the operator has already re-armed.
+    pi.appendEntry(RESUMED_ENTRY_TYPE, {
+      ...resumedData("handoff-released", 0, 0, clock.now()),
+      predecessorId: waiting.predecessorId,
+      intended: 0,
+      inventoryIds,
+      releaseReason: reason,
+    });
+    if (
+      !predecessorHandled(ctx.sessionManager.getBranch(), waiting.predecessorId)
+    )
+      throw new Error("handoff release was not recorded; do not re-arm");
+    waiting.phase = "finished";
+    ctx.ui.setStatus("pi-until-handoff", undefined);
+    const content = renderHandoffReleasePacket(
+      waiting.predecessorId,
+      inventoryIds,
+      reason
+    );
+    ctx.ui.notify(content, "warning");
+    pi.sendMessage({
+      customType: "pi-until-handoff-released",
+      content,
+      display: true,
+    });
+  };
+
   const adoptSuccessor = (ctx: ExtensionContext, binding: SuccessorBinding) => {
     if (
       handoff === false ||
@@ -1561,10 +1697,16 @@ export default function piUntil(
     handoffWait = waiting;
     const adoptLink = async (
       link: SuccessorBinding,
-      visited: readonly string[]
+      visited: readonly string[],
+      carriedDeadline?: number
     ): Promise<void> => {
+      // A consumed ancestor must not return through an older carried link.
+      if (
+        predecessorHandled(ctx.sessionManager.getBranch(), link.predecessorId)
+      )
+        return;
       // The depth bound and cycle check prevent unbounded transitive claims.
-      if ((link.depth ?? 1) > 3 || visited.includes(link.predecessorId)) {
+      if (invalidSuccessorLink(link, visited)) {
         ctx.ui.notify(
           "pi-until predecessor chain limit or cycle; inspect pending work and re-arm manually",
           "warning"
@@ -1576,14 +1718,21 @@ export default function piUntil(
       waiting.depth = link.depth ?? 1;
       waiting.claimed = undefined;
       waiting.phase = "waiting";
-      waiting.deadline = clock.now() + waitMs;
+      waiting.deadline = rememberWaitDeadline(
+        ctx,
+        link.predecessorId,
+        waitMs,
+        carriedDeadline
+      );
+      const remainingMs = Math.max(0, waiting.deadline - Date.now());
       ctx.ui.setStatus("pi-until-handoff", `waiting for ${link.predecessorId}`);
       ctx.ui.notify(
-        `pi-until waiting up to ${waitMs / 1000}s for predecessor ${link.predecessorId}`,
+        `pi-until waiting up to ${remainingMs / 1000}s for predecessor ${link.predecessorId}`,
         "info"
       );
       const result = await claimHandoff({
         ...handoff,
+        waitMs: remainingMs,
         predecessorId: link.predecessorId,
         successorId: sessionId(ctx),
         notBefore: link.notBefore,
@@ -1601,7 +1750,7 @@ export default function piUntil(
           );
           ctx.ui.notify(
             watching
-              ? "pi-until: nothing to adopt yet; watching for a late handoff"
+              ? `pi-until: a late handoff from ${link.predecessorId} may still arrive; re-arm only if ${link.predecessorId} is gone`
               : "pi-until: nothing to adopt; late filesystem watch unavailable",
             "warning"
           );
@@ -1621,9 +1770,14 @@ export default function piUntil(
         return;
       }
       if (result.kind === "empty") return;
+      if (result.kind === "released") {
+        releasePendingHandoff(ctx, waiting, result.reason);
+        return;
+      }
       if (["watching"].includes(waiting.phase))
         ctx.ui.notify("pi-until late handoff arrived; adopting now", "info");
       const { suspension, transferId, pendingPredecessor } = result.handoff;
+      rememberClaimDeadline(ctx, result.handoff, result.pendingDeadline);
       if (!hasAdoptedTransfer(ctx.sessionManager.getBranch(), transferId)) {
         const record = appendSuspension(
           {
@@ -1668,7 +1822,11 @@ export default function piUntil(
         depth: waiting.depth + 1,
       };
       if (next.depth <= 3) pi.appendEntry(SUCCESSOR_ENTRY_TYPE, next);
-      await adoptLink(next, [...visited, link.predecessorId]);
+      await adoptLink(
+        next,
+        [...visited, link.predecessorId],
+        result.pendingDeadline
+      );
     };
     waiting.task = (async () => {
       try {
@@ -1912,9 +2070,28 @@ export default function piUntil(
       syncSessionActivity(ctx);
     }
     pendingRestoration = undefined;
+    livenessTask =
+      handoff === false || isShortLived(ctx)
+        ? undefined
+        : (async () => {
+            try {
+              await writeSessionLiveness(
+                handoff.directory,
+                sessionId(ctx),
+                handoff.processStart
+              );
+            } catch {
+              if (!shuttingDown && lifecycle === generation)
+                ctx.ui.notify(
+                  "pi-until could not record process identity; successors will keep the normal handoff wait",
+                  "warning"
+                );
+            }
+          })();
     restorationTask = undefined;
     restorationTask = restoreAtStart(ctx, generation, event.reason);
     await restorationTask;
+    await livenessTask;
     if (shuttingDown || lifecycle !== generation) return;
     bindSuccessor(ctx, event.reason);
     refreshIndicator();
@@ -1945,7 +2122,8 @@ export default function piUntil(
       takeClaim &&
       waiting?.claimed !== undefined &&
       !hasAdoptedTransfer(entries, waiting.claimed.transferId)
-    )
+    ) {
+      const pending = unhandledPending(ctx, waiting.claimed.pendingPredecessor);
       return {
         captured: waiting.claimed,
         identity: {
@@ -1953,18 +2131,39 @@ export default function piUntil(
           transferId: waiting.claimed.transferId,
           suspendedAt: waiting.claimed.suspension.suspendedAt,
         },
-        pending: waiting.claimed.pendingPredecessor,
+        pending,
+        deadline:
+          pending === undefined
+            ? undefined
+            : handoffDeadlineSync(
+                handoff === false ? "" : handoff.directory,
+                waiting.claimed
+              ),
       };
+    }
     const binding = successorBindingFrom(entries, sessionId(ctx));
-    const pending =
+    const pending = unhandledPending(
+      ctx,
       binding !== undefined &&
-      !predecessorHandled(entries, binding.predecessorId)
+        !predecessorHandled(entries, binding.predecessorId)
         ? {
             predecessorId: binding.predecessorId,
             notBefore: binding.notBefore ?? new Date(0).toISOString(),
           }
-        : newestSuspension(entries)?.pendingPredecessor;
-    return { captured: undefined, identity: undefined, pending };
+        : newestSuspension(entries)?.pendingPredecessor
+    );
+    return {
+      captured: undefined,
+      identity: undefined,
+      pending,
+      deadline:
+        pending === undefined
+          ? undefined
+          : (predecessorDeadlineFrom(entries, pending.predecessorId) ??
+            (waiting?.predecessorId === pending.predecessorId
+              ? waiting.deadline
+              : undefined)),
+    };
   };
 
   const writeShutdownSnapshot = (
@@ -2128,6 +2327,7 @@ export default function piUntil(
         captured: undefined,
         identity: undefined,
         pending: undefined,
+        deadline: undefined,
       },
       quitData: undefined,
       payload: undefined,
@@ -2182,6 +2382,7 @@ export default function piUntil(
     if (state.published || state.payload === undefined || handoff === false)
       return;
     publishHandoffSync(handoff.directory, state.payload, {
+      pendingDeadline: state.forwarding.deadline,
       onPublished: () => {
         state.published = true;
       },
@@ -2251,6 +2452,7 @@ export default function piUntil(
       const { active, closingWait } = state;
       await closingWait?.task;
       await restorationTask;
+      await livenessTask;
       reconcileShutdown(state, ctx);
       const { forwarding } = state;
       handoffWait = undefined;

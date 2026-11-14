@@ -8,7 +8,7 @@ import { SimulatedClock } from "xstate";
 import { systemClock } from "../src/clock.ts";
 import { initialFacts } from "../src/domain.ts";
 import type { WatchDefinition } from "../src/domain.ts";
-import { publishHandoff } from "../src/handoff.ts";
+import { publishHandoff, writeSessionLiveness } from "../src/handoff.ts";
 import { newestSuspension, suspensionData } from "../src/suspension.ts";
 import type { TelemetrySink } from "../src/telemetry.ts";
 import { FakeSession, loadExtension, receiptOf } from "./fake-pi.ts";
@@ -440,17 +440,26 @@ it("shows old claimed payloads without deleting them", async () => {
   });
   expect(await readFile(file, "utf-8")).toBe("inspection fixture");
 });
-it("keeps a passive late watcher after the visible wait", async () => {
+it("keeps watching a recorded live predecessor after the visible wait", async () => {
   const { directory, session, data, handoff } = await setup();
+  const startTime = "2026-11-14T01:02:03.000Z";
+  await writeSessionLiveness(directory, "parent", async () => ({
+    kind: "present",
+    startTime,
+  }));
   const extension = loadExtension(session, {
-    handoff: { ...handoff, waitMs: 10 },
+    handoff: {
+      ...handoff,
+      waitMs: 10,
+      processStart: async () => ({ kind: "present", startTime }),
+    },
   });
   extensions.push(extension);
   const { ctx, notify, setStatus } = session.context();
   await extension.sessionStart("startup", ctx);
   await vi.waitFor(() =>
     expect(notify).toHaveBeenCalledWith(
-      expect.stringContaining("nothing to adopt"),
+      expect.stringContaining("may still arrive"),
       "warning"
     )
   );

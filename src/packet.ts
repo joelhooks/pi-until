@@ -1,4 +1,5 @@
 import type { FollowUpSnapshot } from "./domain.ts";
+import type { HandoffReleaseReason } from "./predecessor.ts";
 
 export interface RecurringPacketReceipt {
   readonly deliveredAt: number;
@@ -11,6 +12,20 @@ export interface RecurringPacketReceipt {
 }
 
 const iso = (value: number): string => new Date(value).toISOString();
+
+/** A release permits manual re-arming, never restoration from inventory. */
+export const renderHandoffReleasePacket = (
+  predecessorId: string,
+  inventoryIds: readonly string[],
+  reason: HandoffReleaseReason = "predecessor-gone"
+): string =>
+  [
+    reason === "deadline-no-record"
+      ? `pi-until handoff released: predecessor \`${predecessorId}\` never handed off before the deadline; no liveness record is available.`
+      : `pi-until handoff released: predecessor \`${predecessorId}\` is gone and no publication arrived during the death grace.`,
+    `Inventory ids: ${inventoryIds.map((id) => `\`${id}\``).join(", ") || "unavailable"}.`,
+    "Re-arm as needed from the advisory inventory after checking handled work. Inventory is not active here and is never restoration authority.",
+  ].join("\n");
 
 const contextLines = (snapshot: FollowUpSnapshot): string[] => {
   const lines = [
