@@ -39,7 +39,7 @@
   },
   "dependencies": {
     "@earendil-works/pi-tui": "0.84.2",
-    "xstate": "5.32.5"
+    "xstate": "6.0.0-alpha.73"
   },
   "devDependencies": {
     "@earendil-works/pi-ai": "0.87.1",

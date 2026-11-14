@@ -9,7 +9,7 @@ import type {
 import { Type } from "typebox";
 import { Value } from "typebox/value";
 import { createActor } from "xstate";
-import type { ActorRefFrom, SnapshotFrom } from "xstate";
+import type { ActorFromLogic, SnapshotFrom } from "xstate";
 
 import { createShellConditionRunner } from "../src/check.ts";
 import { systemClock } from "../src/clock.ts";
@@ -137,10 +137,10 @@ type ReceiptStatus =
   | "failed";
 type FinalReceiptStatus = Exclude<ReceiptStatus, "running">;
 type WatchMachine = ReturnType<typeof createWatchMachine>;
-type WatchActor = ActorRefFrom<WatchMachine>;
+type WatchActor = ActorFromLogic<WatchMachine>;
 type WatchSnapshot = SnapshotFrom<WatchMachine>;
 type FollowUpMachine = ReturnType<typeof createFollowUpMachine>;
-type FollowUpActor = ActorRefFrom<FollowUpMachine>;
+type FollowUpActor = ActorFromLogic<FollowUpMachine>;
 
 const followUpMarkerSchema = Type.Object(
   { followUpId: Type.String({ minLength: 1 }) },

@@ -3,7 +3,7 @@ title: pi-until session lifecycle and delivery arbitration
 type: project
 status: active
 created: 2026-08-27
-updated: 2026-11-11
+updated: 2026-11-14
 tags: [pi-until, pi-extension, xstate, reload, recurrence, telemetry, compaction]
 ---
 
@@ -34,7 +34,7 @@ Pi `0.84.2` supports this boundary through `session_shutdown`, `session_start`, 
 
 ## Two machines
 
-Each watch is an XState v5 actor. It owns cadence, gate checks, pending delivery, settlement, completion, expiry, cancellation, and typed terminal failure.
+Each watch is an XState v6 actor (`6.0.0-alpha.73`). It owns cadence, gate checks, pending delivery, settlement, completion, expiry, cancellation, and typed terminal failure.
 
 One session XState actor owns all `pi-until` delivery. It:
 
@@ -98,6 +98,14 @@ Review of the first packet found two settlement regressions: an in-flight claim 
 ### Handback when an adopted successor is discarded
 
 Do not equate `dropWatches` with handback. It does not say whether work was cancelled or relocated, and a running predecessor may still hold stale state. A safe handback needs an explicit ownership transfer from the current holder to one named recipient, a durable receipt consuming the current holder's work, and the same atomic claim protocol. Muster must name the recipient and distinguish discard from transfer before closing the pane. This is not a small extension-only change, so it remains deferred. Ordinary successor shutdown already forwards its owned watches and any pending predecessor chain.
+
+## XState 6 compatibility
+
+The port from XState `5.32.5` changes machine authoring, not lifecycle or persistence. Sources: the bundled migration guide and declarations in `xstate@6.0.0-alpha.73`, plus the upstream release tag at `2ee15f5a1cd0ad07053afbd47ad5eaf018027e92`. Suspension stores version 3 watch definitions and facts, never XState's internal actor snapshots. The parser, journal writer, handoff format, cadence and expiry anchors remain unchanged. No state migration or new suspension version is needed. State written by the v6 build remains readable by the v5 build at `7fa41bc`.
+
+`tests/fixtures/xstate5-suspension.json` was generated with real v5 actors and the production suspension writer at `7fa41bc`, using synthetic watches only. `tests/xstate-migration.test.ts` checks restoration, phase, state, facts, unchanged wire format and the extension reload boundary. Separate private proofs compare copied live-session suspensions against both runtimes with an inert check port; real conditions never execute.
+
+Fleet installation remains a desk decision after candidate verification and a one-desk canary. Running sessions keep their loaded code until restart. A dependency upgrade is not permission to widen the session lifecycle boundary.
 
 ## Current receipt
 

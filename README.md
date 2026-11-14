@@ -230,7 +230,7 @@ npm run check
 npm run pack:dry
 ```
 
-One XState v5 machine owns each watch:
+One XState v6 machine owns each watch:
 
 ```text
 active.routing -> waiting -> checking -----------------> satisfied
@@ -241,7 +241,7 @@ active.routing -> waiting -> checking -----------------> satisfied
        +-> completed | expired | cancelled | failed
 ```
 
-A second XState v5 machine owns the session delivery queue:
+A second XState v6 machine owns the session delivery queue:
 
 ```text
 ready -> queued -> awaiting message_start -> awaiting agent_settled -> ready

@@ -20,8 +20,8 @@ Node is `24.18.0` or newer. Maintainers and CI use npm `11.16.0` (the `packageMa
 - `src/domain.ts` owns immutable watch definitions, facts, failures, fixed-cadence math, and the per-watch phase and per-tick jitter laid on top of the un-jittered `nextDueAt` anchor.
 - `src/clock.ts` owns the injectable clock port used by machines and tests.
 - `src/jitter.ts` owns the injectable jitter source. It maps a key to a stable value, so a resumed watch recomputes its due time without persisting it.
-- `src/machine.ts` owns the XState v5 shell and recurring watch lifecycle.
-- `src/follow-up.ts` owns the XState v5 session delivery queue, message acknowledgement, settlement, deduplication, and stale-work rejection.
+- `src/machine.ts` owns the XState v6 shell and recurring watch lifecycle.
+- `src/follow-up.ts` owns the XState v6 session delivery queue, message acknowledgement, settlement, deduplication, and stale-work rejection.
 - `src/packet.ts` owns recurring Markdown wake and expiry packets.
 - `src/check.ts` owns bounded shell execution and process-group termination.
 - `src/exit-hooks.ts` owns the process-wide signal/exit registry shared by duplicate package loads and SDK sessions. Signal hooks journal and stop checks; a host settles before publication, or the registry publishes before re-raising an unhandled signal. Signal-exit v3/v4 observers are not host handlers. Keep the shared registry key and shape backward compatible; do not create parallel versioned registries.

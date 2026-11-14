@@ -1,0 +1,150 @@
+{
+  "generator": {
+    "commit": "7fa41bc",
+    "xstate": "5.32.5",
+    "capturedAt": 1000,
+    "note": "Synthetic watches run through real v5 actors and the production v3 suspension writer. No live user data."
+  },
+  "data": {
+    "reason": "reload",
+    "sessionId": "v5-fixture",
+    "suspendedAt": "1970-01-01T00:00:01.000Z",
+    "v": 3,
+    "watches": [
+      {
+        "definition": {
+          "kind": "until",
+          "label": "migration agent fixture",
+          "gate": {
+            "command": "exit 1",
+            "cwd": "/tmp",
+            "checkTimeoutMs": 100
+          },
+          "intervalMs": 5000,
+          "expiresAt": 61000,
+          "wake": "agent"
+        },
+        "facts": {
+          "attempts": 2,
+          "deliveries": 0,
+          "deliveryPending": false,
+          "id": "v5-fixture-0",
+          "missedTicks": 0,
+          "nextDueAt": 30000,
+          "reloads": 1,
+          "startedAt": 0
+        }
+      },
+      {
+        "definition": {
+          "kind": "until",
+          "label": "migration notify fixture",
+          "gate": {
+            "command": "exit 1",
+            "cwd": "/tmp",
+            "checkTimeoutMs": 100
+          },
+          "intervalMs": 10000,
+          "wake": "notify"
+        },
+        "facts": {
+          "attempts": 2,
+          "deliveries": 0,
+          "deliveryPending": false,
+          "id": "v5-fixture-1",
+          "missedTicks": 0,
+          "nextDueAt": 30000,
+          "reloads": 1,
+          "startedAt": 0
+        }
+      },
+      {
+        "definition": {
+          "kind": "recurring",
+          "label": "migration cadence fixture",
+          "intervalMs": 30000,
+          "expiresAt": 121000,
+          "first": "afterInterval",
+          "snapshot": {
+            "capturedAt": 0,
+            "contextRefs": [],
+            "instruction": "Inspect the synthetic fixture.",
+            "quickRef": "fixture only",
+            "origin": {
+              "sessionId": "v5-fixture"
+            }
+          }
+        },
+        "facts": {
+          "attempts": 2,
+          "deliveries": 0,
+          "deliveryPending": false,
+          "id": "v5-fixture-2",
+          "missedTicks": 0,
+          "nextDueAt": 30000,
+          "reloads": 1,
+          "startedAt": 0
+        }
+      },
+      {
+        "definition": {
+          "kind": "recurring",
+          "label": "migration pending fixture",
+          "intervalMs": 30000,
+          "expiresAt": 121000,
+          "first": "now",
+          "jitter": false,
+          "snapshot": {
+            "capturedAt": 0,
+            "contextRefs": [],
+            "instruction": "Inspect the pending synthetic fixture.",
+            "quickRef": "pending fixture only",
+            "origin": {
+              "sessionId": "v5-fixture"
+            }
+          }
+        },
+        "facts": {
+          "attempts": 2,
+          "deliveries": 0,
+          "deliveryPending": true,
+          "id": "v5-fixture-3",
+          "missedTicks": 0,
+          "nextDueAt": 0,
+          "reloads": 1,
+          "startedAt": 0
+        }
+      }
+    ]
+  },
+  "expected": [
+    {
+      "id": "v5-fixture-0",
+      "state": {
+        "active": "waiting"
+      },
+      "phase": 17
+    },
+    {
+      "id": "v5-fixture-1",
+      "state": {
+        "active": "waiting"
+      },
+      "phase": 290
+    },
+    {
+      "id": "v5-fixture-2",
+      "state": {
+        "active": "waiting"
+      },
+      "phase": 1641
+    },
+    {
+      "id": "v5-fixture-3",
+      "state": {
+        "active": "duePending"
+      },
+      "phase": 0
+    }
+  ]
+}

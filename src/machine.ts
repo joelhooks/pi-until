@@ -1,4 +1,4 @@
-import { assign, fromCallback, fromPromise, setup } from "xstate";
+import { createAsyncLogic, createCallbackLogic, setup, types } from "xstate";
 
 import { systemClock } from "./clock.ts";
 import type { UntilClock } from "./clock.ts";
@@ -72,32 +72,28 @@ const afterNoMatch = (
     deliveryPending: false,
   };
   return context.definition.kind === "until"
-    ? {
-        ...checked,
-        nextDueAt: checkedAt + context.definition.intervalMs,
-      }
+    ? { ...checked, nextDueAt: checkedAt + context.definition.intervalMs }
     : advanceAfterTick(checked, context.definition.intervalMs, checkedAt);
 };
 
 const afterDeliveryRequested = (
   context: WatchContext,
-  requestedAt: number,
-  result?: UntilCheckResult
-): WatchFacts => {
-  const checked =
-    result === undefined
-      ? context.facts
-      : withCheckResult(context.facts, result, requestedAt);
-  return advanceAfterTick(
+  requestedAt: number
+): WatchFacts =>
+  advanceAfterTick(
     {
-      ...checked,
-      deliveries: checked.deliveries + 1,
+      ...context.facts,
+      deliveries: context.facts.deliveries + 1,
       deliveryPending: false,
     },
     context.definition.intervalMs,
     requestedAt
   );
-};
+
+const coalesceAtExpiry = (context: WatchContext, at: number) =>
+  context.definition.kind === "recurring"
+    ? coalescePastDue(context.facts, context.definition.intervalMs, at)
+    : context.facts;
 
 export function createWatchMachine(
   runCheck: RunUntilCheck,
@@ -107,84 +103,34 @@ export function createWatchMachine(
   const now = () => clock.now();
   const due = (context: WatchContext) =>
     dueAt(context.definition, context.facts, jitter);
+  const markFinished = ({ context }: { context: WatchContext }) => ({
+    context: {
+      facts: {
+        ...context.facts,
+        finishedAt: context.facts.finishedAt ?? now(),
+      },
+    },
+  });
+
   return setup({
-    actions: {
-      coalesceAtExpiry: assign({
-        facts: ({ context, event }) => {
-          if (context.definition.kind !== "recurring") return context.facts;
-          const at = event.type === "EXPIRE" ? event.at : now();
-          return coalescePastDue(
-            context.facts,
-            context.definition.intervalMs,
-            at
-          );
-        },
-      }),
-      countAttempt: assign({
-        facts: ({ context }) => ({
-          ...context.facts,
-          attempts: context.facts.attempts + 1,
-        }),
-      }),
-      markDeliveryPending: assign({
-        facts: ({ context }) => ({
-          ...context.facts,
-          deliveryPending: true,
-        }),
-      }),
-      markFinished: assign({
-        facts: ({ context }) => ({
-          ...context.facts,
-          finishedAt: context.facts.finishedAt ?? now(),
-        }),
-      }),
-      markDeliveryFailure: assign({
-        facts: ({ context, event }) => ({
-          ...context.facts,
-          failure:
-            event.type === "DELIVERY_FAILED"
-              ? event.failure
-              : { kind: "delivery", message: "follow-up delivery failed" },
-        }),
-      }),
-      startDelivery: assign({
-        facts: ({ context, event }) =>
-          afterDeliveryRequested(
-            context,
-            event.type === "DELIVERY_STARTED" ? event.at : now()
-          ),
-      }),
-      // A recurring tick Pi never started counts as missed; the cadence goes on.
-      skipDelivery: assign({
-        facts: ({ context, event }) =>
-          context.definition.kind === "recurring"
-            ? advanceAfterTick(
-                {
-                  ...context.facts,
-                  deliveryPending: false,
-                  missedTicks: context.facts.missedTicks + 1,
-                },
-                context.definition.intervalMs,
-                event.type === "DELIVERY_SKIPPED" ? event.at : now()
-              )
-            : context.facts,
-      }),
-      settleDelivery: assign({
-        facts: ({ context, event }) =>
-          context.definition.kind === "recurring"
-            ? coalescePastDue(
-                context.facts,
-                context.definition.intervalMs,
-                event.type === "DELIVERY_SETTLED" ? event.at : now()
-              )
-            : context.facts,
-      }),
+    schemas: {
+      context: types<WatchContext>(),
+      events: {
+        CANCEL: types(),
+        COMPLETE: types(),
+        DELIVERY_FAILED: types<{ failure: WatchFailure }>(),
+        DELIVERY_SETTLED: types<{ at: number }>(),
+        DELIVERY_SKIPPED: types<{ at: number }>(),
+        DELIVERY_STARTED: types<{ at: number }>(),
+        EXPIRE: types<{ at: number }>(),
+      },
+      input: types<WatchActorInput>(),
     },
     actors: {
-      checkCondition: fromPromise<UntilCheckResult, ShellGate>(
-        async ({ input, signal }) => runCheck(input, signal)
-      ),
-      expiryTimer: fromCallback<WatchEvent, { expiresAt?: number }>(
+      checkCondition: createAsyncLogic<UntilCheckResult, ShellGate>({
+        run: async ({ input, signal }) => runCheck(input, signal),
+      }),
+      expiryTimer: createCallbackLogic<WatchEvent, { expiresAt?: number }>(
         ({ input, sendBack }) => {
           const expiresAt = input.expiresAt;
           const timer =
@@ -203,27 +149,6 @@ export function createWatchMachine(
     delays: {
       untilDue: ({ context }) => Math.max(0, due(context) - now()),
     },
-    guards: {
-      dueWithoutGate: ({ context }) =>
-        context.definition.kind === "recurring" &&
-        gateOf(context.definition) === undefined &&
-        due(context) <= now(),
-      expired: ({ context }) => {
-        const expiresAt = expiresAtOf(context.definition);
-        return expiresAt !== undefined && expiresAt <= now();
-      },
-      hasDueGate: ({ context }) =>
-        gateOf(context.definition) !== undefined && due(context) <= now(),
-      isRecurring: ({ context }) => context.definition.kind === "recurring",
-    },
-    types: {
-      // SAFETY: XState reads these empty values only as compile-time type witnesses.
-      context: {} as WatchContext,
-      // SAFETY: XState reads these empty values only as compile-time type witnesses.
-      events: {} as WatchEvent,
-      // SAFETY: XState reads these empty values only as compile-time type witnesses.
-      input: {} as WatchActorInput,
-    },
   }).createMachine({
     context: ({ input }) => input,
     id: "watch",
@@ -239,31 +164,47 @@ export function createWatchMachine(
           src: "expiryTimer",
         },
         on: {
-          CANCEL: "cancelled",
-          COMPLETE: {
-            guard: "isRecurring",
-            target: "completed",
-          },
-          EXPIRE: {
-            actions: "coalesceAtExpiry",
+          CANCEL: { target: "cancelled" },
+          COMPLETE: ({ context }) =>
+            context.definition.kind === "recurring"
+              ? { target: "completed" }
+              : undefined,
+          EXPIRE: ({ context, event }) => ({
+            context: { facts: coalesceAtExpiry(context, event.at) },
             target: "expired",
-          },
-          DELIVERY_FAILED: {
-            actions: "markDeliveryFailure",
+          }),
+          DELIVERY_FAILED: ({ context, event }) => ({
+            context: { facts: { ...context.facts, failure: event.failure } },
             target: "failed",
-          },
+          }),
         },
         states: {
           awaitingSettlement: {
             on: {
-              DELIVERY_SETTLED: {
-                actions: "settleDelivery",
+              DELIVERY_SETTLED: ({ context, event }) => ({
+                context: {
+                  facts:
+                    context.definition.kind === "recurring"
+                      ? coalescePastDue(
+                          context.facts,
+                          context.definition.intervalMs,
+                          event.at
+                        )
+                      : context.facts,
+                },
                 target: "routing",
-              },
+              }),
             },
           },
           checking: {
-            entry: "countAttempt",
+            entry: ({ context }) => ({
+              context: {
+                facts: {
+                  ...context.facts,
+                  attempts: context.facts.attempts + 1,
+                },
+              },
+            }),
             invoke: {
               id: "checkCondition",
               input: ({ context }) => {
@@ -273,96 +214,109 @@ export function createWatchMachine(
                 }
                 return gate;
               },
-              onDone: [
-                {
-                  actions: assign({
-                    facts: ({ context, event }) =>
-                      withCheckResult(context.facts, event.output, now()),
-                  }),
-                  guard: ({ context, event }) =>
-                    context.definition.kind === "until" && passed(event.output),
-                  target: "#watch.satisfied",
-                },
-                {
-                  actions: assign({
-                    facts: ({ context, event }) => ({
-                      ...withCheckResult(context.facts, event.output, now()),
-                      deliveryPending: true,
-                    }),
-                  }),
-                  guard: ({ context, event }) =>
-                    context.definition.kind === "recurring" &&
-                    passed(event.output),
-                  target: "duePending",
-                },
-                {
-                  actions: assign({
-                    facts: ({ context, event }) =>
-                      afterNoMatch(context, event.output, now()),
-                  }),
+              onDone: ({ context, event }) => {
+                if (passed(event.output)) {
+                  const facts = withCheckResult(
+                    context.facts,
+                    event.output,
+                    now()
+                  );
+                  return context.definition.kind === "until"
+                    ? { context: { facts }, target: "#watch.satisfied" }
+                    : {
+                        context: { facts: { ...facts, deliveryPending: true } },
+                        target: "duePending",
+                      };
+                }
+                return {
+                  context: {
+                    facts: afterNoMatch(context, event.output, now()),
+                  },
                   target: "routing",
-                },
-              ],
-              onError: {
-                actions: assign({
-                  facts: ({ context, event }) => ({
+                };
+              },
+              onError: ({ context, event }) => ({
+                context: {
+                  facts: {
                     ...context.facts,
                     failure: {
-                      kind: "gate" as const,
+                      kind: "gate",
                       message:
                         event.error instanceof Error
                           ? event.error.message
                           : String(event.error),
                     },
-                  }),
-                }),
+                  },
+                },
                 target: "#watch.failed",
-              },
+              }),
               src: "checkCondition",
             },
           },
           duePending: {
             on: {
-              DELIVERY_STARTED: {
-                actions: "startDelivery",
+              DELIVERY_STARTED: ({ context, event }) => ({
+                context: { facts: afterDeliveryRequested(context, event.at) },
                 target: "awaitingSettlement",
-              },
-              DELIVERY_SKIPPED: {
-                actions: "skipDelivery",
+              }),
+              DELIVERY_SKIPPED: ({ context, event }) => ({
+                context: {
+                  facts:
+                    context.definition.kind === "recurring"
+                      ? advanceAfterTick(
+                          {
+                            ...context.facts,
+                            deliveryPending: false,
+                            missedTicks: context.facts.missedTicks + 1,
+                          },
+                          context.definition.intervalMs,
+                          event.at
+                        )
+                      : context.facts,
+                },
                 target: "routing",
-              },
+              }),
             },
           },
           routing: {
-            always: [
-              {
-                actions: "coalesceAtExpiry",
-                guard: "expired",
-                target: "#watch.expired",
-              },
-              {
-                guard: ({ context }) => context.facts.deliveryPending,
-                target: "duePending",
-              },
-              { guard: "hasDueGate", target: "checking" },
-              {
-                actions: "markDeliveryPending",
-                guard: "dueWithoutGate",
-                target: "duePending",
-              },
-              { target: "waiting" },
-            ],
+            always: ({ context }) => {
+              const expiresAt = expiresAtOf(context.definition);
+              if (expiresAt !== undefined && expiresAt <= now()) {
+                return {
+                  context: { facts: coalesceAtExpiry(context, now()) },
+                  target: "#watch.expired",
+                };
+              }
+              if (context.facts.deliveryPending)
+                return { target: "duePending" };
+              if (due(context) <= now()) {
+                if (gateOf(context.definition) !== undefined) {
+                  return { target: "checking" };
+                }
+                if (context.definition.kind === "recurring") {
+                  return {
+                    context: {
+                      facts: { ...context.facts, deliveryPending: true },
+                    },
+                    target: "duePending",
+                  };
+                }
+              }
+              return { target: "waiting" };
+            },
           },
           waiting: {
-            after: { untilDue: "routing" },
+            after: {
+              untilDue: { target: "routing" },
+            },
           },
         },
       },
-      cancelled: { entry: "markFinished", type: "final" },
-      completed: { entry: "markFinished", type: "final" },
-      expired: { entry: "markFinished", type: "final" },
-      failed: { entry: "markFinished", type: "final" },
-      satisfied: { entry: "markFinished", type: "final" },
+      cancelled: { entry: markFinished, type: "final" },
+      completed: { entry: markFinished, type: "final" },
+      expired: { entry: markFinished, type: "final" },
+      failed: { entry: markFinished, type: "final" },
+      satisfied: { entry: markFinished, type: "final" },
     },
   });
 }

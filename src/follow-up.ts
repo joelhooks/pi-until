@@ -1,4 +1,4 @@
-import { assign, setup } from "xstate";
+import { setup, types } from "xstate";
 
 interface FollowUpRequestBase {
   readonly dedupeKey: string;
@@ -83,112 +83,53 @@ const contains = (
   context.active?.dedupeKey === request.dedupeKey ||
   context.queue.some((item) => item.dedupeKey === request.dedupeKey);
 
-export const createFollowUpMachine = (ports: FollowUpPorts) =>
-  setup({
-    actions: {
-      activateNext: assign(({ context }) => {
-        const [active, ...queue] = context.queue;
-        return { active, queue };
-      }),
-      clearActive: assign({ active: undefined }),
-      dispatchActive: ({ context }) => {
-        if (context.active !== undefined) ports.dispatch(context.active);
+const enqueue = (context: FollowUpContext, request: FollowUpRequest) => ({
+  queue: contains(context, request)
+    ? context.queue
+    : [...context.queue, request],
+});
+
+const requeueLost = (context: FollowUpContext) => {
+  const { active } = context;
+  return active === undefined || active.retried === true
+    ? { active: undefined }
+    : {
+        active: undefined,
+        queue: [{ ...active, retried: true }, ...context.queue],
+      };
+};
+
+export const createFollowUpMachine = (ports: FollowUpPorts) => {
+  const reportLost = (active: FollowUpRequest | undefined) => {
+    if (active === undefined) return;
+    const retrying = active.retried !== true;
+    ports.lost?.(active, retrying);
+    if (retrying) return;
+    // A one-shot result has nowhere else to go, so its loss is a failure.
+    // A recurring tick is skipped: failing it would end the whole watch.
+    if (active.kind === "recurring") ports.skipped?.(active);
+    else ports.failed?.(active);
+  };
+
+  return setup({
+    schemas: {
+      context: types<FollowUpContext>(),
+      events: {
+        COMPACTION_ENDED: types(),
+        COMPACTION_STARTED: types(),
+        DISPATCH_FAILED: types<{ id: string }>(),
+        DROP: types<{ dedupeKey: string }>(),
+        ENQUEUE: types<{ request: FollowUpRequest }>(),
+        MESSAGE_STARTED: types<{ id: string }>(),
+        SESSION_BUSY: types(),
+        SESSION_SETTLED: types(),
       },
-      dropQueueHead: assign({
-        queue: ({ context }) => context.queue.slice(1),
-      }),
-      dropQueued: assign({
-        queue: ({ context, event }) =>
-          event.type === "DROP"
-            ? context.queue.filter(
-                (request) => request.dedupeKey !== event.dedupeKey
-              )
-            : context.queue,
-      }),
-      enqueue: assign({
-        queue: ({ context, event }) =>
-          event.type !== "ENQUEUE" || contains(context, event.request)
-            ? context.queue
-            : [...context.queue, event.request],
-      }),
-      markCompacting: assign({ compacting: true }),
-      markCompactionEnded: assign({ compacting: false }),
-      markSessionBusy: assign({ sessionBusy: true }),
-      markSessionIdle: assign({ compacting: false, sessionBusy: false }),
-      recordDispatchTime: assign({
-        active: ({ context }) => {
-          if (context.active?.kind !== "recurring" || ports.now === undefined) {
-            return context.active;
-          }
-          return { ...context.active, dispatchedAt: ports.now() };
-        },
-      }),
-      reportFailure: ({ context }) => {
-        if (context.active !== undefined) ports.failed?.(context.active);
-      },
-      reportSettled: ({ context }) => {
-        if (context.active !== undefined) ports.settled(context.active);
-      },
-      reportStarted: ({ context }) => {
-        if (context.active !== undefined) ports.started(context.active);
-      },
-      reportLost: ({ context }) => {
-        const { active } = context;
-        if (active === undefined) return;
-        const retrying = active.retried !== true;
-        ports.lost?.(active, retrying);
-        if (retrying) return;
-        // A one-shot result has nowhere else to go, so its loss is a failure.
-        // A recurring tick is skipped: failing it would end the whole watch.
-        if (active.kind === "recurring") ports.skipped?.(active);
-        else ports.failed?.(active);
-      },
-      // One retry at the head of the queue, then give up loudly. The retry
-      // keeps its request id. A late MESSAGE_STARTED for the lost copy can't
-      // match it, because Pi starts a queued follow-up before the run holding
-      // it settles, and only a settle (or the idle cap) declares it lost.
-      requeueLost: assign(({ context }) => {
-        const { active } = context;
-        if (active === undefined || active.retried === true) {
-          return { active: undefined };
-        }
-        return {
-          active: undefined,
-          queue: [{ ...active, retried: true }, ...context.queue],
-        };
-      }),
-      reportUnacknowledged: ({ context }) => {
-        if (context.active !== undefined) {
-          ports.unacknowledged?.(context.active);
-        }
-      },
+      input: types<FollowUpMachineInput>(),
     },
     delays: {
       compactionGrace: ports.compactionGraceMs ?? DEFAULT_COMPACTION_GRACE_MS,
       dispatchAck: ports.dispatchAckMs ?? DEFAULT_DISPATCH_ACK_MS,
       uncertainMax: ports.uncertainMaxMs ?? DEFAULT_UNCERTAIN_MAX_MS,
-    },
-    guards: {
-      hasQueued: ({ context }) => context.queue.length > 0,
-      isCompacting: ({ context }) => context.compacting,
-      isQueueHeadStale: ({ context }) => {
-        const [head] = context.queue;
-        return head !== undefined && !(ports.isLive?.(head) ?? true);
-      },
-      isSessionBusy: ({ context }) => context.sessionBusy,
-      isSessionIdle: ({ context }) => !context.sessionBusy,
-      matchesActive: ({ context, event }) =>
-        (event.type === "DISPATCH_FAILED" ||
-          event.type === "MESSAGE_STARTED") &&
-        context.active?.id === event.id,
-    },
-    types: {
-      // SAFETY: XState reads these empty values only as compile-time type witnesses.
-      context: {} as FollowUpContext,
-      // SAFETY: XState reads these empty values only as compile-time type witnesses.
-      events: {} as FollowUpEvent,
-      // SAFETY: XState reads these empty values only as compile-time type witnesses.
-      input: {} as FollowUpMachineInput,
     },
   }).createMachine({
     context: ({ input }) => ({
@@ -199,147 +140,206 @@ export const createFollowUpMachine = (ports: FollowUpPorts) =>
     id: "sessionFollowUps",
     initial: "routing",
     on: {
-      // An agent run owns the session through its own compaction, so outside
-      // the idle states compaction is only a fact for the next routing pass.
-      COMPACTION_ENDED: { actions: "markCompactionEnded" },
-      COMPACTION_STARTED: { actions: "markCompacting" },
-      DROP: { actions: "dropQueued" },
+      // Outside idle states, compaction is a fact for the next routing pass.
+      COMPACTION_ENDED: () => ({ context: { compacting: false } }),
+      COMPACTION_STARTED: () => ({ context: { compacting: true } }),
+      DROP: ({ context, event }) => ({
+        context: {
+          queue: context.queue.filter(
+            (request) => request.dedupeKey !== event.dedupeKey
+          ),
+        },
+      }),
     },
     states: {
       awaitingSettlement: {
         on: {
-          ENQUEUE: { actions: "enqueue" },
-          SESSION_BUSY: { actions: "markSessionBusy" },
-          SESSION_SETTLED: {
-            actions: ["markSessionIdle", "reportSettled", "clearActive"],
-            target: "routing",
+          ENQUEUE: ({ context, event }) => ({
+            context: enqueue(context, event.request),
+          }),
+          SESSION_BUSY: () => ({ context: { sessionBusy: true } }),
+          SESSION_SETTLED: ({ context }, enq) => {
+            if (context.active !== undefined)
+              enq(ports.settled, context.active);
+            return {
+              context: {
+                active: undefined,
+                compacting: false,
+                sessionBusy: false,
+              },
+              target: "routing",
+            };
           },
         },
       },
       awaitingStart: {
         after: {
-          dispatchAck: {
-            actions: "reportUnacknowledged",
-            target: "startUncertain",
+          dispatchAck: ({ context }, enq) => {
+            const { active } = context;
+            if (active !== undefined) {
+              enq(() => ports.unacknowledged?.(active));
+            }
+            return { target: "startUncertain" };
           },
         },
-        entry: ["recordDispatchTime", "dispatchActive"],
+        entry: ({ context }, enq) => {
+          const active =
+            context.active?.kind === "recurring" && ports.now !== undefined
+              ? { ...context.active, dispatchedAt: ports.now() }
+              : context.active;
+          if (active !== undefined) enq(ports.dispatch, active);
+          return { context: { active } };
+        },
         on: {
-          DISPATCH_FAILED: {
-            actions: ["reportFailure", "clearActive"],
-            guard: "matchesActive",
-            target: "routing",
+          DISPATCH_FAILED: ({ context, event }, enq) => {
+            const { active } = context;
+            const matches = active?.id === event.id;
+            if (matches) enq(() => ports.failed?.(active));
+            return matches
+              ? { context: { active: undefined }, target: "routing" }
+              : undefined;
           },
-          ENQUEUE: { actions: "enqueue" },
-          MESSAGE_STARTED: {
-            actions: "reportStarted",
-            guard: "matchesActive",
-            target: "awaitingSettlement",
+          ENQUEUE: ({ context, event }) => ({
+            context: enqueue(context, event.request),
+          }),
+          MESSAGE_STARTED: ({ context, event }, enq) => {
+            const { active } = context;
+            const matches = active?.id === event.id;
+            if (matches) enq(ports.started, active);
+            return matches ? { target: "awaitingSettlement" } : undefined;
           },
-          SESSION_BUSY: { actions: "markSessionBusy" },
+          SESSION_BUSY: () => ({ context: { sessionBusy: true } }),
         },
       },
       startUncertain: {
-        // The cap fires once. If the session is busy then, its run will
-        // settle (every run emits agent_settled), and SESSION_SETTLED below
-        // decides. Don't turn this into a polling loop.
+        // The cap fires once. A busy run's SESSION_SETTLED decides instead.
         after: {
-          uncertainMax: {
-            actions: ["reportLost", "requeueLost"],
-            guard: "isSessionIdle",
-            target: "routing",
+          uncertainMax: ({ context }, enq) => {
+            if (!context.sessionBusy) enq(reportLost, context.active);
+            return context.sessionBusy
+              ? undefined
+              : { context: requeueLost(context), target: "routing" };
           },
         },
         on: {
-          DISPATCH_FAILED: {
-            actions: ["reportFailure", "clearActive"],
-            guard: "matchesActive",
-            target: "routing",
+          DISPATCH_FAILED: ({ context, event }, enq) => {
+            const { active } = context;
+            const matches = active?.id === event.id;
+            if (matches) enq(() => ports.failed?.(active));
+            return matches
+              ? { context: { active: undefined }, target: "routing" }
+              : undefined;
           },
-          ENQUEUE: { actions: "enqueue" },
-          MESSAGE_STARTED: {
-            actions: "reportStarted",
-            guard: "matchesActive",
-            target: "awaitingSettlement",
+          ENQUEUE: ({ context, event }) => ({
+            context: enqueue(context, event.request),
+          }),
+          MESSAGE_STARTED: ({ context, event }, enq) => {
+            const { active } = context;
+            const matches = active?.id === event.id;
+            if (matches) enq(ports.started, active);
+            return matches ? { target: "awaitingSettlement" } : undefined;
           },
-          SESSION_BUSY: { actions: "markSessionBusy" },
-          SESSION_SETTLED: {
-            actions: ["markSessionIdle", "reportLost", "requeueLost"],
-            target: "routing",
+          SESSION_BUSY: () => ({ context: { sessionBusy: true } }),
+          SESSION_SETTLED: ({ context }, enq) => {
+            enq(reportLost, context.active);
+            return {
+              context: {
+                ...requeueLost(context),
+                compacting: false,
+                sessionBusy: false,
+              },
+              target: "routing",
+            };
           },
         },
       },
       compacting: {
         on: {
-          COMPACTION_ENDED: {
-            actions: "markCompactionEnded",
+          COMPACTION_ENDED: () => ({
+            context: { compacting: false },
             target: "compactionGrace",
-          },
-          ENQUEUE: { actions: "enqueue" },
-          SESSION_BUSY: { actions: "markSessionBusy", target: "busy" },
-          // Pi settles only after compaction finishes; a missed end event
-          // must not strand the queue.
-          SESSION_SETTLED: {
-            actions: "markSessionIdle",
+          }),
+          ENQUEUE: ({ context, event }) => ({
+            context: enqueue(context, event.request),
+          }),
+          SESSION_BUSY: () => ({
+            context: { sessionBusy: true },
+            target: "busy",
+          }),
+          // A missed compaction-end event must not strand the queue.
+          SESSION_SETTLED: () => ({
+            context: { compacting: false, sessionBusy: false },
             target: "routing",
-          },
+          }),
         },
       },
       compactionGrace: {
-        after: {
-          compactionGrace: { target: "routing" },
-        },
+        after: { compactionGrace: { target: "routing" } },
         on: {
-          COMPACTION_STARTED: {
-            actions: "markCompacting",
+          COMPACTION_STARTED: () => ({
+            context: { compacting: true },
             target: "compacting",
-          },
-          ENQUEUE: { actions: "enqueue" },
-          SESSION_BUSY: { actions: "markSessionBusy", target: "busy" },
-          SESSION_SETTLED: {
-            actions: "markSessionIdle",
+          }),
+          ENQUEUE: ({ context, event }) => ({
+            context: enqueue(context, event.request),
+          }),
+          SESSION_BUSY: () => ({
+            context: { sessionBusy: true },
+            target: "busy",
+          }),
+          SESSION_SETTLED: () => ({
+            context: { compacting: false, sessionBusy: false },
             target: "routing",
-          },
+          }),
         },
       },
       busy: {
         on: {
-          ENQUEUE: { actions: "enqueue" },
-          SESSION_SETTLED: {
-            actions: "markSessionIdle",
+          ENQUEUE: ({ context, event }) => ({
+            context: enqueue(context, event.request),
+          }),
+          SESSION_SETTLED: () => ({
+            context: { compacting: false, sessionBusy: false },
             target: "routing",
-          },
+          }),
         },
       },
       routing: {
-        always: [
-          {
-            actions: "dropQueueHead",
-            guard: "isQueueHeadStale",
-            target: "routing",
-          },
-          { guard: "isSessionBusy", target: "busy" },
-          { guard: "isCompacting", target: "compacting" },
-          {
-            actions: "activateNext",
-            guard: "hasQueued",
-            target: "awaitingStart",
-          },
-          { target: "ready" },
-        ],
+        always: ({ context }) => {
+          const [head, ...queue] = context.queue;
+          if (head !== undefined && !(ports.isLive?.(head) ?? true)) {
+            return { context: { queue }, target: "routing" };
+          }
+          if (context.sessionBusy) return { target: "busy" };
+          if (context.compacting) return { target: "compacting" };
+          if (head !== undefined) {
+            return {
+              context: { active: head, queue },
+              target: "awaitingStart",
+            };
+          }
+          return { target: "ready" };
+        },
       },
       ready: {
         on: {
-          COMPACTION_STARTED: {
-            actions: "markCompacting",
+          COMPACTION_STARTED: () => ({
+            context: { compacting: true },
             target: "compacting",
-          },
-          ENQUEUE: { actions: "enqueue", target: "routing" },
-          SESSION_BUSY: { actions: "markSessionBusy", target: "busy" },
+          }),
+          ENQUEUE: ({ context, event }) => ({
+            context: enqueue(context, event.request),
+            target: "routing",
+          }),
+          SESSION_BUSY: () => ({
+            context: { sessionBusy: true },
+            target: "busy",
+          }),
         },
       },
     },
   });
+};
 
 /**
  * Version 1 request from another extension to share this session's arbiter.
