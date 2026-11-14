@@ -20,7 +20,8 @@ const DEFAULT_INTERVAL_SECONDS = 30;
 const DEFAULT_CHECK_TIMEOUT_SECONDS = 30;
 
 // `list` separates pending/released inventory from active watches. Re-arming
-// requires adoption or an unspent release owned by this session; schema unchanged.
+// requires adoption or this session's release; reload/partial re-arm retain it.
+// Check active watches first. Serialized schema and prompt strings stay unchanged.
 export const untilParameters = Type.Object(
   {
     action: StringEnum([

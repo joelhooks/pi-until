@@ -145,23 +145,66 @@ it("hides a foreign release even without a newer successor binding", async () =>
   expect(result.content[0]?.text).not.toContain("Re-arm as needed");
 });
 
-it.each([
-  "pi-until-started",
-  "pi-until-resumed",
-  "pi-until-suspended",
-  "pi-until-successor",
-])("hides a release view after newer %s work", async (type) => {
+it.each(["pi-until-resumed", "pi-until-suspended", "pi-until-successor"])(
+  "hides a release view after newer %s work",
+  async (type) => {
+    const test = await waitingSession(false);
+    await vi.waitFor(() =>
+      expect(predecessorHandled(test.session.entries, test.parent.id)).toBe(
+        true
+      )
+    );
+    const before = await test.list();
+    expect(before.details).toHaveProperty("handoffReleased");
+    test.session.appendCustom(type, {
+      receipt: { id: "rearmed", label: "new work" },
+    });
+    const after = await test.list();
+    expect(after.details).not.toHaveProperty("handoffReleased");
+  }
+);
+
+it("keeps release inventory after a partial re-arm and warns to check active work", async () => {
   const test = await waitingSession(false);
   await vi.waitFor(() =>
     expect(predecessorHandled(test.session.entries, test.parent.id)).toBe(true)
   );
-  const before = await test.list();
-  expect(before.details).toHaveProperty("handoffReleased");
-  test.session.appendCustom(type, {
-    receipt: { id: "rearmed", label: "new work" },
+  test.session.appendCustom("pi-until-started", {
+    receipt: { id: "fresh-arm", label: "partial re-arm" },
   });
   const after = await test.list();
-  expect(after.details).not.toHaveProperty("handoffReleased");
+  expect(after.details).toMatchObject({
+    handoffReleased: { inventoryIds: ["inventory"] },
+  });
+  expect(after.content[0]?.text).toContain("Some ids may already be re-armed");
+  expect(after.content[0]?.text).toContain(
+    "If `until list` shows a pending handoff, this release does not apply."
+  );
+});
+
+it("retains released ids through reload before any re-arm", async () => {
+  const test = await waitingSession(false);
+  await vi.waitFor(() =>
+    expect(predecessorHandled(test.session.entries, test.parent.id)).toBe(true)
+  );
+  await test.extension.shutdown("reload", test.ctx);
+  extensions.delete(test.extension);
+  const reloaded = loadExtension(test.session, { handoff: test.handoff });
+  extensions.add(reloaded);
+  await reloaded.sessionStart("reload", test.ctx);
+  const after = await reloaded.tool(
+    "list",
+    { action: "list" },
+    new AbortController().signal,
+    undefined,
+    test.ctx
+  );
+  expect(after.details).toMatchObject({
+    watches: [],
+    handoffReleased: { inventoryIds: ["inventory"] },
+  });
+  expect(after.content[0]?.text).toContain("Re-arm as needed");
+  expect(reloaded.messages).toHaveLength(0);
 });
 
 it("clears released inventory before a later fork lists re-armed ids", async () => {
@@ -607,7 +650,9 @@ it("releases with predecessor and inventory ids, consumes the binding and ignore
     ctx
   );
   expect(after.details).toMatchObject({ watches: [] });
-  expect(after.details).not.toHaveProperty("handoffReleased");
+  expect(after.details).toMatchObject({
+    handoffReleased: { inventoryIds: ["inventory-a", "inventory-b"] },
+  });
   expect(after.content[0]?.text).not.toContain("Handoff pending");
   expect(reloaded.messages).toHaveLength(0);
   expect(await stat(join(directory, `${parent.id}.json`))).toBeDefined();

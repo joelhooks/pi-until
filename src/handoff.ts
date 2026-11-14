@@ -13,6 +13,7 @@ import {
 } from "node:fs";
 import {
   mkdir,
+  link,
   open,
   readFile,
   readdir,
@@ -21,7 +22,7 @@ import {
   unlink,
 } from "node:fs/promises";
 import { homedir } from "node:os";
-import { basename, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 
 import type { SessionEntry } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
@@ -433,20 +434,11 @@ export const writeSessionLiveness = async (
   return true;
 };
 
-export const predecessorLiveness = async (
-  directory: string,
+const livenessFromRecord = async (
+  data: unknown,
   sessionId: string,
-  probe: ProcessStartProbe = processStartTime
+  probe: ProcessStartProbe
 ): Promise<PredecessorLiveness> => {
-  if (!validId(sessionId)) return "unknown";
-  let data: unknown;
-  try {
-    data = JSON.parse(
-      await readFile(join(directory, "liveness", `${sessionId}.json`), "utf-8")
-    );
-  } catch (error) {
-    return missing(error) ? "unrecorded" : "unknown";
-  }
   try {
     if (
       !Value.Check(livenessSchema, data) ||
@@ -471,6 +463,23 @@ export const predecessorLiveness = async (
   } catch {
     return "unknown";
   }
+};
+
+export const predecessorLiveness = async (
+  directory: string,
+  sessionId: string,
+  probe: ProcessStartProbe = processStartTime
+): Promise<PredecessorLiveness> => {
+  if (!validId(sessionId)) return "unknown";
+  let data: unknown;
+  try {
+    data = JSON.parse(
+      await readFile(join(directory, "liveness", `${sessionId}.json`), "utf-8")
+    );
+  } catch (error) {
+    return missing(error) ? "unrecorded" : "unknown";
+  }
+  return livenessFromRecord(data, sessionId, probe);
 };
 
 const clearOwnLiveness = (directory: string, sessionId: string): void => {
@@ -788,17 +797,127 @@ const filesIn = async (directory: string): Promise<string[]> => {
 
 type MailboxWarning = (message: string) => void;
 
+type PrivateRead =
+  | { kind: "present"; data: unknown }
+  | { kind: "missing" }
+  | { kind: "unreadable" };
+const readPrivateResult = async (
+  path: string,
+  read: (path: string) => Promise<string> = (file) => readFile(file, "utf-8")
+): Promise<PrivateRead> => {
+  try {
+    return { kind: "present", data: JSON.parse(await read(path)) };
+  } catch (error) {
+    return { kind: missing(error) ? "missing" : "unreadable" };
+  }
+};
 const readPrivate = async (
   path: string,
   warn?: MailboxWarning
 ): Promise<unknown> => {
-  try {
-    return JSON.parse(await readFile(path, "utf-8"));
-  } catch (error) {
-    if (!missing(error))
-      warn?.(`pi-until skipped unreadable mailbox file ${basename(path)}`);
-    return undefined;
+  const result = await readPrivateResult(path);
+  if (result.kind === "unreadable")
+    warn?.(`pi-until skipped unreadable mailbox file ${basename(path)}`);
+  return result.kind === "present" ? result.data : undefined;
+};
+
+// Capture the candidate before deleting it. A concurrent atomic rewrite is
+// restored without replacing any newer canonical record.
+const removeMetadataIfSame = async (
+  path: string,
+  metadata: { ino: number; mtimeMs: number }
+) => {
+  const quarantine = join(
+    dirname(path),
+    `.${basename(path)}.${randomUUID()}.tmp`
+  );
+  await rename(path, quarantine);
+  const captured = await stat(quarantine);
+  if (captured.ino !== metadata.ino || captured.mtimeMs !== metadata.mtimeMs) {
+    try {
+      await link(quarantine, path);
+    } catch (error) {
+      if (
+        !(error instanceof Error && "code" in error && error.code === "EEXIST")
+      )
+        throw error;
+    }
   }
+  await unlink(quarantine);
+};
+
+const deathObservationSchema = Type.Object(
+  {
+    identity: livenessSchema,
+    observedAt: Type.Number({ minimum: 0 }),
+  },
+  { additionalProperties: false }
+);
+const sameIdentity = (
+  left: Static<typeof livenessSchema>,
+  right: Static<typeof livenessSchema>
+) =>
+  left.sessionId === right.sessionId &&
+  left.pid === right.pid &&
+  left.startTime === right.startTime;
+
+const deathRetentionElapsed = async (
+  directory: string,
+  name: string,
+  identity: Static<typeof livenessSchema>,
+  now: number,
+  retentionMs: number
+): Promise<boolean> => {
+  const folder = join(directory, "liveness-deaths");
+  const prior = await readPrivate(join(folder, name));
+  if (
+    Value.Check(deathObservationSchema, prior) &&
+    sameIdentity(prior.identity, identity)
+  )
+    return now - prior.observedAt >= retentionMs;
+  await writeAtomic(folder, name, { identity, observedAt: now });
+  return false;
+};
+
+const pruneDeathObservations = async (
+  directory: string,
+  now: number,
+  retentionMs: number
+) => {
+  const folder = join(directory, "liveness-deaths");
+  const names = await filesIn(folder);
+  await Promise.all(
+    names.map(async (name) => {
+      const path = join(folder, name);
+      try {
+        const metadata = await stat(path);
+        if (name.startsWith(".") && name.endsWith(".tmp")) {
+          if (metadata.mtimeMs < now - TEMP_RETENTION_MS)
+            await removeMetadataIfSame(path, metadata);
+          return;
+        }
+        if (!name.endsWith(".json")) return;
+        const data = await readPrivate(path);
+        if (
+          !Value.Check(deathObservationSchema, data) ||
+          now - data.observedAt < retentionMs
+        )
+          return;
+        const current = await readPrivateResult(
+          join(directory, "liveness", name)
+        );
+        if (
+          current.kind === "missing" ||
+          (current.kind === "present" &&
+            Value.Check(livenessSchema, current.data) &&
+            !sameIdentity(current.data, data.identity))
+        )
+          await removeMetadataIfSame(path, metadata);
+      } catch (error) {
+        if (!missing(error)) throw error;
+      }
+    })
+  );
 };
 
 const pruneIdentityMetadata = async (
@@ -846,23 +965,28 @@ const pruneIdentityMetadata = async (
               metadata.mtimeMs >= now - retentionMs
             )
               return;
-            const removable =
-              kind === "deadlines"
-                ? !unknownReference && !referenced.has(name.slice(0, -5))
-                : (await predecessorLiveness(
-                    directory,
-                    name.slice(0, -5),
-                    probe
-                  )) === "gone";
-            if (removable) {
-              // Do not remove an identity/deadline atomically refreshed during the probe.
-              const latest = await stat(path);
-              if (
-                latest.ino === metadata.ino &&
-                latest.mtimeMs === metadata.mtimeMs
-              )
-                await unlink(path);
+            let removable =
+              kind === "deadlines" &&
+              !unknownReference &&
+              !referenced.has(name.slice(0, -5));
+            if (kind === "liveness") {
+              const identity = await readPrivate(path, warn);
+              removable =
+                Value.Check(livenessSchema, identity) &&
+                (await livenessFromRecord(
+                  identity,
+                  name.slice(0, -5),
+                  probe
+                )) === "gone" &&
+                (await deathRetentionElapsed(
+                  directory,
+                  name,
+                  identity,
+                  now,
+                  retentionMs
+                ));
             }
+            if (removable) await removeMetadataIfSame(path, metadata);
           } catch (error) {
             if (!missing(error))
               warn?.(`pi-until could not prune identity metadata ${name}`);
@@ -871,6 +995,7 @@ const pruneIdentityMetadata = async (
       );
     })
   );
+  await pruneDeathObservations(directory, now, retentionMs);
 };
 
 export const pruneHandoffs = async ({
@@ -1137,6 +1262,8 @@ interface ClaimOptions {
   readonly onTimeout?: (watching: boolean) => void;
   readonly processStart?: ProcessStartProbe;
   readonly deathGraceMs?: number;
+  /** Ownership read port, preserving ENOENT versus unreadable evidence. */
+  readonly readOwnership?: (path: string) => Promise<string>;
 }
 
 const missing = (error: unknown): boolean =>
@@ -1285,13 +1412,18 @@ export const claimHandoff = async (
                   name.startsWith(`${predecessorId}.`)
               )
               .map(async (name) => {
-                const data = await readPrivate(join(directory, folder, name));
-                if (data === undefined) {
+                const result = await readPrivateResult(
+                  join(directory, folder, name),
+                  options.readOwnership
+                );
+                if (result.kind === "missing") return false;
+                if (result.kind === "unreadable") {
                   options.warn?.(
                     "pi-until ownership evidence is unavailable; do not re-arm; inspect claimed/receipts and reload after resolving ownership"
                   );
                   return true;
                 }
+                const data = result.data;
                 if (
                   Value.Check(handoffSchema, data) &&
                   data.suspension.sessionId === predecessorId &&
@@ -1325,15 +1457,16 @@ export const claimHandoff = async (
       options.onTimeout?.(true);
     };
     const release = async (reason: HandoffReleaseReason) => {
-      if (await hasForeignPublication()) {
-        if (ending === undefined) finish({ kind: "claimed-elsewhere" });
-        return;
-      }
-      // Last read after identity verification: publication always wins.
+      const foreign = await hasForeignPublication();
+      // Even if foreign evidence was observed, a publication arriving while
+      // it was read still wins this last atomic claim attempt.
       const late = await attempt();
       if (late === "nothing") finish({ kind: "nothing" });
       else if (late !== undefined) finishClaim(late);
-      else if (ending === undefined) finish({ kind: "released", reason });
+      else if (ending === undefined)
+        finish(
+          foreign ? { kind: "claimed-elsewhere" } : { kind: "released", reason }
+        );
     };
     const afterDeadline = async (identity: PredecessorLiveness) => {
       if (options.passive !== true) {

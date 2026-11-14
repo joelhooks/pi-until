@@ -25,7 +25,7 @@ The agent can release its turn, keep working on other requests, and wake with a 
 
 ## Review-hardened release boundary
 
-Release permission is session-scoped, ends after newer work, and never crosses a fork. Released ids leave future inventory. Foreign ownership means do not re-arm. Linux identity uses boot-relative proc ticks, not wall-clock `lstart`; old incompatible records are unknown. Release messages explicitly disable turn triggering. Warn on missing registration and retain recent/live/unknown identity metadata. Missing-record releases require confirming the predecessor stopped. Follow README's stopped-runtime identity-cleanup procedure before rollback; never remove journals.
+Release permission is session-scoped and never crosses a fork. Same-session reload and partial re-arm retain its inventory; new adoption, successor binding or quit ends the view. Check active watches before re-arming more ids. Released ids leave future inventory. Foreign ownership means do not re-arm. Linux identity uses boot-relative proc ticks, not wall-clock `lstart`; old incompatible records are unknown. Release messages explicitly disable turn triggering. Warn on missing registration and retain recent/live/unknown identity metadata. Missing-record releases require confirming the predecessor stopped. Follow README's stopped-runtime identity-cleanup procedure before rollback; never remove journals.
 
 ## Taste
 

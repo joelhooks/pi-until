@@ -31,6 +31,7 @@ import {
   pruneHandoffs,
   publishHandoff,
   PERSISTENCE_ERRORS_FILE,
+  predecessorLiveness,
   writeSessionLiveness,
 } from "../src/handoff.ts";
 import { suspensionData, newestSuspension } from "../src/suspension.ts";
@@ -109,6 +110,27 @@ it("prunes only old conclusive dead identities and unreferenced deadlines", asyn
       return { kind: "missing" };
     },
   });
+  // Old startup mtime is not old death evidence: the first prune marks it.
+  const firstIdentities = await readdir(join(directory, "liveness"));
+  expect(firstIdentities.sort()).toEqual([
+    "alive.json",
+    "dead.json",
+    "recent.json",
+    "reused.json",
+    "unknown.json",
+  ]);
+  await pruneHandoffs({
+    directory,
+    now: Date.now() + 2000,
+    retentionMs: 1000,
+    processStart: async (pid) => {
+      if (pid === 12) return { kind: "present", startTime };
+      if (pid === 13) return { kind: "unknown" };
+      if (pid === 14)
+        return { kind: "present", startTime: "2026-11-14T01:02:04.000Z" };
+      return { kind: "missing" };
+    },
+  });
   const identities = await readdir(join(directory, "liveness"));
   expect(identities.sort()).toEqual([
     "alive.json",
@@ -118,6 +140,90 @@ it("prunes only old conclusive dead identities and unreferenced deadlines", asyn
   expect(await readdir(join(directory, "deadlines"))).toEqual([
     `${canonical.transferId}.json`,
   ]);
+});
+
+it("keeps old-mtime death evidence when pruning runs during the death grace", async () => {
+  const directory = await directoryFor();
+  const time = "2026-11-14T01:02:03.000Z";
+  await writeSessionLiveness(directory, "parent", async () => ({
+    kind: "present",
+    startTime: time,
+  }));
+  const file = join(directory, "liveness", "parent.json");
+  await utimes(file, new Date(0), new Date(0));
+  let prune: Promise<unknown> | undefined;
+  let probes = 0;
+  const controller = new AbortController();
+  try {
+    const result = await claimHandoff({
+      directory,
+      predecessorId: "parent",
+      successorId: "child",
+      signal: controller.signal,
+      passive: true,
+      waitMs: 1000,
+      deathGraceMs: 40,
+      processStart: async () => {
+        probes += 1;
+        if (probes === 1)
+          setTimeout(() => {
+            prune = pruneHandoffs({
+              directory,
+              now: Date.now(),
+              processStart: async () => ({ kind: "missing" }),
+            });
+          }, 5);
+        return { kind: "missing" };
+      },
+    });
+    await prune;
+    expect(prune).toBeDefined();
+    expect(result).toEqual({ kind: "released", reason: "predecessor-gone" });
+    expect(await stat(file)).toBeDefined();
+    expect(await readdir(join(directory, "liveness-deaths"))).toEqual([
+      "parent.json",
+    ]);
+  } finally {
+    controller.abort();
+  }
+});
+
+it("quarantines and restores a refreshed identity without replacing a newer canonical file", async () => {
+  const directory = await directoryFor();
+  const oldTime = "2026-11-14T01:02:03.000Z";
+  const newTime = "2026-11-14T01:02:04.000Z";
+  await writeSessionLiveness(directory, "parent", async () => ({
+    kind: "present",
+    startTime: oldTime,
+  }));
+  const file = join(directory, "liveness", "parent.json");
+  await utimes(file, new Date(0), new Date(0));
+  const now = Date.now();
+  await pruneHandoffs({
+    directory,
+    now,
+    retentionMs: 1000,
+    processStart: async () => ({ kind: "missing" }),
+  });
+  await pruneHandoffs({
+    directory,
+    now: now + 2000,
+    retentionMs: 1000,
+    processStart: async () => {
+      await writeSessionLiveness(directory, "parent", async () => ({
+        kind: "present",
+        startTime: newTime,
+      }));
+      return { kind: "missing" };
+    },
+  });
+  expect(
+    await predecessorLiveness(directory, "parent", async () => ({
+      kind: "present",
+      startTime: newTime,
+    }))
+  ).toBe("alive");
+  expect(await readdir(join(directory, "liveness"))).toEqual(["parent.json"]);
 });
 
 it.each(["fresh", "old", "oversize"] as const)(

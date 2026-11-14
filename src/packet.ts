@@ -27,7 +27,7 @@ export const renderHandoffReleasePacket = (
     ...(successorId === undefined
       ? []
       : [
-          `This permission belongs only to successor \`${successorId}\` before newer work; forks do not inherit it.`,
+          `This permission belongs only to successor \`${successorId}\` while no new handoff is pending; forks do not inherit it.`,
         ]),
     ...(reason === "deadline-no-record"
       ? [
@@ -35,6 +35,8 @@ export const renderHandoffReleasePacket = (
         ]
       : []),
     `Inventory ids: ${inventoryIds.map((id) => `\`${id}\``).join(", ") || "unavailable"}.`,
+    "If `until list` shows a pending handoff, this release does not apply.",
+    "Some ids may already be re-armed; check `until list` above before starting more work.",
     "Re-arm as needed from the advisory inventory after checking handled work. Inventory is not active here and is never restoration authority.",
   ].join("\n");
 

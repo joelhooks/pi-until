@@ -5,6 +5,7 @@ import { join } from "node:path";
 import type {
   ExtensionAPI,
   ExtensionContext,
+  SessionEntry,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { Value } from "typebox/value";
@@ -102,6 +103,7 @@ import {
   suspendWatch,
   suspendedWatchesFrom,
   suspensionData,
+  suspensionDataSchema,
   unfinishedWatches,
 } from "../src/suspension.ts";
 import type {
@@ -830,6 +832,12 @@ export default function piUntil(
   const releasedHandoffView = () => {
     if (currentContext === undefined) return null;
     const entries = currentContext.sessionManager.getBranch();
+    const ownReload = (entry: SessionEntry | undefined): boolean =>
+      entry?.type === "custom" &&
+      entry.customType === SUSPENDED_ENTRY_TYPE &&
+      Value.Check(suspensionDataSchema, entry.data) &&
+      entry.data.reason === "reload" &&
+      entry.data.sessionId === sessionId(currentContext);
     for (let index = entries.length - 1; index >= 0; index -= 1) {
       const entry = entries[index];
       if (
@@ -849,13 +857,24 @@ export default function piUntil(
       if (
         entry?.type === "custom" &&
         [
-          "pi-until-started",
           RESUMED_ENTRY_TYPE,
           SUSPENDED_ENTRY_TYPE,
           SUCCESSOR_ENTRY_TYPE,
         ].includes(entry.customType)
-      )
+      ) {
+        if (ownReload(entry)) continue;
+        if (
+          entry.customType === RESUMED_ENTRY_TYPE &&
+          typeof entry.data === "object" &&
+          entry.data !== null &&
+          "from" in entry.data
+        ) {
+          const from = entry.data.from;
+          if (ownReload(entries.find((candidate) => candidate.id === from)))
+            continue;
+        }
         return null;
+      }
     }
     return null;
   };

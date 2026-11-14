@@ -5,6 +5,7 @@ import {
   readdir,
   rm,
   stat,
+  unlink,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -352,6 +353,58 @@ describe("death grace lifecycle", () => {
       controller.abort();
     }
   );
+
+  it("skips ownership evidence removed between listing and reading", async () => {
+    const directory = await directoryFor();
+    await mkdir(join(directory, "receipts"));
+    const path = join(directory, "receipts", "parent!expired.json");
+    await writeFile(path, "{}");
+    const readOwnership = vi.fn(async (file) => {
+      await unlink(file);
+      throw Object.assign(new Error("removed by concurrent pruning"), {
+        code: "ENOENT",
+      });
+    });
+    const pending = claim(directory, async () => ({ kind: "missing" }), {
+      passive: true,
+      waitMs: 1,
+      readOwnership,
+    });
+    expect(await pending.result).toEqual({
+      kind: "released",
+      reason: "deadline-no-record",
+    });
+    expect(readOwnership).toHaveBeenCalledWith(path);
+  });
+
+  it("adopts a publication arriving while foreign ownership is read", async () => {
+    const directory = await directoryFor();
+    await mkdir(join(directory, "claimed"));
+    await writeFile(
+      join(directory, "claimed", "parent!other.json"),
+      "invalid JSON"
+    );
+    const readOwnership = vi.fn(async () => {
+      await publishHandoff(
+        directory,
+        suspensionData([], Date.now(), "quit", "parent"),
+        { predecessorId: "ancestor", notBefore: new Date(0).toISOString() }
+      );
+      throw Object.assign(new Error("existing but unreadable ownership"), {
+        code: "EACCES",
+      });
+    });
+    const pending = claim(directory, async () => ({ kind: "missing" }), {
+      passive: true,
+      waitMs: 1,
+      readOwnership,
+    });
+    expect(await pending.result).toMatchObject({
+      kind: "claimed",
+      handoff: { suspension: { sessionId: "parent" } },
+    });
+    expect(readOwnership).toHaveBeenCalled();
+  });
 
   it("honors abort while ownership evidence is being classified", async () => {
     const directory = await directoryFor();
