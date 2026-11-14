@@ -71,6 +71,10 @@ Keep these surfaces aligned when behavior changes:
 
 Preserve four distinctions in every surface: a gate permits work but does not complete it; dispatch is not acknowledgement; an acknowledgement timeout is uncertain rather than rejected; `/reload` and a graceful quit followed by reopening the same session restore watches automatically, a crash restores nothing unless the operator runs `/until-resume`, and an undeclared session replacement, new session, or fork restores nothing.
 
+## Review-hardened release boundary
+
+Release permission is session-scoped, ends after newer work, and never crosses a fork. Released ids leave future inventory. Foreign ownership means do not re-arm. Linux identity uses boot-relative proc ticks, not wall-clock `lstart`; old incompatible records are unknown. Release messages explicitly disable turn triggering. Warn on missing registration and retain recent/live/unknown identity metadata. Missing-record releases require confirming the predecessor stopped. Follow README's stopped-runtime identity-cleanup procedure before rollback; never remove journals.
+
 ## Sources
 
 Pi extension behavior must be checked against the maintained source mirror in the Dark Wizard repo:

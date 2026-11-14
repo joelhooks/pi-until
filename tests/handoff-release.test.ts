@@ -14,7 +14,11 @@ import { afterEach, expect, it, vi } from "vitest";
 import { systemClock } from "../src/clock.ts";
 import { initialFacts } from "../src/domain.ts";
 import type { WatchDefinition } from "../src/domain.ts";
-import { publishHandoff, predecessorDeadlineFrom } from "../src/handoff.ts";
+import {
+  publishHandoff,
+  predecessorDeadlineFrom,
+  prepareHandoff,
+} from "../src/handoff.ts";
 import type { ProcessStart, ProcessStartProbe } from "../src/predecessor.ts";
 import { predecessorHandled, suspensionData } from "../src/suspension.ts";
 import { FakeSession, loadExtension } from "./fake-pi.ts";
@@ -91,6 +95,151 @@ const waitingSession = async (hasRecord: boolean, waitMs = 40) => {
   };
 };
 
+it("does not export a release permission into a forked successor", async () => {
+  const test = await waitingSession(false);
+  await vi.waitFor(() =>
+    expect(predecessorHandled(test.session.entries, test.parent.id)).toBe(true)
+  );
+  const fork = test.session.fork();
+  const child = loadExtension(fork, {
+    handoff: {
+      ...test.handoff,
+      predecessorId: test.session.id,
+      successorId: fork.id,
+      waitMs: 10_000,
+    },
+  });
+  extensions.add(child);
+  const { ctx } = fork.context();
+  await child.sessionStart("startup", ctx);
+  const result = await child.tool(
+    "list",
+    { action: "list" },
+    new AbortController().signal,
+    undefined,
+    ctx
+  );
+  expect(result.details).not.toHaveProperty("handoffReleased");
+  expect(result.content[0]?.text).not.toContain("Re-arm as needed");
+  expect(result.details).toMatchObject({ handoffPending: { watches: [] } });
+});
+
+it("hides a foreign release even without a newer successor binding", async () => {
+  const test = await waitingSession(false);
+  await vi.waitFor(() =>
+    expect(predecessorHandled(test.session.entries, test.parent.id)).toBe(true)
+  );
+  const fork = test.session.fork();
+  const child = loadExtension(fork, { handoff: false });
+  extensions.add(child);
+  const { ctx } = fork.context();
+  await child.sessionStart("new", ctx);
+  const result = await child.tool(
+    "list",
+    { action: "list" },
+    new AbortController().signal,
+    undefined,
+    ctx
+  );
+  expect(result.details).not.toHaveProperty("handoffReleased");
+  expect(result.content[0]?.text).not.toContain("Re-arm as needed");
+});
+
+it.each([
+  "pi-until-started",
+  "pi-until-resumed",
+  "pi-until-suspended",
+  "pi-until-successor",
+])("hides a release view after newer %s work", async (type) => {
+  const test = await waitingSession(false);
+  await vi.waitFor(() =>
+    expect(predecessorHandled(test.session.entries, test.parent.id)).toBe(true)
+  );
+  const before = await test.list();
+  expect(before.details).toHaveProperty("handoffReleased");
+  test.session.appendCustom(type, {
+    receipt: { id: "rearmed", label: "new work" },
+  });
+  const after = await test.list();
+  expect(after.details).not.toHaveProperty("handoffReleased");
+});
+
+it("clears released inventory before a later fork lists re-armed ids", async () => {
+  const test = await waitingSession(false);
+  await vi.waitFor(() =>
+    expect(predecessorHandled(test.session.entries, test.parent.id)).toBe(true)
+  );
+  test.session.appendCustom("pi-until-started", {
+    receipt: { id: "rearmed", label: "new work" },
+  });
+  const fork = test.session.fork();
+  const child = loadExtension(fork, {
+    handoff: {
+      ...test.handoff,
+      predecessorId: test.session.id,
+      successorId: fork.id,
+      waitMs: 10_000,
+    },
+  });
+  extensions.add(child);
+  const { ctx } = fork.context();
+  await child.sessionStart("startup", ctx);
+  const result = await child.tool(
+    "list",
+    { action: "list" },
+    new AbortController().signal,
+    undefined,
+    ctx
+  );
+  expect(result.details).toMatchObject({
+    handoffPending: { watches: [{ id: "rearmed" }] },
+  });
+  expect(result.content[0]?.text).not.toContain("synthetic inventory");
+});
+
+it("reports claimed-elsewhere ownership without conditional re-arm permission", async () => {
+  const test = await waitingSession(false, 200);
+  await mkdir(join(test.directory, "claimed"), { recursive: true });
+  const held = prepareHandoff(
+    suspensionData([], Date.now(), "quit", test.parent.id),
+    { predecessorId: "ancestor", notBefore: new Date(0).toISOString() }
+  );
+  await writeFile(
+    join(test.directory, "claimed", `${test.parent.id}!other.json`),
+    JSON.stringify(held)
+  );
+  await vi.waitFor(() =>
+    expect(test.notify).toHaveBeenCalledWith(
+      expect.stringContaining("claimed by another session; do not re-arm"),
+      "warning"
+    )
+  );
+  const result = await test.list();
+  expect(result.content[0]?.text).toContain(
+    "claimed by another session; do not re-arm"
+  );
+  expect(result.content[0]?.text).not.toContain("re-arm only if");
+  expect(result.details).not.toHaveProperty("handoffReleased");
+});
+
+it("warns when the identity probe returns unknown without throwing", async () => {
+  const test = await waitingSession(false);
+  const session = new FakeSession();
+  const extension = loadExtension(session, {
+    handoff: {
+      directory: test.directory,
+      processStart: async () => ({ kind: "unknown" }),
+    },
+  });
+  extensions.add(extension);
+  const { ctx, notify } = session.context();
+  await extension.sessionStart("startup", ctx);
+  expect(notify).toHaveBeenCalledWith(
+    expect.stringContaining("could not record process identity"),
+    "warning"
+  );
+});
+
 it("releases a legacy predecessor at the ceiling without claiming it is dead", async () => {
   const test = await waitingSession(false);
   await vi.waitFor(() =>
@@ -109,6 +258,10 @@ it("releases a legacy predecessor at the ceiling without claiming it is dead", a
     "never handed off before the deadline"
   );
   expect(result.content[0]?.text).toContain("Re-arm as needed");
+  expect(result.content[0]?.text).toContain(
+    "may still be running; confirm it has stopped before re-arming"
+  );
+  expect(result.content[0]?.text).toContain("Reopening that predecessor later");
   expect(result.content[0]?.text).not.toContain("do not re-arm");
   expect(result.content[0]?.text).not.toContain("is gone and");
 });
@@ -418,7 +571,7 @@ it("releases with predecessor and inventory ids, consumes the binding and ignore
   expect(extension.messages[0]?.message.customType).toBe(
     "pi-until-handoff-released"
   );
-  expect(extension.messages[0]?.options?.triggerTurn).not.toBe(true);
+  expect(extension.messages[0]?.options?.triggerTurn).toBe(false);
   await extension.shutdown("reload", ctx);
   extensions.delete(extension);
 
@@ -453,10 +606,8 @@ it("releases with predecessor and inventory ids, consumes the binding and ignore
     undefined,
     ctx
   );
-  expect(after.details).toMatchObject({
-    watches: [],
-    handoffReleased: { predecessorId: parent.id },
-  });
+  expect(after.details).toMatchObject({ watches: [] });
+  expect(after.details).not.toHaveProperty("handoffReleased");
   expect(after.content[0]?.text).not.toContain("Handoff pending");
   expect(reloaded.messages).toHaveLength(0);
   expect(await stat(join(directory, `${parent.id}.json`))).toBeDefined();

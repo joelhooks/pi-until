@@ -17,12 +17,23 @@ const iso = (value: number): string => new Date(value).toISOString();
 export const renderHandoffReleasePacket = (
   predecessorId: string,
   inventoryIds: readonly string[],
-  reason: HandoffReleaseReason = "predecessor-gone"
+  reason: HandoffReleaseReason = "predecessor-gone",
+  successorId?: string
 ): string =>
   [
     reason === "deadline-no-record"
       ? `pi-until handoff released: predecessor \`${predecessorId}\` never handed off before the deadline; no liveness record is available.`
       : `pi-until handoff released: predecessor \`${predecessorId}\` is gone and no publication arrived during the death grace.`,
+    ...(successorId === undefined
+      ? []
+      : [
+          `This permission belongs only to successor \`${successorId}\` before newer work; forks do not inherit it.`,
+        ]),
+    ...(reason === "deadline-no-record"
+      ? [
+          "The predecessor may still be running; confirm it has stopped before re-arming. Reopening that predecessor later can restore its watches; check handled work there too.",
+        ]
+      : []),
     `Inventory ids: ${inventoryIds.map((id) => `\`${id}\``).join(", ") || "unavailable"}.`,
     "Re-arm as needed from the advisory inventory after checking handled work. Inventory is not active here and is never restoration authority.",
   ].join("\n");

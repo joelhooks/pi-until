@@ -27,6 +27,7 @@ import {
   createDeathGraceMachine,
   DEFAULT_DEATH_GRACE_MS,
   processStartTime,
+  linuxProcessStart,
 } from "../src/predecessor.ts";
 import type { ProcessStart, ProcessStartProbe } from "../src/predecessor.ts";
 import { suspensionData } from "../src/suspension.ts";
@@ -66,6 +67,49 @@ const claim = (directory: string, probe: ProcessStartProbe, extra = {}) => {
     }),
   };
 };
+
+it("parses Linux field 22 independently of wall-clock fields and complex comm names", () => {
+  const boot = "12345678-1234-1234-1234-123456789abc";
+  const procStat = `123 (a ) tricky name) S ${Array.from({ length: 18 }, () => "0").join(" ")} 987654321 99`;
+  expect(linuxProcessStart(procStat, boot)).toEqual({
+    kind: "present",
+    startTime: `linux:${boot}:987654321`,
+  });
+  expect(linuxProcessStart(procStat.replace(" 0 0", " 999 888"), boot)).toEqual(
+    linuxProcessStart(procStat, boot)
+  );
+  expect(
+    linuxProcessStart(procStat.replace("987654321", "987654322"), boot)
+  ).not.toEqual(linuxProcessStart(procStat, boot));
+  expect(linuxProcessStart("invalid", boot)).toEqual({ kind: "unknown" });
+});
+
+it("treats a pre-upgrade Linux wall-clock identity as unknown, not reused", async () => {
+  const directory = await directoryFor();
+  await record(directory);
+  expect(
+    await predecessorLiveness(directory, "parent", async () => ({
+      kind: "present",
+      startTime: "linux:12345678-1234-1234-1234-123456789abc:123",
+    }))
+  ).toBe("unknown");
+});
+
+it("does not treat an invalid ISO identity record as death", async () => {
+  const directory = await directoryFor();
+  await record(directory);
+  await writeFile(
+    join(directory, "liveness", "parent.json"),
+    JSON.stringify({
+      sessionId: "parent",
+      pid: process.pid,
+      startTime: "2026-99-14T01:02:03.000Z",
+    })
+  );
+  expect(
+    await predecessorLiveness(directory, "parent", async () => present)
+  ).toBe("unknown");
+});
 
 describe("process identity records", () => {
   it("writes only owner-private identity metadata atomically", async () => {
@@ -303,11 +347,36 @@ describe("death grace lifecycle", () => {
           },
         }
       );
-      await vi.waitFor(() => expect(timeout).toHaveBeenCalledWith(true));
+      await expect(result).resolves.toEqual({ kind: "claimed-elsewhere" });
+      expect(timeout).not.toHaveBeenCalled();
       controller.abort();
-      await expect(result).resolves.toEqual({ kind: "aborted" });
     }
   );
+
+  it("honors abort while ownership evidence is being classified", async () => {
+    const directory = await directoryFor();
+    await mkdir(join(directory, "claimed"));
+    await writeFile(
+      join(directory, "claimed", "parent!other.json"),
+      "invalid JSON"
+    );
+    const controller = new AbortController();
+    controllers.push(controller);
+    const warn = vi.fn(() => controller.abort());
+    const result = await claimHandoff({
+      directory,
+      predecessorId: "parent",
+      successorId: "child",
+      signal: controller.signal,
+      waitMs: 1,
+      passive: true,
+      warn,
+    });
+    expect(warn).toHaveBeenCalledWith(
+      expect.stringContaining("ownership evidence is unavailable")
+    );
+    expect(result).toEqual({ kind: "aborted" });
+  });
 
   it("adopts a publication arriving after death detection but inside the grace", async () => {
     const directory = await directoryFor();

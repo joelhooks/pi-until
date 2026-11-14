@@ -23,6 +23,10 @@ The agent can release its turn, keep working on other requests, and wake with a 
 - Only an exactly targeted successor may take graceful-quit work; details live in `.brain/projects/pi-until-reload-survival.svx`. A private pid/start-time identity record may prove predecessor death and permit an explicit handoff release after a short publication grace. Alive or inconclusive recorded identity never permits early release; legacy predecessors keep the normal ceiling and receive an explicit release when it expires without an identity record. Watching continues to observe recorded identity so later death can release after the grace. A restart chain carries the original absolute wait deadline and cannot extend it. Inventory remains advisory, never restoration authority. An explicit release consumes that predecessor binding before inviting manual re-arming.
 - Usage telemetry stays local: a JSONL file under `~/.pi/agent/pi-until/`; only condition hashes are written, never command fragments, recurring instructions, quick references, or context pointers; no network.
 
+## Review-hardened release boundary
+
+Release permission is session-scoped, ends after newer work, and never crosses a fork. Released ids leave future inventory. Foreign ownership means do not re-arm. Linux identity uses boot-relative proc ticks, not wall-clock `lstart`; old incompatible records are unknown. Release messages explicitly disable turn triggering. Warn on missing registration and retain recent/live/unknown identity metadata. Missing-record releases require confirming the predecessor stopped. Follow README's stopped-runtime identity-cleanup procedure before rollback; never remove journals.
+
 ## Taste
 
 Keep the interface smaller than the problem space. Shell already composes files, HTTP, SSH, PIDs, databases, and scripts. Typed predicate helpers can be sugar later; they must not split the core lifecycle.

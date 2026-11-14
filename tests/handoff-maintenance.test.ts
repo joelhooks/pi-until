@@ -49,6 +49,77 @@ const directoryFor = async () => {
   directories.push(path);
   return path;
 };
+it("prunes only old conclusive dead identities and unreferenced deadlines", async () => {
+  const directory = await directoryFor();
+  const startTime = "2026-11-14T01:02:03.000Z";
+  await mkdir(join(directory, "liveness"));
+  await mkdir(join(directory, "deadlines"));
+  await Promise.all(
+    (
+      [
+        ["dead", 11],
+        ["alive", 12],
+        ["unknown", 13],
+        ["reused", 14],
+        ["recent", 15],
+      ] as const
+    ).map(async ([name, pid]) => {
+      const file = join(directory, "liveness", `${name}.json`);
+      await writeFile(
+        file,
+        JSON.stringify({ sessionId: name, pid, startTime })
+      );
+      if (name !== "recent") await utimes(file, new Date(0), new Date(0));
+    })
+  );
+  await publishHandoff(
+    directory,
+    pending("publisher"),
+    { predecessorId: "ancestor", notBefore: new Date(0).toISOString() },
+    Date.now()
+  );
+  const canonical = JSON.parse(
+    await readFile(join(directory, "publisher.json"), "utf-8")
+  );
+  const referenced = join(
+    directory,
+    "deadlines",
+    `${canonical.transferId}.json`
+  );
+  await utimes(referenced, new Date(0), new Date(0));
+  await Promise.all(
+    ["liveness", "deadlines"].map(async (kind) => {
+      const path = join(directory, kind, ".orphan.tmp");
+      await writeFile(path, "partial");
+      await utimes(path, new Date(0), new Date(0));
+    })
+  );
+  const orphan = join(directory, "deadlines", "orphan.json");
+  await writeFile(orphan, "{}");
+  await utimes(orphan, new Date(0), new Date(0));
+  await pruneHandoffs({
+    directory,
+    now: Date.now(),
+    retentionMs: 1000,
+    processStart: async (pid) => {
+      if (pid === 12) return { kind: "present", startTime };
+      if (pid === 13) return { kind: "unknown" };
+      if (pid === 14)
+        return { kind: "present", startTime: "2026-11-14T01:02:04.000Z" };
+      return { kind: "missing" };
+    },
+  });
+  const identities = await readdir(join(directory, "liveness"));
+  expect(identities.sort()).toEqual([
+    "alive.json",
+    "recent.json",
+    "unknown.json",
+  ]);
+  expect(await readdir(join(directory, "deadlines"))).toEqual([
+    `${canonical.transferId}.json`,
+  ]);
+});
+
 it.each(["fresh", "old", "oversize"] as const)(
   "bounds the private persistence error log: %s",
   async (kind) => {

@@ -152,6 +152,7 @@ const releaseReceiptSchema = Type.Object(
   {
     from: Type.Literal("handoff-released"),
     predecessorId: Type.String(),
+    successorId: Type.String(),
     inventoryIds: Type.Array(Type.String()),
     resumedAt: Type.String(),
     releaseReason: Type.Union([
@@ -174,7 +175,7 @@ interface WatchRecord {
 interface SuccessorWait {
   readonly controller: AbortController;
   task: Promise<void>;
-  phase: "waiting" | "watching" | "finished";
+  phase: "waiting" | "watching" | "finished" | "claimed-elsewhere";
   predecessorId: string;
   notBefore?: string;
   depth: number;
@@ -236,6 +237,17 @@ const invalidSuccessorLink = (
   link: SuccessorBinding,
   visited: readonly string[]
 ) => (link.depth ?? 1) > 3 || visited.includes(link.predecessorId);
+
+const pendingInventoryHeading = (
+  phase: SuccessorWait["phase"],
+  predecessorId: string
+) => {
+  if (phase === "claimed-elsewhere")
+    return "Handoff claimed by another session; do not re-arm these watches. Snapshot inventory (not active here):";
+  if (phase === "watching")
+    return `A late handoff from ${predecessorId} may still arrive; re-arm only if ${predecessorId} is gone. Snapshot inventory (not active here):`;
+  return "Handoff pending; do not re-arm these watches. Snapshot inventory (not active here):";
+};
 
 function terminalState(
   snapshot: WatchSnapshot
@@ -816,7 +828,8 @@ export default function piUntil(
     };
   };
   const releasedHandoffView = () => {
-    const entries = currentContext?.sessionManager.getBranch() ?? [];
+    if (currentContext === undefined) return null;
+    const entries = currentContext.sessionManager.getBranch();
     for (let index = entries.length - 1; index >= 0; index -= 1) {
       const entry = entries[index];
       if (
@@ -824,17 +837,32 @@ export default function piUntil(
         entry.customType === RESUMED_ENTRY_TYPE &&
         Value.Check(releaseReceiptSchema, entry.data)
       ) {
+        if (entry.data.successorId !== sessionId(currentContext)) return null;
         return {
           predecessorId: entry.data.predecessorId,
           inventoryIds: entry.data.inventoryIds,
           releasedAt: entry.data.resumedAt,
+          successorId: entry.data.successorId,
           reason: entry.data.releaseReason,
         };
       }
+      if (
+        entry?.type === "custom" &&
+        [
+          "pi-until-started",
+          RESUMED_ENTRY_TYPE,
+          SUSPENDED_ENTRY_TYPE,
+          SUCCESSOR_ENTRY_TYPE,
+        ].includes(entry.customType)
+      )
+        return null;
     }
     return null;
   };
-  const listWithArbiter = (receipts: readonly WatchReceipt[]): string => {
+  const listWithArbiter = (
+    receipts: readonly WatchReceipt[],
+    released = releasedHandoffView()
+  ): string => {
     const waiting =
       handoffWait?.phase === "waiting"
         ? `handoff: waiting for ${handoffWait.predecessorId} until ${new Date(handoffWait.deadline).toISOString()}`
@@ -848,19 +876,17 @@ export default function piUntil(
         ? `claimed: ${oldClaims} older than 7 days; retained for inspection`
         : undefined;
     const pending = pendingHandoffView();
-    const released = releasedHandoffView();
     const inventory =
       pending === null
         ? undefined
         : [
-            pending.phase === "watching"
-              ? `A late handoff from ${pending.predecessorId} may still arrive; re-arm only if ${pending.predecessorId} is gone. Snapshot inventory (not active here):`
-              : "Handoff pending; do not re-arm these watches. Snapshot inventory (not active here):",
+            pendingInventoryHeading(pending.phase, pending.predecessorId),
             ...pending.watches.map(
               (watch) =>
                 `- ${watch.id} (${watch.label}); watch deadline ${watch.expiresAt ?? "none"}; handoff deadline ${pending.deadline}`
             ),
-            ...(pending.watches.length === 0
+            ...(pending.watches.length === 0 &&
+            pending.phase !== "claimed-elsewhere"
               ? [
                   "Watch ids are not available in this fork snapshot; waiting for the predecessor's handoff.",
                 ]
@@ -879,7 +905,8 @@ export default function piUntil(
         : renderHandoffReleasePacket(
             released.predecessorId,
             released.inventoryIds,
-            released.reason
+            released.reason,
+            released.successorId
           ),
       claims,
     ]
@@ -1240,14 +1267,15 @@ export default function piUntil(
       if (command.action === "list") {
         const receipts = allReceipts();
         const pending = pendingHandoffView();
+        const released = releasedHandoffView();
         return {
-          content: [{ type: "text", text: listWithArbiter(receipts) }],
+          content: [
+            { type: "text", text: listWithArbiter(receipts, released) },
+          ],
           details: {
             watches: receipts,
             ...(pending === null ? {} : { handoffPending: pending }),
-            ...(releasedHandoffView() === null
-              ? {}
-              : { handoffReleased: releasedHandoffView() }),
+            ...(released === null ? {} : { handoffReleased: released }),
           },
         };
       }
@@ -1615,7 +1643,7 @@ export default function piUntil(
       predecessorId
     );
     const deadline = Math.min(
-      Date.now() + waitMs,
+      clock.now() + waitMs,
       stored ?? Infinity,
       carried ?? Infinity
     );
@@ -1653,6 +1681,7 @@ export default function piUntil(
       predecessorId: waiting.predecessorId,
       intended: 0,
       inventoryIds,
+      successorId: sessionId(ctx),
       releaseReason: reason,
     });
     if (
@@ -1664,14 +1693,18 @@ export default function piUntil(
     const content = renderHandoffReleasePacket(
       waiting.predecessorId,
       inventoryIds,
-      reason
+      reason,
+      sessionId(ctx)
     );
     ctx.ui.notify(content, "warning");
-    pi.sendMessage({
-      customType: "pi-until-handoff-released",
-      content,
-      display: true,
-    });
+    pi.sendMessage(
+      {
+        customType: "pi-until-handoff-released",
+        content,
+        display: true,
+      },
+      { triggerTurn: false }
+    );
   };
 
   const adoptSuccessor = (ctx: ExtensionContext, binding: SuccessorBinding) => {
@@ -1724,7 +1757,7 @@ export default function piUntil(
         waitMs,
         carriedDeadline
       );
-      const remainingMs = Math.max(0, waiting.deadline - Date.now());
+      const remainingMs = Math.max(0, waiting.deadline - clock.now());
       ctx.ui.setStatus("pi-until-handoff", `waiting for ${link.predecessorId}`);
       ctx.ui.notify(
         `pi-until waiting up to ${remainingMs / 1000}s for predecessor ${link.predecessorId}`,
@@ -1770,6 +1803,14 @@ export default function piUntil(
         return;
       }
       if (result.kind === "empty") return;
+      if (result.kind === "claimed-elsewhere") {
+        waiting.phase = "claimed-elsewhere";
+        ctx.ui.notify(
+          "pi-until handoff claimed by another session; do not re-arm",
+          "warning"
+        );
+        return;
+      }
       if (result.kind === "released") {
         releasePendingHandoff(ctx, waiting, result.reason);
         return;
@@ -1834,7 +1875,7 @@ export default function piUntil(
       } catch (error) {
         ctx.ui.notify(adoptionErrorText(error, waiting, ctx), "error");
       } finally {
-        waiting.phase = "finished";
+        if (waiting.phase !== "claimed-elsewhere") waiting.phase = "finished";
         ctx.ui.setStatus("pi-until-handoff", undefined);
       }
     })();
@@ -2075,11 +2116,12 @@ export default function piUntil(
         ? undefined
         : (async () => {
             try {
-              await writeSessionLiveness(
+              const recorded = await writeSessionLiveness(
                 handoff.directory,
                 sessionId(ctx),
                 handoff.processStart
               );
+              if (!recorded) throw new Error("identity probe unavailable");
             } catch {
               if (!shuttingDown && lifecycle === generation)
                 ctx.ui.notify(

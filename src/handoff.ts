@@ -152,6 +152,14 @@ const carriedInventorySchema = Type.Object(
   { additionalProperties: true }
 );
 
+const releasedInventorySchema = Type.Object(
+  {
+    from: Type.Literal("handoff-released"),
+    inventoryIds: Type.Array(Type.String()),
+  },
+  { additionalProperties: true }
+);
+
 /** Advisory inventory from the fork snapshot, never authority to start work. */
 export const pendingWatchSummaries = (entries: readonly SessionEntry[]) => {
   // An adopted outer suspension can own no watches while still waiting on an
@@ -192,6 +200,11 @@ export const pendingWatchSummaries = (entries: readonly SessionEntry[]) => {
               : new Date(definition.expiresAt).toISOString(),
         });
       }
+    } else if (
+      entry.customType === RESUMED_ENTRY_TYPE &&
+      Value.Check(releasedInventorySchema, entry.data)
+    ) {
+      for (const id of entry.data.inventoryIds) candidates.delete(id);
     } else if (
       entry.customType === "pi-until-finished" &&
       typeof entry.data === "object" &&
@@ -396,7 +409,8 @@ const livenessSchema = Type.Object(
     sessionId: Type.String(),
     pid: Type.Integer({ minimum: 1, maximum: 2_147_483_647 }),
     startTime: Type.String({
-      pattern: "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z$",
+      pattern:
+        "^(\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z|linux:[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}:\\d+)$",
     }),
   },
   { additionalProperties: false }
@@ -437,11 +451,20 @@ export const predecessorLiveness = async (
     if (
       !Value.Check(livenessSchema, data) ||
       data.sessionId !== sessionId ||
-      !Number.isFinite(Date.parse(data.startTime))
+      (!data.startTime.startsWith("linux:") &&
+        (!Number.isFinite(Date.parse(data.startTime)) ||
+          new Date(data.startTime).toISOString() !== data.startTime))
     )
       return "unknown";
     const identity = await probe(data.pid);
     if (identity.kind === "unknown") return "unknown";
+    // A pre-upgrade Linux wall-clock record is not comparable to boot ticks.
+    if (
+      identity.kind === "present" &&
+      identity.startTime.startsWith("linux:") !==
+        data.startTime.startsWith("linux:")
+    )
+      return "unknown";
     return identity.kind === "missing" || identity.startTime !== data.startTime
       ? "gone"
       : "alive";
@@ -778,19 +801,94 @@ const readPrivate = async (
   }
 };
 
+const pruneIdentityMetadata = async (
+  directory: string,
+  now: number,
+  retentionMs: number,
+  probe: ProcessStartProbe,
+  warn?: MailboxWarning
+) => {
+  const referenced = new Set<string>();
+  let unknownReference = false;
+  await Promise.all(
+    [directory, join(directory, "claimed")].map(async (folder) => {
+      const names = await filesIn(folder);
+      await Promise.all(
+        names
+          .filter((name) => name.endsWith(".json"))
+          .map(async (name) => {
+            const data = await readPrivate(join(folder, name), warn);
+            if (Value.Check(handoffSchema, data))
+              referenced.add(data.transferId);
+            else if (!Value.Check(tombstoneSchema, data))
+              unknownReference = true;
+          })
+      );
+    })
+  );
+  await Promise.all(
+    ["liveness", "deadlines"].map(async (kind) => {
+      const folder = join(directory, kind);
+      const names = await filesIn(folder);
+      await Promise.all(
+        names.map(async (name) => {
+          const path = join(folder, name);
+          try {
+            const metadata = await stat(path);
+            if (name.startsWith(".") && name.endsWith(".tmp")) {
+              if (metadata.mtimeMs < now - TEMP_RETENTION_MS)
+                await unlink(path);
+              return;
+            }
+            // Preserve recent death evidence for the grace and active transfer deadlines.
+            if (
+              !name.endsWith(".json") ||
+              metadata.mtimeMs >= now - retentionMs
+            )
+              return;
+            const removable =
+              kind === "deadlines"
+                ? !unknownReference && !referenced.has(name.slice(0, -5))
+                : (await predecessorLiveness(
+                    directory,
+                    name.slice(0, -5),
+                    probe
+                  )) === "gone";
+            if (removable) {
+              // Do not remove an identity/deadline atomically refreshed during the probe.
+              const latest = await stat(path);
+              if (
+                latest.ino === metadata.ino &&
+                latest.mtimeMs === metadata.mtimeMs
+              )
+                await unlink(path);
+            }
+          } catch (error) {
+            if (!missing(error))
+              warn?.(`pi-until could not prune identity metadata ${name}`);
+          }
+        })
+      );
+    })
+  );
+};
+
 export const pruneHandoffs = async ({
   directory,
   now,
   retentionMs = DEFAULT_HANDOFF_RETENTION_MS,
   receiptRetentionMs = DEFAULT_RECEIPT_RETENTION_MS,
+  processStart = processStartTime,
   warn,
 }: {
   directory: string;
   now: number;
   retentionMs?: number;
   receiptRetentionMs?: number;
+  processStart?: ProcessStartProbe;
   warn?: MailboxWarning;
 }): Promise<void> => {
+  await pruneIdentityMetadata(directory, now, retentionMs, processStart, warn);
   await Promise.all(
     [directory, join(directory, "claimed"), join(directory, "receipts")].map(
       async (folder) => {
@@ -1023,7 +1121,8 @@ type ClaimResult =
   | { readonly kind: "empty" }
   | { readonly kind: "nothing" }
   | { readonly kind: "aborted" }
-  | { readonly kind: "released"; readonly reason: HandoffReleaseReason };
+  | { readonly kind: "released"; readonly reason: HandoffReleaseReason }
+  | { readonly kind: "claimed-elsewhere" };
 
 interface ClaimOptions {
   readonly directory: string;
@@ -1187,7 +1286,12 @@ export const claimHandoff = async (
               )
               .map(async (name) => {
                 const data = await readPrivate(join(directory, folder, name));
-                if (data === undefined) return true;
+                if (data === undefined) {
+                  options.warn?.(
+                    "pi-until ownership evidence is unavailable; do not re-arm; inspect claimed/receipts and reload after resolving ownership"
+                  );
+                  return true;
+                }
                 if (
                   Value.Check(handoffSchema, data) &&
                   data.suspension.sessionId === predecessorId &&
@@ -1222,8 +1326,7 @@ export const claimHandoff = async (
     };
     const release = async (reason: HandoffReleaseReason) => {
       if (await hasForeignPublication()) {
-        grace.send({ type: "OBSERVED", state: "unknown" });
-        if (deadlineElapsed) enterWatching();
+        if (ending === undefined) finish({ kind: "claimed-elsewhere" });
         return;
       }
       // Last read after identity verification: publication always wins.
@@ -1255,7 +1358,6 @@ export const claimHandoff = async (
           grace.getSnapshot().matches("verify") ||
           Date.now() >= nextProbeAt
         ) {
-          nextProbeAt = Date.now() + 1_000;
           const identity = await predecessorLiveness(
             directory,
             predecessorId,
@@ -1263,6 +1365,9 @@ export const claimHandoff = async (
           );
           if (done || ending !== undefined) return;
           grace.send({ type: "OBSERVED", state: identity });
+          nextProbeAt =
+            Date.now() +
+            (passiveWatching && identity !== "gone" ? 5_000 : 1_000);
           if (identity === "gone" && grace.getSnapshot().matches("verify")) {
             await release("predecessor-gone");
           } else if (deadlineElapsed) await afterDeadline(identity);
