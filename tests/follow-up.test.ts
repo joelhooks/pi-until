@@ -337,6 +337,86 @@ const harness = (sessionBusy: boolean) => {
 const dispatchedIds = (dispatch: ReturnType<typeof vi.fn>) =>
   dispatch.mock.calls.map(([item]) => (item as FollowUpRequest).id);
 
+describe("queue maintenance", () => {
+  it.each(["busy", "awaitingStart", "awaitingSettlement"])(
+    "drops a queued request directly from %s without relying on liveness routing",
+    (state) => {
+      const { actor, calls } = harness(state === "busy");
+      if (state !== "busy") {
+        actor.send({ request: request("active"), type: "ENQUEUE" });
+        if (state === "awaitingSettlement") {
+          actor.send({ id: "delivery:active", type: "MESSAGE_STARTED" });
+        }
+      }
+      actor.send({ request: request("drop"), type: "ENQUEUE" });
+      actor.send({ request: request("keep"), type: "ENQUEUE" });
+      const before = actor.getSnapshot();
+      expect(before.value).toBe(state);
+
+      actor.send({ dedupeKey: "watch:drop", type: "DROP" });
+
+      expect(actor.getSnapshot().value).toBe(state);
+      expect(actor.getSnapshot().context.queue).toEqual([request("keep")]);
+      expect(actor.getSnapshot().context.active).toEqual(before.context.active);
+      expect(calls.dispatch).toHaveBeenCalledTimes(state === "busy" ? 0 : 1);
+      actor.stop();
+    }
+  );
+
+  it("does not retract an already-dispatched request when its dedupe key is dropped", () => {
+    const { actor } = harness(false);
+    actor.send({ request: request("active"), type: "ENQUEUE" });
+    actor.send({ request: request("keep"), type: "ENQUEUE" });
+
+    actor.send({ dedupeKey: "watch:active", type: "DROP" });
+
+    expect(actor.getSnapshot().value).toBe("awaitingStart");
+    expect(actor.getSnapshot().context.active).toEqual(request("active"));
+    expect(actor.getSnapshot().context.queue).toEqual([request("keep")]);
+    actor.stop();
+  });
+
+  it("runs ports in enqueue order after commit and mailboxes synchronous re-entry", () => {
+    const observations: string[] = [];
+    const actor = createActor(
+      createFollowUpMachine({
+        dispatch: (item) => {
+          expect(actor.getSnapshot().value).toBe("awaitingStart");
+          expect(actor.getSnapshot().context.compacting).toBe(false);
+          expect(actor.getSnapshot().context.active).toEqual(item);
+          observations.push("dispatch");
+          actor.send({ id: item.id, type: "MESSAGE_STARTED" });
+          observations.push("dispatch returned");
+        },
+        settled: (item) => {
+          expect(item).toEqual(request("held"));
+          expect(actor.getSnapshot().value).toBe("ready");
+          expect(actor.getSnapshot().context.active).toBeUndefined();
+          observations.push("settled");
+        },
+        started: () => {
+          expect(actor.getSnapshot().value).toBe("awaitingSettlement");
+          observations.push("started");
+        },
+      }),
+      { input: { sessionBusy: false } }
+    ).start();
+    actor.send({ type: "COMPACTION_STARTED" });
+    actor.send({ request: request("held"), type: "ENQUEUE" });
+
+    actor.send({ type: "SESSION_SETTLED" });
+    actor.send({ type: "SESSION_SETTLED" });
+
+    expect(observations).toEqual([
+      "dispatch",
+      "dispatch returned",
+      "started",
+      "settled",
+    ]);
+    actor.stop();
+  });
+});
+
 describe("a dispatch that never starts", () => {
   it("retries a wake dispatched into a compaction, and later wakes still arrive", () => {
     const { actor, calls, clock } = harness(false);

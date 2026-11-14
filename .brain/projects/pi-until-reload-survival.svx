@@ -34,7 +34,7 @@ Pi `0.84.2` supports this boundary through `session_shutdown`, `session_start`, 
 
 ## Two machines
 
-Each watch is an XState v6 actor (`6.0.0-alpha.73`). It owns cadence, gate checks, pending delivery, settlement, completion, expiry, cancellation, and typed terminal failure.
+Each watch is an XState v6 actor (`6.0.0-beta.1`). It owns cadence, gate checks, pending delivery, settlement, completion, expiry, cancellation, and typed terminal failure.
 
 One session XState actor owns all `pi-until` delivery. It:
 
@@ -101,7 +101,24 @@ Do not equate `dropWatches` with handback. It does not say whether work was canc
 
 ## XState 6 compatibility
 
-The port from XState `5.32.5` changes machine authoring, not lifecycle or persistence. Sources: the bundled migration guide and declarations in `xstate@6.0.0-alpha.73`, plus the upstream release tag at `2ee15f5a1cd0ad07053afbd47ad5eaf018027e92`. Suspension stores version 3 watch definitions and facts, never XState's internal actor snapshots. The parser, journal writer, handoff format, cadence and expiry anchors remain unchanged. No state migration or new suspension version is needed. State written by the v6 build remains readable by the v5 build at `7fa41bc`.
+The port from XState `5.32.5` preserves watch lifecycle and persistence, with one internal timing difference: v5 ran actions inline before snapshot commit; v6 commits the snapshot, then runs effects in enqueue order. A port that re-enters and reads the actor sees the new state and context. Its synchronous sends remain mailbox-serialized. For example, dispatch after a compaction-ending settlement now sees `compacting: false`. The re-entrant port regression in `tests/follow-up.test.ts` pins this behavior. Keep eventless `always` bodies, `isLive` and clock reads side-effect free: an enabled eventless function is evaluated during selection and again during execution; ordinary event transitions reuse their selection result. Effects belong behind the enqueuer.
+
+Suspension stores version 3 watch definitions and facts, never XState's internal actor snapshots. The parser, journal writer, handoff format, cadence and expiry anchors remain unchanged. No state migration or new suspension version is needed. State written by the v6 build remains readable by the v5 build at `7fa41bc`.
+
+The first port used `6.0.0-alpha.73` (release tag `2ee15f5a1cd0ad07053afbd47ad5eaf018027e92`). The follow-up pins `6.0.0-beta.1` (tag `d84d1dedac9f2c62082cf2c2094daee8d32ad0a9`), checked against its bundled migration guide, declarations, changelog and tagged TypeScript source. Beta.0 moves raw actor-snapshot restoration to `restoreActor` from `xstate/persist`, rejects legacy config and unknown actor options, changes schema accessors, improves `self` typing and production diagnostics, and rejects obsolete suffixed lifecycle event keys. None of those removed APIs is used here. Beta.1 adds static target checking to `setup().createMachine`; the existing targets typecheck unchanged.
+
+Unlike alpha.73's default 1000-microstep error, beta.1 defaults to unbounded macrosteps, matching v5. Development builds warn once per machine after 1000 steps. An explicit `options.maxIterations` still errors when exceeded. This port adds no blocking limit. The extension caps active internal watches at 32; that is not a hard bound on external follow-up requests or every queue length.
+
+Version-pinned runtime evidence, relative to upstream `packages/core/src` at the beta.1 tag:
+
+| Contract | Source |
+| --- | --- |
+| Snapshot commit precedes ordered effects | `createActor.ts:1042–1043`, `createActor.ts:122–131` |
+| Ordinary transition selection is reused; eventless selection has no result cache | `stateUtils.ts:2339–2368`, `stateUtils.ts:2984–3018`, `stateUtils.ts:3021–3068` |
+| Context patches merge shallowly | `transitionActions.ts:355–360` |
+| Scheduler uses injected clock for time, schedule and cancel | `system.ts:720–760` |
+| Async disposer aborts; late resolve/reject after stop is ignored | `actors/promise.ts:519–555` |
+| Default microstep limit is infinite; development warning at 1001 | `stateUtils.ts:2429`, `stateUtils.ts:2703–2733` |
 
 `tests/fixtures/xstate5-suspension.json` was generated with real v5 actors and the production suspension writer at `7fa41bc`, using synthetic watches only. `tests/xstate-migration.test.ts` checks restoration, phase, state, facts, unchanged wire format and the extension reload boundary. Separate private proofs compare copied live-session suspensions against both runtimes with an inert check port; real conditions never execute.
 

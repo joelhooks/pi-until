@@ -212,6 +212,70 @@ describe("pi-until watch machine", () => {
     await expect(done).resolves.toBe("expired");
   });
 
+  it("ignores COMPLETE for an until watch without changing its facts", () => {
+    const clock = new SimulatedClock();
+    const runCheck = vi.fn<RunUntilCheck>();
+    const actor = createActor(createWatchMachine(runCheck, clock), {
+      clock,
+      input: input(untilDefinition({ jitter: false }), { nextDueAt: 100 }),
+    }).start();
+    const before = actor.getSnapshot();
+
+    actor.send({ type: "COMPLETE" });
+
+    expect(actor.getSnapshot().status).toBe("active");
+    expect(actor.getSnapshot().matches({ active: "waiting" })).toBe(true);
+    expect(actor.getSnapshot().context).toEqual(before.context);
+    expect(runCheck).not.toHaveBeenCalled();
+    actor.stop();
+  });
+
+  it("coalesces recurring expiry at the event time, not the current clock", () => {
+    const clock = new SimulatedClock();
+    const actor = createActor(
+      createWatchMachine(vi.fn<RunUntilCheck>(), clock),
+      {
+        clock,
+        input: input(recurringDefinition({ jitter: false }), {
+          deliveryPending: true,
+          missedTicks: 2,
+          nextDueAt: 5,
+        }),
+      }
+    ).start();
+    expect(actor.getSnapshot().matches({ active: "duePending" })).toBe(true);
+
+    actor.send({ at: 16, type: "EXPIRE" });
+
+    expect(actor.getSnapshot().value).toBe("expired");
+    expect(actor.getSnapshot().context.facts).toMatchObject({
+      missedTicks: 5,
+      nextDueAt: 20,
+    });
+  });
+
+  it("coalesces an already-expired recurring watch before routing pending work", () => {
+    const clock = new SimulatedClock();
+    clock.set(16);
+    const runCheck = vi.fn<RunUntilCheck>();
+    const actor = createActor(createWatchMachine(runCheck, clock), {
+      clock,
+      input: input(recurringDefinition({ expiresAt: 15, jitter: false }), {
+        deliveryPending: true,
+        missedTicks: 2,
+        nextDueAt: 5,
+      }),
+    }).start();
+
+    expect(actor.getSnapshot().value).toBe("expired");
+    expect(actor.getSnapshot().context.facts).toMatchObject({
+      finishedAt: 16,
+      missedTicks: 5,
+      nextDueAt: 20,
+    });
+    expect(runCheck).not.toHaveBeenCalled();
+  });
+
   it("coalesces fixed-cadence ticks while one follow-up is pending", async () => {
     const clock = new SimulatedClock();
     const definition = recurringDefinition();

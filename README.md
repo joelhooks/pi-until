@@ -230,7 +230,7 @@ npm run check
 npm run pack:dry
 ```
 
-One XState v6 machine owns each watch:
+One XState v6 machine (`6.0.0-beta.1`) owns each watch:
 
 ```text
 active.routing -> waiting -> checking -----------------> satisfied
@@ -241,7 +241,7 @@ active.routing -> waiting -> checking -----------------> satisfied
        +-> completed | expired | cancelled | failed
 ```
 
-A second XState v6 machine owns the session delivery queue:
+A second XState v6 machine owns the session delivery queue. The runtime commits each snapshot before it runs effects in enqueue order. Synchronous port callbacks therefore see the committed state; their sends remain mailbox-serialized. Keep eventless transition bodies and liveness/clock ports side-effect free because enabled eventless functions are evaluated twice.
 
 ```text
 ready -> queued -> awaiting message_start -> awaiting agent_settled -> ready

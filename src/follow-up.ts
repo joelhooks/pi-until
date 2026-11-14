@@ -42,6 +42,7 @@ export type FollowUpEvent =
   | { readonly type: "SESSION_BUSY" }
   | { readonly type: "SESSION_SETTLED" };
 
+/** Enqueued ports run unbound after snapshot commit; do not rely on `this`. */
 export interface FollowUpPorts {
   readonly compactionGraceMs?: number;
   readonly dispatch: (request: FollowUpRequest) => void;
@@ -305,6 +306,7 @@ export const createFollowUpMachine = (ports: FollowUpPorts) => {
         },
       },
       routing: {
+        // v6 evaluates `always` twice. `isLive` must stay side-effect free.
         always: ({ context }) => {
           const [head, ...queue] = context.queue;
           if (head !== undefined && !(ports.isLive?.(head) ?? true)) {

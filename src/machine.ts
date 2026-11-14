@@ -279,6 +279,7 @@ export function createWatchMachine(
             },
           },
           routing: {
+            // v6 evaluates `always` twice. Keep it pure; enqueue any effects.
             always: ({ context }) => {
               const expiresAt = expiresAtOf(context.definition);
               if (expiresAt !== undefined && expiresAt <= now()) {

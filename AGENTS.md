@@ -35,6 +35,8 @@ Node is `24.18.0` or newer. Maintainers and CI use npm `11.16.0` (the `packageMa
 
 ## Invariants
 
+- XState v6 commits snapshots before running effects in enqueue order; re-entrant ports see the committed state. Eventless `always` functions are evaluated twice, so they and liveness/clock ports must stay side-effect free. Enqueued port functions run unbound and must not rely on `this`.
+
 - Exit code 0 is the only success condition.
 - Checks must not overlap for one watch.
 - Only one `pi-until` follow-up may be submitted to or running in Pi at a time. Correlate it through `details.followUpId`. Requests other extensions emit on `pi-until:follow-up` join the same queue as terminal follow-ups; `parseExternalFollowUpRequest` validates them, and `accept()` runs only after the request is queued. The extension listens only between `session_start` and `session_shutdown`.
