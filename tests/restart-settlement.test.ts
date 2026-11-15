@@ -210,25 +210,29 @@ it.each(["claim", "receipt"] as const)(
       join(directory, `${parent.id}.json`),
       "utf-8"
     );
+    const completed = deferred();
+    const actualHandoff =
+      await vi.importActual<typeof handoff>("../src/handoff.ts");
+    vi.mocked(handoff.completeHandoff).mockImplementation(async (options) => {
+      await actualHandoff.completeHandoff(options);
+      completed.resolve();
+    });
     await next.sessionStart("startup", successor.context().ctx);
-    await vi.waitFor(() =>
-      expect(
-        existsSync(
-          join(directory, "receipts", `${parent.id}!${successor.id}.json`)
-        )
-      ).toBe(true)
-    );
+    // Wait for durable completion, not a one-second race against fsync.
+    await completed.promise;
+    expect(
+      existsSync(
+        join(directory, "receipts", `${parent.id}!${successor.id}.json`)
+      )
+    ).toBe(true);
     expect(await ids(next, successor)).toEqual([receipt.id]);
     if (evidence === "claim") {
-      // completeHandoff writes its receipt before unlinking the old claim.
-      // Wait for that unlink before planting synthetic claim-only evidence.
-      await vi.waitFor(() =>
-        expect(
-          existsSync(
-            join(directory, "claimed", `${parent.id}!${successor.id}.json`)
-          )
-        ).toBe(false)
-      );
+      // Completion also settles claim cleanup before synthetic evidence.
+      expect(
+        existsSync(
+          join(directory, "claimed", `${parent.id}!${successor.id}.json`)
+        )
+      ).toBe(false);
       await fs.writeFile(
         join(directory, "claimed", `${parent.id}!${successor.id}.json`),
         originalPayload,
@@ -261,7 +265,8 @@ it.each(["claim", "receipt"] as const)(
     await again.sessionStart("startup", parent.context().ctx);
     expect(await ids(again, parent)).toEqual([]);
     expect(await ids(next, successor)).toEqual([receipt.id]);
-  }
+  },
+  15_000
 );
 
 it.each(["before rename", "after rename"] as const)(

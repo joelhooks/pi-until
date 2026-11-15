@@ -28,7 +28,7 @@ afterEach(async () => {
     roots.splice(0).map((path) => rm(path, { recursive: true, force: true }))
   );
 });
-const setup = async (bound = true) => {
+const setup = async (bound = true, waitMs = 200) => {
   const directory = await mkdtemp(join(tmpdir(), "until-binding-"));
   roots.push(directory);
   const session = new FakeSession();
@@ -48,7 +48,7 @@ const setup = async (bound = true) => {
   const handoff = {
     directory,
     predecessorId: "parent",
-    waitMs: 200,
+    waitMs,
     ...(bound ? { successorId: session.id } : {}),
   };
   const extension = loadExtension(session, { handoff });
@@ -739,7 +739,12 @@ it("refuses an inherited-env RPC child on fallback", async () => {
 it.each([false, true])(
   "rearms a bound wait after reload, including interrupted rename: %s",
   async (interrupted) => {
-    const { directory, session, extension, data, handoff } = await setup();
+    // This tests recovery, not expiry. Journal and mailbox fsync can outlast
+    // the default 200 ms fixture ceiling on Darwin.
+    const { directory, session, extension, data, handoff } = await setup(
+      true,
+      10_000
+    );
     await extension.sessionStart("startup", session.context().ctx);
     await extension.shutdown("reload");
     if (interrupted) {
@@ -755,8 +760,9 @@ it.each([false, true])(
     extensions.push(reloaded);
     await reloaded.sessionStart("reload", session.context().ctx);
     if (!interrupted) await publishHandoff(directory, data);
-    await vi.waitFor(async () =>
-      expect(await listed(reloaded, session)).toEqual(["watch"])
+    await vi.waitFor(
+      async () => expect(await listed(reloaded, session)).toEqual(["watch"]),
+      { timeout: 5000 }
     );
     const markers = session.entries.filter(
       (entry) =>
@@ -767,5 +773,6 @@ it.each([false, true])(
         "predecessorId" in entry.data
     );
     expect(markers).toHaveLength(1);
-  }
+  },
+  10_000
 );

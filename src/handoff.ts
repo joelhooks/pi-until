@@ -1318,7 +1318,11 @@ export const claimHandoff = async (
 ): Promise<ClaimResult> => {
   const { directory, predecessorId, successorId, signal } = options;
   const reportIdentity = (identity: PredecessorLiveness) => {
-    options.onIdentity?.(identity);
+    try {
+      options.onIdentity?.(identity);
+    } catch {
+      // A diagnostic consumer must not end a claim or change release policy.
+    }
   };
   if (
     !validId(predecessorId) ||

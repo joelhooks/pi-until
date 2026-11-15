@@ -386,7 +386,13 @@ it("names unresolved identity and its first observation time past the ceiling wi
   expect(result.content[0]?.text).toMatch(/unknown since \d{4}-\d\d-\d\dT/u);
   expect(result.content[0]?.text).toContain("ceiling passed");
   expect(result.content[0]?.text).toContain(
-    "once its death is visible, release follows on its own"
+    "Once death is visible, release follows automatically"
+  );
+  expect(result.content[0]?.text).toContain(
+    "Check whether it has stopped (don't stop it yourself)"
+  );
+  expect(result.content[0]?.text).toContain(
+    "tell the desk that maintains pi-until"
   );
   expect(result.content[0]?.text).toContain(
     "Don't re-arm or delete the record."

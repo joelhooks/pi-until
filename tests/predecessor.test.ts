@@ -53,6 +53,13 @@ const present: ProcessStart = { kind: "present", startTime };
 const record = async (directory: string) => {
   await writeSessionLiveness(directory, "parent", async () => present);
 };
+const probeExitedChild = async () => {
+  const child = spawn(process.execPath, ["-e", "process.exit(0)"]);
+  const pid = child.pid;
+  if (pid === undefined) throw new Error("child failed to start");
+  await once(child, "close");
+  return processStartTime(pid);
+};
 const claim = (directory: string, probe: ProcessStartProbe, extra = {}) => {
   const controller = new AbortController();
   controllers.push(controller);
@@ -218,15 +225,44 @@ describe("process identity records", () => {
     });
   });
   it("recognizes a real exited child as missing without treating ambiguity as death", async () => {
-    const child = spawn(process.execPath, ["-e", "process.exit(0)"]);
-    const pid = child.pid;
-    if (pid === undefined) throw new Error("child failed to start");
-    await once(child, "close");
-    expect(await processStartTime(pid)).toEqual({ kind: "missing" });
+    let result = await probeExitedChild();
+    // PID reuse is possible after close. Retry it once, not an unknown probe.
+    if (result.kind === "present") result = await probeExitedChild();
+    expect(result).toEqual({ kind: "missing" });
   });
 });
 
 describe("death grace lifecycle", () => {
+  it("keeps watching and claims a publication when its diagnostic observer throws", async () => {
+    const directory = await directoryFor();
+    await record(directory);
+    const observed = vi.fn(() => {
+      throw new Error("diagnostic unavailable");
+    });
+    const { result } = claim(directory, async () => ({ kind: "unknown" }), {
+      passive: true,
+      waitMs: 10_000,
+      onIdentity: observed,
+    });
+    const outcome = (async () => {
+      try {
+        return await result;
+      } catch (error) {
+        return error;
+      }
+    })();
+    await vi.waitFor(() => expect(observed).toHaveBeenCalled());
+    expect(
+      await predecessorLiveness(directory, "parent", async () => ({
+        kind: "unknown",
+      }))
+    ).toBe("unknown");
+    await publishHandoff(
+      directory,
+      suspensionData([], Date.now(), "quit", "parent")
+    );
+    expect(await outcome).toMatchObject({ kind: "nothing" });
+  });
   it("requires continuous conclusive death and resets on alive or unknown", () => {
     const clock = new SimulatedClock();
     const elapsed = vi.fn();
