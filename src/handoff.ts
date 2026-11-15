@@ -1295,6 +1295,8 @@ interface ClaimOptions {
   readonly notBefore?: string;
   readonly passive?: boolean;
   readonly onTimeout?: (watching: boolean) => void;
+  /** Diagnostic observation only; never authorizes release. */
+  readonly onIdentity?: (identity: PredecessorLiveness) => void;
   readonly processStart?: ProcessStartProbe;
   readonly deathGraceMs?: number;
   /** Ownership read port, preserving ENOENT versus unreadable evidence. */
@@ -1315,6 +1317,9 @@ export const claimHandoff = async (
   options: ClaimOptions
 ): Promise<ClaimResult> => {
   const { directory, predecessorId, successorId, signal } = options;
+  const reportIdentity = (identity: PredecessorLiveness) => {
+    options.onIdentity?.(identity);
+  };
   if (
     !validId(predecessorId) ||
     !validId(successorId) ||
@@ -1532,6 +1537,7 @@ export const claimHandoff = async (
             options.processStart
           );
           if (done || ending !== undefined) return;
+          reportIdentity(identity);
           grace.send({ type: "OBSERVED", state: identity });
           nextProbeAt =
             Date.now() +

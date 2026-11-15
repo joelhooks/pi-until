@@ -1,3 +1,5 @@
+import { spawn } from "node:child_process";
+import { once } from "node:events";
 import {
   mkdtemp,
   mkdir,
@@ -210,7 +212,17 @@ describe("process identity records", () => {
     const first = await processStartTime(process.pid);
     expect(first.kind).toBe("present");
     expect(await processStartTime(process.pid)).toEqual(first);
-    expect(await processStartTime(2_147_483_647)).toEqual({ kind: "missing" });
+    // Darwin rejects this input with a diagnostic, not a clean absent lookup.
+    expect(await processStartTime(2_147_483_647)).toEqual({
+      kind: process.platform === "darwin" ? "unknown" : "missing",
+    });
+  });
+  it("recognizes a real exited child as missing without treating ambiguity as death", async () => {
+    const child = spawn(process.execPath, ["-e", "process.exit(0)"]);
+    const pid = child.pid;
+    if (pid === undefined) throw new Error("child failed to start");
+    await once(child, "close");
+    expect(await processStartTime(pid)).toEqual({ kind: "missing" });
   });
 });
 

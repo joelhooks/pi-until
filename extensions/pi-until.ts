@@ -82,11 +82,15 @@ import type { UntilJitter } from "../src/jitter.ts";
 import { createWatchMachine } from "../src/machine.ts";
 import type { WatchTerminalState } from "../src/machine.ts";
 import {
+  renderHandoffUnknownPacket,
   renderRecurringExpiredPacket,
   renderRecurringWakePacket,
   renderHandoffReleasePacket,
 } from "../src/packet.ts";
-import type { HandoffReleaseReason } from "../src/predecessor.ts";
+import type {
+  HandoffReleaseReason,
+  PredecessorLiveness,
+} from "../src/predecessor.ts";
 import {
   RESUMED_ENTRY_TYPE,
   RESUME_INTENDED_ENTRY_TYPE,
@@ -184,7 +188,16 @@ interface SuccessorWait {
   depth: number;
   claimed?: Handoff;
   deadline: number;
+  identity?: PredecessorLiveness;
+  unknownSince?: number;
 }
+
+const unknownHandoffPacket = (waiting: SuccessorWait | undefined) =>
+  waiting?.phase === "watching" &&
+  waiting.identity === "unknown" &&
+  waiting.unknownSince !== undefined
+    ? renderHandoffUnknownPacket(waiting.predecessorId, waiting.unknownSince)
+    : undefined;
 
 export interface PiUntilOptions {
   readonly clock?: UntilClock;
@@ -823,6 +836,12 @@ export default function piUntil(
       predecessorId: handoffWait.predecessorId,
       deadline: new Date(handoffWait.deadline).toISOString(),
       phase: handoffWait.phase,
+      ...(handoffWait.identity === undefined
+        ? {}
+        : { identity: handoffWait.identity }),
+      ...(handoffWait.unknownSince === undefined
+        ? {}
+        : { unknownSince: new Date(handoffWait.unknownSince).toISOString() }),
       // The predecessor may still change its watches. These ids describe the
       // fork snapshot only; the actual handoff remains the restoration authority.
       watches: pendingWatchSummaries(
@@ -879,6 +898,22 @@ export default function piUntil(
     }
     return null;
   };
+  const activeAdoptionLines = (
+    active: readonly WatchReceipt[],
+    hasPending: boolean
+  ) => {
+    if (!hasPending || currentContext === undefined) return [];
+    const adopted = adoptedWatchSources(
+      currentContext.sessionManager.getBranch(),
+      sessionId(currentContext)
+    );
+    return active.flatMap((receipt) => {
+      const predecessor = adopted.get(receipt.id);
+      return predecessor === undefined
+        ? []
+        : [`- ${receipt.id} (from ${predecessor})`];
+    });
+  };
   const listWithArbiter = (
     receipts: readonly WatchReceipt[],
     released = releasedHandoffView()
@@ -887,9 +922,11 @@ export default function piUntil(
       handoffWait?.phase === "waiting"
         ? `handoff: waiting for ${handoffWait.predecessorId} until ${new Date(handoffWait.deadline).toISOString()}`
         : undefined;
+    const unknownPacket = unknownHandoffPacket(handoffWait);
     const late =
       handoffWait?.phase === "watching"
-        ? `handoff: watching for a late handoff from ${handoffWait.predecessorId}`
+        ? (unknownPacket ??
+          `handoff: watching for a late handoff from ${handoffWait.predecessorId}`)
         : undefined;
     const claims =
       oldClaims > 0
@@ -897,19 +934,7 @@ export default function piUntil(
         : undefined;
     const pending = pendingHandoffView();
     const active = receipts.filter((receipt) => receipt.status === "running");
-    const adopted =
-      pending === null || currentContext === undefined
-        ? new Map<string, string>()
-        : adoptedWatchSources(
-            currentContext.sessionManager.getBranch(),
-            sessionId(currentContext)
-          );
-    const activeAdoptions = active.flatMap((receipt) => {
-      const predecessor = adopted.get(receipt.id);
-      return predecessor === undefined
-        ? []
-        : [`- ${receipt.id} (from ${predecessor})`];
-    });
+    const activeAdoptions = activeAdoptionLines(active, pending !== null);
     const inventory =
       pending === null
         ? undefined
@@ -919,7 +944,9 @@ export default function piUntil(
               : [
                   "Additional predecessor handoff (separate from the active watches above):",
                 ]),
-            pendingInventoryHeading(pending.phase, pending.predecessorId),
+            unknownPacket === undefined
+              ? pendingInventoryHeading(pending.phase, pending.predecessorId)
+              : "Snapshot inventory (not active here; do not re-arm):",
             ...pending.watches.map(
               (watch) =>
                 `- ${watch.id} (${watch.label}); watch deadline ${watch.expiresAt ?? "none"}; handoff deadline ${pending.deadline}`
@@ -1795,6 +1822,8 @@ export default function piUntil(
       waiting.depth = link.depth ?? 1;
       waiting.claimed = undefined;
       waiting.phase = "waiting";
+      waiting.identity = undefined;
+      waiting.unknownSince = undefined;
       waiting.deadline = rememberWaitDeadline(
         ctx,
         link.predecessorId,
@@ -1816,6 +1845,14 @@ export default function piUntil(
         signal: controller.signal,
         passive: true,
         warn: (message) => ctx.ui.notify(message, "warning"),
+        onIdentity: (identity) => {
+          if (shuttingDown || lifecycle !== generation) return;
+          waiting.identity = identity;
+          waiting.unknownSince =
+            identity === "unknown"
+              ? (waiting.unknownSince ?? clock.now())
+              : undefined;
+        },
         onTimeout: (watching) => {
           if (shuttingDown || lifecycle !== generation) return;
           waiting.phase = watching ? "watching" : "finished";
@@ -1827,7 +1864,8 @@ export default function piUntil(
           );
           ctx.ui.notify(
             watching
-              ? `pi-until: a late handoff from ${link.predecessorId} may still arrive; re-arm only if ${link.predecessorId} is gone`
+              ? (unknownHandoffPacket(waiting) ??
+                  `pi-until: a late handoff from ${link.predecessorId} may still arrive; re-arm only if ${link.predecessorId} is gone`)
               : "pi-until: nothing to adopt; late filesystem watch unavailable",
             "warning"
           );

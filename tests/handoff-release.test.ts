@@ -19,6 +19,7 @@ import {
   predecessorDeadlineFrom,
   prepareHandoff,
 } from "../src/handoff.ts";
+import { renderHandoffUnknownPacket } from "../src/packet.ts";
 import type { ProcessStart, ProcessStartProbe } from "../src/predecessor.ts";
 import { predecessorHandled, suspensionData } from "../src/suspension.ts";
 import { FakeSession, loadExtension } from "./fake-pi.ts";
@@ -36,7 +37,11 @@ afterEach(async () => {
   );
 });
 
-const waitingSession = async (hasRecord: boolean, waitMs = 40) => {
+const waitingSession = async (
+  hasRecord: boolean,
+  waitMs = 40,
+  initialObservation?: ProcessStart
+) => {
   const directory = await mkdtemp(join(tmpdir(), "until-ceiling-"));
   roots.push(directory);
   const parent = new FakeSession();
@@ -49,7 +54,10 @@ const waitingSession = async (hasRecord: boolean, waitMs = 40) => {
   });
   const session = parent.fork();
   const startTime = "2026-11-14T01:02:03.000Z";
-  let observed: ProcessStart = { kind: "present", startTime };
+  let observed: ProcessStart = initialObservation ?? {
+    kind: "present",
+    startTime,
+  };
   const processStart: ProcessStartProbe = async (pid) =>
     pid === process.pid ? { kind: "present", startTime } : observed;
   if (hasRecord) {
@@ -351,6 +359,53 @@ it("keeps an alive predecessor watching past the ceiling and adopts a late publi
     expect(result.details).toMatchObject({ watches: [{ id: "inventory" }] });
   });
   expect(predecessorHandled(test.session.entries, test.parent.id)).toBe(true);
+});
+
+it("names unresolved identity and its first observation time past the ceiling without releasing", async () => {
+  expect(
+    renderHandoffUnknownPacket("parent", 0).split(/\s+/u).length
+  ).toBeLessThanOrEqual(50);
+  const test = await waitingSession(true, 40, { kind: "unknown" });
+  await vi.waitFor(() =>
+    expect(test.notify).toHaveBeenCalledWith(
+      expect.stringContaining("Handoff stuck:"),
+      "warning"
+    )
+  );
+  const result = await test.list();
+  expect(result.details).toMatchObject({
+    handoffPending: {
+      phase: "watching",
+      identity: "unknown",
+      unknownSince: expect.any(String),
+    },
+  });
+  expect(result.content[0]?.text).toContain(
+    `can't tell if predecessor ${test.parent.id} has stopped`
+  );
+  expect(result.content[0]?.text).toMatch(/unknown since \d{4}-\d\d-\d\dT/u);
+  expect(result.content[0]?.text).toContain("ceiling passed");
+  expect(result.content[0]?.text).toContain(
+    "once its death is visible, release follows on its own"
+  );
+  expect(result.content[0]?.text).toContain(
+    "Don't re-arm or delete the record."
+  );
+  expect(result.content[0]?.text).not.toContain(
+    `re-arm only if ${test.parent.id} is gone`
+  );
+  expect(predecessorHandled(test.session.entries, test.parent.id)).toBe(false);
+  const again = await test.list();
+  expect(again.details).toEqual(result.details);
+  await publishHandoff(
+    test.directory,
+    suspensionData([], Date.now(), "quit", test.parent.id)
+  );
+  await vi.waitFor(() =>
+    expect(predecessorHandled(test.session.entries, test.parent.id)).toBe(true)
+  );
+  const after = await test.list();
+  expect(after.content[0]?.text).not.toContain("Handoff stuck:");
 });
 
 it("detects death while watching and releases after the death grace", async () => {

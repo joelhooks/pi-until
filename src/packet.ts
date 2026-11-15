@@ -13,6 +13,13 @@ export interface RecurringPacketReceipt {
 
 const iso = (value: number): string => new Date(value).toISOString();
 
+/** Unknown recorded identity keeps watching; this is not release permission. */
+export const renderHandoffUnknownPacket = (
+  predecessorId: string,
+  unknownSince: number
+): string =>
+  `Handoff stuck: can't tell if predecessor ${predecessorId} has stopped (unknown since ${iso(unknownSince)}; ceiling passed). Pending inventory is not active here. Confirm it has stopped; once its death is visible, release follows on its own. If stuck, tell the flowing-pi desk. Don't re-arm or delete the record.`;
+
 /** A release permits manual re-arming, never restoration from inventory. */
 export const renderHandoffReleasePacket = (
   predecessorId: string,
