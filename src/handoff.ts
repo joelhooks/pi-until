@@ -43,13 +43,18 @@ import type {
 } from "./predecessor.ts";
 import {
   suspensionDataSchema,
+  newestSuspension,
   pendingPredecessorSchema,
   SUSPENDED_ENTRY_TYPE,
   SUSPENSION_EXTRA_ENTRY_TYPE,
   RESUMED_ENTRY_TYPE,
   RESUME_INTENDED_ENTRY_TYPE,
 } from "./suspension.ts";
-import type { PendingPredecessor, SuspensionData } from "./suspension.ts";
+import type {
+  PendingPredecessor,
+  SuspensionData,
+  SuspensionRecord,
+} from "./suspension.ts";
 
 const handoffSchema = Type.Object(
   {
@@ -217,6 +222,36 @@ export const pendingWatchSummaries = (entries: readonly SessionEntry[]) => {
     }
   }
   return [...candidates.values()];
+};
+
+/** Adoption provenance for display only; never authority to restore a watch. */
+export const adoptedWatchSources = (
+  entries: readonly SessionEntry[],
+  successorId: string
+): ReadonlyMap<string, string> => {
+  const sources = new Map(entries.map((entry) => [entry.id, entry]));
+  const adopted = new Map<string, string>();
+  for (const entry of entries) {
+    let record: SuspensionRecord | undefined;
+    if (entry.type !== "custom") continue;
+    if (entry.customType === SUSPENDED_ENTRY_TYPE) {
+      record = newestSuspension([entry]);
+    } else if (
+      entry.customType === SUSPENSION_EXTRA_ENTRY_TYPE &&
+      typeof entry.data === "object" &&
+      entry.data !== null &&
+      "from" in entry.data &&
+      typeof entry.data.from === "string"
+    ) {
+      const source = sources.get(entry.data.from);
+      if (source !== undefined) record = newestSuspension([source, entry]);
+    }
+    if (record?.sessionId !== successorId || record.handoff === undefined)
+      continue;
+    for (const savedWatch of record.watches)
+      adopted.set(savedWatch.facts.id, record.handoff.predecessorId);
+  }
+  return adopted;
 };
 
 export const SUCCESSOR_ENTRY_TYPE = "pi-until-successor";

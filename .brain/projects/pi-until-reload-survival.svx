@@ -142,6 +142,16 @@ Version-pinned runtime evidence, relative to upstream `packages/core/src` at the
 
 Fleet installation remains a desk decision after candidate verification and a one-desk canary. Running sessions keep their loaded code until restart. A dependency upgrade is not permission to widen the session lifecycle boundary.
 
+## Active adoption versus a pending ancestor
+
+The stale-predecessor report was a display defect, not incorrect immediate targeting. Read-only session evidence showed each successor binding its immediate predecessor, adopting one recurrence, and delivering further ticks under the same watch id. It then followed an unresolved ancestor carried in that predecessor's payload. Matching mailbox receipts confirmed both immediate adoptions. An inherited binding stamped for a different successor was not selected. The separate report of a predecessor with no quit journal or remaining mailbox artifact has no evidence establishing whether it ever published; absence now does not prove historical nonpublication or identify the loaded version.
+
+At `7fa41bc`, `extensions/pi-until.ts:1562–1671` resumes the immediate payload before following its pending predecessor. The actual defect is `extensions/pi-until.ts:784–809`: active watch rows are followed by an unqualified pending warning and an empty-inventory message, without explaining that adoption already succeeded. A pending ancestor does not suspend adopted watches. Keep valid transitive adoption; do not infer stopped timers from a pending link.
+
+The list renderer now names adopted, active ids and their immediate source separately from an additional predecessor handoff. Empty additional inventory does not mean active watches are absent. Provenance comes only from validated adoption records naming this successor, is display-only, and survives same-session reload. Cancelled watches and a fork's inherited adoptions cannot appear as adopted and active here. No cached tool description, prompt snippet, guidelines, wake packet or restoration contract changes.
+
+`tests/handoff-list.test.ts` pins the production shape with synthetic watches: immediate adoption despite inherited ancestor bindings, ticks while that ancestor waits, explicit missing-record release without stopping the adopted recurrence, same-session provenance across reload, fork isolation, cancellation, and expired watches skipped on late ancestor publication. Baseline comparison: `7fa41bc` already adopts and ticks correctly and skips late-expired work, but lacks bounded missing-record release; `7cfa879` already fixes that release and preserves expiry. Both baselines fail the new list clarity assertion. Neither establishes a fix for the unproved publication case. This patch changes presentation, not ownership, persistence or recovery guarantees.
+
 ## Current receipt
 
 Version `0.6.0` adds automatic quit-then-relaunch recovery; see the PR receipt in the pi-until repo history. Version `0.4.0` passed 59 tests, `npm run check`, `npm run pack:dry`, a real Pi RPC recurrence, independent review, and GitHub Actions. The installed Git source is `git:github.com/joelhooks/pi-until@main`.

@@ -45,6 +45,7 @@ import {
   type FollowUpRequest,
 } from "../src/follow-up.ts";
 import {
+  adoptedWatchSources,
   claimHandoff,
   completeHandoff,
   completeOwnHandoff,
@@ -895,10 +896,29 @@ export default function piUntil(
         ? `claimed: ${oldClaims} older than 7 days; retained for inspection`
         : undefined;
     const pending = pendingHandoffView();
+    const active = receipts.filter((receipt) => receipt.status === "running");
+    const adopted =
+      pending === null || currentContext === undefined
+        ? new Map<string, string>()
+        : adoptedWatchSources(
+            currentContext.sessionManager.getBranch(),
+            sessionId(currentContext)
+          );
+    const activeAdoptions = active.flatMap((receipt) => {
+      const predecessor = adopted.get(receipt.id);
+      return predecessor === undefined
+        ? []
+        : [`- ${receipt.id} (from ${predecessor})`];
+    });
     const inventory =
       pending === null
         ? undefined
         : [
+            ...(active.length === 0
+              ? []
+              : [
+                  "Additional predecessor handoff (separate from the active watches above):",
+                ]),
             pendingInventoryHeading(pending.phase, pending.predecessorId),
             ...pending.watches.map(
               (watch) =>
@@ -907,7 +927,9 @@ export default function piUntil(
             ...(pending.watches.length === 0 &&
             pending.phase !== "claimed-elsewhere"
               ? [
-                  "Watch ids are not available in this fork snapshot; waiting for the predecessor's handoff.",
+                  active.length === 0
+                    ? "Watch ids are not available in this fork snapshot; waiting for the predecessor's handoff."
+                    : "No additional watch ids in the snapshot; this does not stop active watches.",
                 ]
               : []),
           ].join("\n");
@@ -915,6 +937,9 @@ export default function piUntil(
       pending !== null && receipts.length === 0
         ? "No local watches yet."
         : listText(receipts),
+      ...(activeAdoptions.length === 0
+        ? []
+        : ["Adopted and active here (do not re-arm):", ...activeAdoptions]),
       arbiterLine(),
       waiting,
       late,
